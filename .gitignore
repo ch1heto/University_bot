@@ -1,0 +1,62 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+*.so
+*.dylib
+
+# Пакеты/сборки
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Тесты/линтеры/кеши
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.pyre/
+.cache/
+
+# Виртуальные окружения (на будущее)
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# --- Конфиги/секреты ---
+.env
+.env.*
+*.env
+
+# --- IDE/редакторы ---
+.idea/
+.vscode/
+*.code-workspace
+
+# --- ОС ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Логи ---
+logs/
+*.log
+
+# --- Проект-специфичное ---
+uploads/            # загруженные ВКР/файлы пользователей
+uploads/**
+
+vkr.sqlite          # локальная база SQLite
+*.sqlite
+*.sqlite3
+
+dump.pg             # дампы БД (если делал)
+pgdata/             # локальные данные Postgres (если появятся)
+docker-data/
+qdrant_storage/     # если вдруг попробуешь Qdrant локально
+minio/              # если вдруг поднимешь MinIO локально
