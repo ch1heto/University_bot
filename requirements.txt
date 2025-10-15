@@ -1,9 +1,12 @@
-aiogram==3.4.1
-psycopg[binary]==3.2.1
-fastapi==0.115.0
-uvicorn[standard]==0.30.6
-python-docx==1.1.2
-pdfplumber==0.11.4
-requests==2.32.3
-numpy==1.26.4
-python-dotenv==1.0.1
+aiogram>=3.3,<4
+python-dotenv>=1.0
+python-docx>=1.1
+requests>=2.31
+pdfplumber>=0.11
+numpy>=1.23
+
+# .doc -> .docx без офисов
+aspose-words>=24.6
+
+# только для Windows (MS Word COM, опционально)
+pywin32; sys_platform == "win32"

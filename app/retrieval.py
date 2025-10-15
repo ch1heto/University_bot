@@ -1,4 +1,5 @@
 import re
+import json
 import numpy as np
 from typing import Optional, List, Dict, Tuple
 from .db import get_conn
@@ -6,6 +7,18 @@ from .polza_client import embeddings
 
 # Кэш векторов на процесс: (owner_id, doc_id) -> {"mat": np.ndarray [N,D], "meta": list[dict]}
 _DOC_CACHE: dict[tuple[int, int], dict] = {}
+
+
+# ---------------------------
+# Утилиты схемы
+# ---------------------------
+
+def _table_has_columns(con, table: str, cols: List[str]) -> bool:
+    cur = con.cursor()
+    cur.execute(f"PRAGMA table_info({table})")
+    have = {row[1] for row in cur.fetchall()}
+    return all(c in have for c in cols)
+
 
 # ---------------------------
 # Загрузка матрицы документа
@@ -22,11 +35,21 @@ def _load_doc(owner_id: int, doc_id: int) -> dict:
 
     con = get_conn()
     cur = con.cursor()
-    cur.execute(
-        "SELECT id, page, section_path, text, embedding "
-        "FROM chunks WHERE owner_id=? AND doc_id=?",
-        (owner_id, doc_id),
-    )
+
+    # Пытаемся взять расширенные поля (element_type, attrs), если они есть
+    has_ext = _table_has_columns(con, "chunks", ["element_type", "attrs"])
+    if has_ext:
+        cur.execute(
+            "SELECT id, page, section_path, text, element_type, attrs, embedding "
+            "FROM chunks WHERE owner_id=? AND doc_id=?",
+            (owner_id, doc_id),
+        )
+    else:
+        cur.execute(
+            "SELECT id, page, section_path, text, embedding "
+            "FROM chunks WHERE owner_id=? AND doc_id=?",
+            (owner_id, doc_id),
+        )
     rows = cur.fetchall()
     con.close()
 
@@ -37,25 +60,84 @@ def _load_doc(owner_id: int, doc_id: int) -> dict:
 
     meta, vecs = [], []
     for r in rows:
-        meta.append(
-            {
-                "id": r["id"],
-                "page": r["page"],
-                "section_path": r["section_path"],
-                "text": r["text"],
-            }
-        )
-        # эмбеддинг хранится как BLOB(float32[])
-        vecs.append(np.frombuffer(r["embedding"], dtype=np.float32))
+        if has_ext:
+            et = (r["element_type"] or "").lower() if "element_type" in r.keys() else ""
+            attrs_raw = r["attrs"] if "attrs" in r.keys() else None
+            try:
+                attrs = json.loads(attrs_raw) if attrs_raw else {}
+            except Exception:
+                attrs = {}
+            meta.append(
+                {
+                    "id": r["id"],
+                    "page": r["page"],
+                    "section_path": r["section_path"],
+                    "text": r["text"],
+                    "element_type": et,
+                    "attrs": attrs,
+                }
+            )
+            vecs.append(np.frombuffer(r["embedding"], dtype=np.float32))
+        else:
+            meta.append(
+                {
+                    "id": r["id"],
+                    "page": r["page"],
+                    "section_path": r["section_path"],
+                    "text": r["text"],
+                    # полей нет в схеме — оставим пустыми
+                    "element_type": "",
+                    "attrs": {},
+                }
+            )
+            vecs.append(np.frombuffer(r["embedding"], dtype=np.float32))
 
     mat = np.vstack(vecs)  # [N, D]
     # Нормируем по L2 для косинуса
     norms = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-9
-    mat = mat / norms
+    mat = (mat / norms).astype(np.float32, copy=False)
 
-    pack = {"mat": mat.astype(np.float32, copy=False), "meta": meta}
+    pack = {"mat": mat, "meta": meta}
     _DOC_CACHE[key] = pack
     return pack
+
+
+# ---------------------------
+# Вспомогалки сигналы/классы
+# ---------------------------
+
+_NUM_RE = re.compile(r"\b\d+(?:[.,]\d+)?%?\b")
+
+def _extract_numbers(s: str) -> set[str]:
+    return set(_NUM_RE.findall(s or ""))
+
+def _classify_by_prefix(text: str) -> str:
+    """Классификация по префиксам из indexing.py, если нет element_type в БД."""
+    t = (text or "").lower()
+    if t.startswith("[таблица]"):
+        return "table"
+    if t.startswith("[рисунок]"):
+        return "figure"
+    if t.startswith("[заголовок]"):
+        return "heading"
+    if t.startswith("[страница]"):
+        return "page"
+    return "text"
+
+def _chunk_type(meta: Dict) -> str:
+    """Читаем element_type из БД, при его отсутствии — по префиксу текста."""
+    et = (meta.get("element_type") or "").lower()
+    if et:
+        return et
+    return _classify_by_prefix(meta.get("text") or "")
+
+def _query_signals(q: str) -> Dict[str, bool]:
+    ql = (q or "").lower()
+    return {
+        "ask_table": bool(re.search(r"\bтабл|таблица\b", ql)),
+        "ask_figure": bool(re.search(r"\bрис\.?|рисунок\b", ql)),
+        "ask_heading": bool(re.search(r"\bглава\b|\bраздел\b|\bвведение\b|\bзаключение\b", ql)),
+    }
 
 
 # ---------------------------
@@ -75,7 +157,7 @@ def _embed_query(query: str) -> Optional[np.ndarray]:
 
 def retrieve(owner_id: int, doc_id: int, query: str, top_k: int = 8) -> List[Dict]:
     """
-    Возвращает top-k чанков по косинусному сходству с вопросом.
+    Возвращает top-k чанков по косинусному сходству с вопросом (с лёгким переранжированием).
     Каждый элемент: {id, page, section_path, text, score}.
     """
     pack = _load_doc(owner_id, doc_id)
@@ -87,16 +169,66 @@ def retrieve(owner_id: int, doc_id: int, query: str, top_k: int = 8) -> List[Dic
         return []
 
     sims = pack["mat"] @ q  # косинус
-    k = min(top_k, sims.shape[0])
-    if k <= 0:
+    N = sims.shape[0]
+    # Возьмём побольше кандидатов для переранжа
+    prelim_k = max(top_k * 3, top_k, 16)
+    prelim_k = min(prelim_k, N)
+    if prelim_k <= 0:
         return []
 
-    # Быстрый выбор top-k без полного сортирования
-    idx = np.argpartition(-sims, range(k))[:k]
-    idx = idx[np.argsort(-sims[idx])]
+    # Быстрый выбор top-prelim_k без полного сортирования
+    idx = np.argpartition(-sims, range(prelim_k))[:prelim_k]
+    idx = idx[np.argsort(-sims[idx])]  # <-- фикс: argsort латиницей
+
+    # Переранж: тип чанка/совпадения номеров/чисел
+    sig = _query_signals(query)
+    q_nums = _extract_numbers(query)
+    tab_pat = _mk_table_pattern(query)
+    fig_pat = _mk_figure_pattern(query)
+    tab_rgx = re.compile(tab_pat, re.IGNORECASE) if tab_pat else None
+    fig_rgx = re.compile(fig_pat, re.IGNORECASE) if fig_pat else None
+
+    rescored: List[Tuple[int, float]] = []
+    for i in idx:
+        m = pack["meta"][int(i)]
+        text = (m["text"] or "")
+        score = float(sims[i])
+
+        ctype = _chunk_type(m)
+
+        # Тематические бусты по типу чанка
+        if sig["ask_table"] and ctype in {"table", "table_row"}:
+            score += 0.10
+        if sig["ask_figure"] and ctype in {"figure"}:
+            score += 0.08
+        if sig["ask_heading"] and ctype in {"heading"}:
+            score += 0.05
+
+        # Совпадение конкретного номера таблицы/рисунка
+        if tab_rgx and tab_rgx.search(text):
+            score += 0.22
+        if fig_rgx and fig_rgx.search(text):
+            score += 0.22
+
+        # Совпадение чисел (до +0.10 суммарно)
+        if q_nums:
+            c_nums = _extract_numbers(text)
+            inter = len(q_nums & c_nums)
+            if inter:
+                score += min(0.02 * inter, 0.10)
+
+        # Лёгкий штраф для «страниц», если не спрашивали именно про разделы/структуру
+        if ctype == "page" and not (sig["ask_table"] or sig["ask_figure"] or sig["ask_heading"]):
+            score -= 0.02
+
+        rescored.append((int(i), score))
+
+    # Финальная сортировка по новым скорингам
+    rescored.sort(key=lambda x: -x[1])
+    best = rescored[:top_k]
 
     out: List[Dict] = []
-    for i in idx:
+    for i, sc in best:
         m = pack["meta"][int(i)]
         out.append(
             {
@@ -104,7 +236,7 @@ def retrieve(owner_id: int, doc_id: int, query: str, top_k: int = 8) -> List[Dic
                 "page": m["page"],
                 "section_path": m["section_path"],
                 "text": (m["text"] or "").strip(),
-                "score": float(sims[i]),
+                "score": float(sc),
             }
         )
     return out
@@ -112,16 +244,25 @@ def retrieve(owner_id: int, doc_id: int, query: str, top_k: int = 8) -> List[Dic
 
 def build_context(snippets: List[Dict], max_chars: int = 6000) -> str:
     """
-    Склеивает фрагменты в вид:
-    [Источник N] ...текст... (стр. X • Раздел)
+    Склеивает фрагменты ТОЛЬКО текстом без каких-либо ссылочных пометок
+    (никаких страниц/разделов в квадратных скобках). Блоки разделяются пустой строкой.
     """
-    parts, total = [], 0
-    for i, s in enumerate(snippets, 1):
-        block = f"[Источник {i}] {s['text']}  (стр. {s['page']} • {s['section_path']})"
+    parts: List[str] = []
+    total = 0
+    for s in snippets:
+        block = (s.get("text") or "").strip()
+        if not block:
+            continue
+        # Урезаем последний блок, чтобы не превысить max_chars
         if total + len(block) > max_chars:
-            break
+            remaining = max_chars - total
+            if remaining <= 0:
+                break
+            block = block[:remaining]
         parts.append(block)
         total += len(block)
+        if total >= max_chars:
+            break
     return "\n\n".join(parts)
 
 
@@ -144,7 +285,6 @@ def _mk_table_pattern(q: str) -> Optional[str]:
     if not m:
         return None
     num = f"{m.group(1)}[.,]{m.group(2)}"
-    # варианты 'таблица 3.1', 'табл. 3,1'
     return rf"(табл(?:ица)?\.?\s*{num})"
 
 
@@ -193,12 +333,6 @@ def keyword_find(owner_id: int, doc_id: int, pattern: str, max_hits: int = 3) ->
     return hits
 
 
-# Экспортируем паттерн-хелперы, чтобы дергать их в bot.py перед обычным RAG
-# Пример использования:
-#   pat = _mk_table_pattern(question) or _mk_figure_pattern(question)
-#   if pat:
-#       hits = keyword_find(uid, doc_id, pat)
-#       if hits: ... ответить короткой справкой про страницы/фрагменты
 __all__ = [
     "retrieve",
     "build_context",
