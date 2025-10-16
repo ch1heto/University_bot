@@ -1,6 +1,6 @@
 import re
 import json
-from .polza_client import chat
+from .polza_client import chat_with_gpt  # Используем GPT-5 для генерации ответов
 
 # -------------------- СИСТЕМНЫЕ ПОДСКАЗКИ --------------------
 
@@ -119,7 +119,7 @@ def expand_text(question: str, ctx: str) -> str:
         "Сохрани все факты и ограничения, не добавляй новых сведений.\n\n"
         f"Запрос: {question}"
     )
-    return chat(
+    return chat_with_gpt(
         [
             {"role": "system", "content": SYS_EXPAND},
             {"role": "assistant", "content": f"Контекст:\n{ctx}"},
@@ -131,7 +131,7 @@ def expand_text(question: str, ctx: str) -> str:
 
 def explain_answer(question: str, ctx: str) -> str:
     """Тёплое развёрнутое объяснение на основе контекста (без выдумывания фактов)."""
-    return chat(
+    return chat_with_gpt(
         [
             {"role": "system", "content": SYS_EXPLAIN},
             {"role": "assistant", "content": f"Контекст:\n{ctx}"},
@@ -143,7 +143,7 @@ def explain_answer(question: str, ctx: str) -> str:
 
 def draft_answer(question: str, ctx: str) -> str:
     """Генерация черновика строго по контексту."""
-    return chat(
+    return chat_with_gpt(
         [
             {"role": "system", "content": SYS_ANSWER},
             {"role": "assistant", "content": f"Контекст:\n{ctx}"},
@@ -154,7 +154,7 @@ def draft_answer(question: str, ctx: str) -> str:
 
 def critique_json(draft: str, ctx: str) -> dict:
     """Критик → компактный JSON-отчёт (с дефолтами при сбое)."""
-    raw = chat(
+    raw = chat_with_gpt(
         [
             {"role": "system", "content": SYS_CRITIC},
             {"role": "assistant", "content": f"КОНТЕКСТ:\n{ctx}"},
@@ -195,7 +195,7 @@ def critique_json(draft: str, ctx: str) -> dict:
 
 def edit_answer(draft: str, ctx: str, report: dict) -> str:
     """Редактируем черновик по замечаниям критика."""
-    return chat(
+    return chat_with_gpt(
         [
             {"role": "system", "content": SYS_EDITOR},
             {"role": "assistant", "content": f"КОНТЕКСТ:\n{ctx}"},
@@ -237,7 +237,7 @@ def ace_once(question: str, ctx: str, pass_score: int = 85) -> str:
 
 def agent_no_context(question: str) -> str:
     """Агентный ответ без документа (ограничен доменом ВКР)."""
-    return chat(
+    return chat_with_gpt(
         [
             {"role": "system", "content": SYS_NO_CONTEXT},
             {"role": "user", "content": question},

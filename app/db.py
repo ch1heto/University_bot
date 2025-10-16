@@ -42,7 +42,6 @@ def _table_info(con: sqlite3.Connection, table: str) -> set[str]:
     return {row[1] for row in cur.fetchall()}
 
 def _try_exec_many(con: sqlite3.Connection, sqls: Iterable[str]) -> None:
-    cur = con.cursor
     cur = con.cursor()
     for s in sqls:
         cur.execute(s)
@@ -128,7 +127,7 @@ def _ensure_fts(con: sqlite3.Connection) -> None:
         )
 
         # Триггеры синхронизации
-        cur.executescript("""
+        cur.executescript(""" 
         CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
             INSERT INTO chunks_fts(rowid, text, section_path)
             VALUES (new.id, new.text, new.section_path);

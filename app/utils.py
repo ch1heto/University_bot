@@ -160,3 +160,34 @@ def infer_doc_kind(filename: str | None) -> str:
     if ext in {".doc", ".docx", ".pdf"}:
         return "thesis"
     return "file"
+
+# ------------------------- НОВАЯ ФУНКЦИЯ: РАЗБИТИЕ ДОКУМЕНТА НА ЧАСТИ -------------------------
+
+def split_document(text: str, max_chunk_size: int = 3000) -> List[str]:
+    """
+    Разбивает текст на части, чтобы каждая часть не превышала заданный размер в символах.
+    Это нужно для обработки больших документов, которые могут не поместиться в запрос к GPT-5.
+    
+    :param text: Текст документа, который нужно разделить.
+    :param max_chunk_size: Максимальный размер части в символах.
+    :return: Список частей текста, каждая из которых имеет размер не более max_chunk_size.
+    """
+    # Разбиваем текст на строки, чтобы сохранить структуру
+    chunks = []
+    current_chunk = ""
+    
+    # Разделяем текст на строки
+    for line in text.splitlines():
+        # Добавляем строку в текущий чанк, если не превышает максимальный размер
+        if len(current_chunk) + len(line) + 1 <= max_chunk_size:
+            current_chunk += (line + "\n")
+        else:
+            # Если превышает, сохраняем текущий чанк и начинаем новый
+            chunks.append(current_chunk.strip())
+            current_chunk = line + "\n"
+    
+    # Добавляем последний чанк, если он не пустой
+    if current_chunk.strip():
+        chunks.append(current_chunk.strip())
+    
+    return chunks

@@ -1,13 +1,14 @@
+# app/retrieval.py
 import re
 import json
 import numpy as np
 from typing import Optional, List, Dict, Tuple
+
 from .db import get_conn
-from .polza_client import embeddings
+from .polza_client import embeddings  # только эмбеддинги; чат не используется здесь
 
 # Кэш векторов на процесс: (owner_id, doc_id) -> {"mat": np.ndarray [N,D], "meta": list[dict]}
 _DOC_CACHE: dict[tuple[int, int], dict] = {}
-
 
 # ---------------------------
 # Утилиты схемы
@@ -18,7 +19,6 @@ def _table_has_columns(con, table: str, cols: List[str]) -> bool:
     cur.execute(f"PRAGMA table_info({table})")
     have = {row[1] for row in cur.fetchall()}
     return all(c in have for c in cols)
-
 
 # ---------------------------
 # Загрузка матрицы документа
@@ -101,7 +101,6 @@ def _load_doc(owner_id: int, doc_id: int) -> dict:
     _DOC_CACHE[key] = pack
     return pack
 
-
 # ---------------------------
 # Вспомогалки сигналы/классы
 # ---------------------------
@@ -125,20 +124,28 @@ def _classify_by_prefix(text: str) -> str:
     return "text"
 
 def _chunk_type(meta: Dict) -> str:
-    """Читаем element_type из БД, при его отсутствии — по префиксу текста."""
+    """
+    Читаем element_type из БД. Если отсутствует —:
+    1) по названию раздела распознаём 'reference' (Источники/Список литературы/Библиография/References);
+    2) иначе по префиксу текста.
+    """
     et = (meta.get("element_type") or "").lower()
     if et:
         return et
+    sec = (meta.get("section_path") or "").lower()
+    if ("источник" in sec) or ("литератур" in sec) or ("библиограф" in sec) or ("reference" in sec):
+        return "reference"
     return _classify_by_prefix(meta.get("text") or "")
 
 def _query_signals(q: str) -> Dict[str, bool]:
     ql = (q or "").lower()
     return {
-        "ask_table": bool(re.search(r"\bтабл|таблица\b", ql)),
-        "ask_figure": bool(re.search(r"\bрис\.?|рисунок\b", ql)),
+        "ask_table":   bool(re.search(r"\bтабл|таблица\b", ql)),
+        "ask_figure":  bool(re.search(r"\bрис\.?|рисунок\b", ql)),
         "ask_heading": bool(re.search(r"\bглава\b|\bраздел\b|\bвведение\b|\bзаключение\b", ql)),
+        "ask_sources": bool(re.search(r"\bисточник(?:и|ов)?\b|\bсписок\s+литературы\b|\bбиблиограф", ql) or
+                            re.search(r"\breferences?\b", ql)),
     }
-
 
 # ---------------------------
 # Основной RAG-поиск
@@ -153,7 +160,6 @@ def _embed_query(query: str) -> Optional[np.ndarray]:
         return q
     except Exception:
         return None
-
 
 def retrieve(owner_id: int, doc_id: int, query: str, top_k: int = 8) -> List[Dict]:
     """
@@ -178,7 +184,7 @@ def retrieve(owner_id: int, doc_id: int, query: str, top_k: int = 8) -> List[Dic
 
     # Быстрый выбор top-prelim_k без полного сортирования
     idx = np.argpartition(-sims, range(prelim_k))[:prelim_k]
-    idx = idx[np.argsort(-sims[idx])]  # <-- фикс: argsort латиницей
+    idx = idx[np.argsort(-sims[idx])]  # фикс: argsort латиницей
 
     # Переранж: тип чанка/совпадения номеров/чисел
     sig = _query_signals(query)
@@ -199,10 +205,12 @@ def retrieve(owner_id: int, doc_id: int, query: str, top_k: int = 8) -> List[Dic
         # Тематические бусты по типу чанка
         if sig["ask_table"] and ctype in {"table", "table_row"}:
             score += 0.10
-        if sig["ask_figure"] and ctype in {"figure"}:
+        if sig["ask_figure"] and ctype == "figure":
             score += 0.08
-        if sig["ask_heading"] and ctype in {"heading"}:
+        if sig["ask_heading"] and ctype == "heading":
             score += 0.05
+        if sig["ask_sources"] and ctype == "reference":
+            score += 0.25  # заметный буст для списка литературы
 
         # Совпадение конкретного номера таблицы/рисунка
         if tab_rgx and tab_rgx.search(text):
@@ -218,7 +226,7 @@ def retrieve(owner_id: int, doc_id: int, query: str, top_k: int = 8) -> List[Dic
                 score += min(0.02 * inter, 0.10)
 
         # Лёгкий штраф для «страниц», если не спрашивали именно про разделы/структуру
-        if ctype == "page" and not (sig["ask_table"] or sig["ask_figure"] or sig["ask_heading"]):
+        if ctype == "page" and not (sig["ask_table"] or sig["ask_figure"] or sig["ask_heading"] or sig["ask_sources"]):
             score -= 0.02
 
         rescored.append((int(i), score))
@@ -269,7 +277,6 @@ def build_context(snippets: List[Dict], max_chars: int = 6000) -> str:
 def invalidate_cache(owner_id: int, doc_id: int):
     """Сбрасывает кэш матрицы для документа (вызывать после переиндексации)."""
     _DOC_CACHE.pop((owner_id, doc_id), None)
-
 
 # ---------------------------
 # Keyword-fallback (опционально)
@@ -331,13 +338,3 @@ def keyword_find(owner_id: int, doc_id: int, pattern: str, max_hits: int = 3) ->
             if len(hits) >= max_hits:
                 break
     return hits
-
-
-__all__ = [
-    "retrieve",
-    "build_context",
-    "invalidate_cache",
-    "_mk_table_pattern",
-    "_mk_figure_pattern",
-    "keyword_find",
-]

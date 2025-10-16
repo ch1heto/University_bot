@@ -1,3 +1,4 @@
+# app/indexing.py
 import json
 import numpy as np
 from typing import List, Dict, Any, Iterable
@@ -31,6 +32,8 @@ def _prefix(section: Dict[str, Any]) -> str:
         pfx_parts.append("[Рисунок]")
     elif et == "page":
         pfx_parts.append("[Страница]")
+    elif et == "reference":
+        pfx_parts.append("[Источник]")  # Новый префикс для источников
     else:
         pfx_parts.append("[Текст]")
 
@@ -50,6 +53,7 @@ def _yield_chunks_for_section(
 
     - Таблицы -> одна строка = один чанк (element_type='table_row', attrs: row_index).
     - Заголовки -> отдельный маленький чанк (element_type='heading').
+    - Источники — каждый источник как отдельный чанк (element_type='reference').
     - Остальной текст -> split_into_chunks(...) (element_type='paragraph' или исходный для page/figure).
     """
     et = (section.get("element_type") or "").lower()
@@ -64,6 +68,12 @@ def _yield_chunks_for_section(
     if et == "heading":
         head_txt = f"{prefix}"
         yield head_txt, {"page": page, "section_path": section_path}, "heading", base_attrs
+        return
+
+    # Источник — отдельный чанк
+    if et == "reference":
+        ref_title = f"{prefix} — {title}"
+        yield ref_title, {"page": page, "section_path": section_path}, "reference", base_attrs
         return
 
     # Таблица — построчно

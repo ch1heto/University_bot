@@ -3,7 +3,7 @@ import re
 from typing import List, Dict, Any, Optional, Tuple
 
 from .db import get_conn
-from .polza_client import chat
+from .polza_client import chat_with_gpt  # Используем GPT-5 для генерации резюме
 
 # ----------------------- СИСТЕМНЫЙ ПРОМТ ДЛЯ РЕЗЮМЕ -----------------------
 
@@ -34,6 +34,58 @@ def _fetchall(con, sql: str, params: Tuple[Any, ...]) -> List[Dict[str, Any]]:
     cur.execute(sql, params)
     rows = cur.fetchall()
     return [dict(r) for r in rows]
+
+# ----------------------- СБОР СНИППЕТОВ ДЛЯ ОБЗОРА -----------------------
+
+# Сбор всего текста документа
+def _collect_full_text(owner_id: int, doc_id: int) -> str:
+    """
+    Собирает весь текст документа, включая все части (главы, параграфы, таблицы и т. д.).
+    """
+    con = get_conn()
+    cur = con.cursor()
+    cur.execute(
+        "SELECT text FROM chunks WHERE owner_id=? AND doc_id=? ORDER BY page ASC, id ASC",
+        (owner_id, doc_id)
+    )
+    rows = cur.fetchall()
+    con.close()
+
+    # Собираем весь текст в одну строку
+    full_text = "\n\n".join([row["text"] for row in rows if row["text"]])
+
+    return full_text
+
+# ----------------------- ПОСТРОЕНИЕ КОНТЕКСТА -----------------------
+
+def _clean(s: str) -> str:
+    return (s or "").replace("\xa0", " ").strip()
+
+def _build_context_block(rows: List[Dict[str, Any]], max_chars: int = 6000) -> str:
+    """
+    Формирует контекст вида:
+    [Источник N] ...текст... (стр. X • Раздел)
+    """
+    parts, total = [], 0
+    for i, r in enumerate(rows, 1):
+        page = r.get("page")
+        sec = r.get("section_path")
+        text = _clean(r.get("text") or "")
+        block = f"[Источник {i}] {text}  (стр. {page} • {sec})"
+        if total + len(block) > max_chars:
+            break
+        parts.append(block)
+        total += len(block)
+    return "\n\n".join(parts)
+
+def make_full_context(owner_id: int, doc_id: int, max_chars: int = 6000) -> str:
+    """
+    Формирует полный контекст, включающий весь текст документа.
+    """
+    full_text = _collect_full_text(owner_id, doc_id)
+
+    # Ограничиваем размер контекста
+    return full_text[:max_chars]  # Чтобы не превысить лимит символов
 
 # ----------------------- СБОР СНИППЕТОВ ДЛЯ ОБЗОРА -----------------------
 
@@ -101,7 +153,7 @@ def _collect_keylines(owner_id: int, doc_id: int, limit: int = 30) -> List[Dict[
             out.append(r)
     return out[:limit]
 
-def _collect_tables(owner_id: int, doc_id: int, max_tables: int = 8, sample_rows: int = 2) -> List[Dict[str, Any]]:
+def _collect_tables(owner_id: int, doc_id: int, max_tables: int = 8, sample_rows: int = 2) -> List[Dict[str, Any]]: 
     """
     Собирает список таблиц (уникальные base_name) и несколько первых строк каждой.
     Совместимо со старым индексом: ищем префикс '[Таблица]' и section_path с суффиксом ' [row N]'.
@@ -156,7 +208,7 @@ def _collect_tables(owner_id: int, doc_id: int, max_tables: int = 8, sample_rows
 
     return result
 
-def _collect_figures(owner_id: int, doc_id: int, max_figs: int = 8) -> List[Dict[str, Any]]:
+def _collect_figures(owner_id: int, doc_id: int, max_figs: int = 8) -> List[Dict[str, Any]]: 
     """
     Грубый сбор «рисунков» — по префиксу '[Рисунок]' (совместимость со старым индексом).
     """
@@ -181,75 +233,20 @@ def _collect_figures(owner_id: int, doc_id: int, max_figs: int = 8) -> List[Dict
     con.close()
     return [{"name": r["section_path"]} for r in rows if r.get("section_path")]
 
-# ----------------------- ПОСТРОЕНИЕ КОНТЕКСТА -----------------------
-
-def _clean(s: str) -> str:
-    return (s or "").replace("\xa0", " ").strip()
-
-def _build_context_block(rows: List[Dict[str, Any]], max_chars: int = 6000) -> str:
-    """
-    Формирует контекст вида:
-    [Источник N] ...текст... (стр. X • Раздел)
-    """
-    parts, total = [], 0
-    for i, r in enumerate(rows, 1):
-        page = r.get("page")
-        sec = r.get("section_path")
-        text = _clean(r.get("text") or "")
-        block = f"[Источник {i}] {text}  (стр. {page} • {sec})"
-        if total + len(block) > max_chars:
-            break
-        parts.append(block)
-        total += len(block)
-    return "\n\n".join(parts)
-
-def make_overview_context(owner_id: int, doc_id: int,
-                          *, add_tables: bool = True,
-                          max_chars: int = 6000) -> str:
-    """
-    Делает «обзорный» контекст для резюме:
-    1) Заголовки (первые до 50)
-    2) Ключевые строки (цели, задачи, методы, выводы…)
-    3) По таблицам: первые строки нескольких таблиц (если есть)
-    """
-    # 1) заголовки
-    heads = _collect_headings(owner_id, doc_id, limit=50)
-    # 2) ключевые строки
-    keys = _collect_keylines(owner_id, doc_id, limit=30)
-
-    rows: List[Dict[str, Any]] = []
-    rows.extend(heads)
-    rows.extend(keys)
-
-    # 3) таблицы — добавим как отдельные источники (по 1-2 строки на таблицу)
-    if add_tables:
-        tabs = _collect_tables(owner_id, doc_id, max_tables=6, sample_rows=2)
-        for t in tabs:
-            # собираем 1 блок на таблицу: «[Таблица ...] ряд i: ...»
-            name = t["name"]
-            for s in (t.get("samples") or []):
-                rows.append({
-                    "page": None,
-                    "section_path": name,
-                    "text": s
-                })
-
-    return _build_context_block(rows, max_chars=max_chars)
-
-# ----------------------- ВЫСОКООРОВНЕВЫЕ API -----------------------
+# ----------------------- ВЫСОКОУРОВНЕВЫЕ API -----------------------
 
 def summarize_document(owner_id: int, doc_id: int) -> str:
     """
     Делаем краткое резюме дипломной работы:
-    — строим обзорный контекст,
+    — строим полный контекст,
     — отправляем в модель с SYS_SUMMARY,
     — возвращаем ответ.
     """
-    ctx = make_overview_context(owner_id, doc_id, add_tables=True, max_chars=6000)
+    ctx = make_full_context(owner_id, doc_id, max_chars=6000)
     if not ctx.strip():
         return ("Не удалось собрать достаточно контекста для резюме. "
                 "Проверьте, что в работе есть текстовые разделы (цели/задачи/методы/выводы).")
-    reply = chat(
+    reply = chat_with_gpt(
         [
             {"role": "system", "content": SYS_SUMMARY},
             {"role": "assistant", "content": f"Контекст:\n{ctx}"},
@@ -258,46 +255,3 @@ def summarize_document(owner_id: int, doc_id: int) -> str:
         temperature=0.2,
     )
     return reply
-
-def list_tables_overview(owner_id: int, doc_id: int,
-                         *, include_samples: bool = True,
-                         sample_rows: int = 2) -> str:
-    """
-    Возвращает текстовую справку по найденным таблицам и (опционально) первые строки.
-    """
-    tabs = _collect_tables(owner_id, doc_id, max_tables=20, sample_rows=sample_rows if include_samples else 0)
-    if not tabs:
-        return "Таблиц в индексе не найдено."
-    lines = ["Найденные таблицы:"]
-    for t in tabs:
-        lines.append(f"• {t['name']}")
-        if include_samples and t.get("samples"):
-            for i, s in enumerate(t["samples"], 1):
-                lines.append(f"    — ряд {i}: {s}")
-    return "\n".join(lines)
-
-def list_figures_overview(owner_id: int, doc_id: int) -> str:
-    """
-    Возвращает перечень распознанных «рисунков» (по префиксу).
-    """
-    figs = _collect_figures(owner_id, doc_id, max_figs=30)
-    if not figs:
-        return "Рисунков в индексе не найдено."
-    lines = ["Найденные рисунки:"] + [f"• {f['name']}" for f in figs]
-    return "\n".join(lines)
-
-def quick_outline(owner_id: int, doc_id: int) -> str:
-    """
-    Плоский оглавление-эскиз по заголовкам в порядке следования.
-    Уровни не восстанавливаем (в chunks нет), но для навигации полезно.
-    """
-    heads = _collect_headings(owner_id, doc_id, limit=120)
-    if not heads:
-        return "Заголовки в индексе не найдены."
-    out = ["Черновик оглавления:"]
-    for h in heads:
-        # удалим префикс [Заголовок] при старом индексе
-        t = (h["text"] or "")
-        t = re.sub(r"^\[Заголовок\]\s*", "", t).strip()
-        out.append(f"• {t}")
-    return "\n".join(out)

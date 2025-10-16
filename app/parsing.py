@@ -1,3 +1,4 @@
+# app/parsing.py
 from docx import Document as Docx
 from docx.table import Table
 from docx.text.paragraph import Paragraph
@@ -193,6 +194,30 @@ def _classify_caption(text: str) -> Tuple[Optional[str], Optional[str]]:
         return "figure", title
     return None, None
 
+# ----------------------------- sources helpers -----------------------------
+
+SOURCES_TITLE_RE = re.compile(r"(источник|список\s+литератур|библиограф|references?)", re.IGNORECASE)
+REF_LINE_RE = re.compile(r"^\s*(?:\[(\d+)\]|(\d+)[\.\)])\s*(.+)$")
+
+def _is_sources_title(s: str) -> bool:
+    return bool(SOURCES_TITLE_RE.search(s or ""))
+
+def _parse_reference_line(s: str) -> Tuple[Optional[int], str]:
+    """
+    Из строки источника выделяет номер (если есть) и «хвост».
+    Поддерживает формы: "[12] …", "12. …", "12) …".
+    """
+    t = _clean(s)
+    m = REF_LINE_RE.match(t)
+    if not m:
+        return None, t
+    num = m.group(1) or m.group(2)
+    try:
+        idx = int(num)
+    except Exception:
+        idx = None
+    return idx, (m.group(3) or "").strip()
+
 # ----------------------------- section-path helpers -----------------------------
 
 def _hpath_str(stack: List[str]) -> str:
@@ -205,6 +230,8 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
     Парсим .docx с поддержкой заголовков, таблиц, базового форматирования, пометок о картинках и
     корректной обработкой подписей (таблица/рисунок). Для секций формируем иерархический section_path
     по стеку заголовков: 'Глава 1 / 1.1 Введение / Таблица 1.1 — ...'.
+    Также распознаём раздел «Источники/Список литературы/Библиография/References» и помечаем его
+    элементы как element_type='reference'.
     """
     doc = Docx(path)
 
@@ -215,6 +242,9 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
     # текущий заголовок и стек заголовков для section_path
     title, level = "Документ", 0
     heading_stack: List[str] = []
+
+    # состояние: находимся ли в разделе «Источники»
+    in_sources = False
 
     # ожидаемая подпись
     pending_caption_tbl: Optional[str] = None
@@ -260,6 +290,9 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                 heading_stack = heading_stack[:level]
                 heading_stack[level - 1] = title
 
+                # режим «Источники»
+                in_sources = _is_sources_title(title)
+
                 # сбрасываем ожидаемые подписи
                 pending_caption_tbl = None
                 pending_caption_fig = None
@@ -276,6 +309,26 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                 })
                 continue
 
+            # Если мы в разделе Источников — каждый непустой абзац трактуем как запись reference
+            if in_sources and p_text:
+                flush_text_section()
+                idx, tail = _parse_reference_line(p_text)
+                attrs = _paragraph_attrs(block)
+                attrs.update({"numbers": _extract_numbers(tail)})
+                if idx is not None:
+                    attrs["ref_index"] = idx
+                ref_title = f"Источник {idx}" if idx is not None else "Источник"
+                sections.append({
+                    "title": ref_title,
+                    "level": max(1, level + 1),
+                    "text": tail,
+                    "page": None,
+                    "section_path": _hpath_str(heading_stack + [ref_title]),
+                    "element_type": "reference",
+                    "attrs": attrs,
+                })
+                continue
+
             # Подпись (caption) — разруливаем двусмысленность
             if p_style == "caption" or CAPTION_RE_TABLE.match(p_text or "") or CAPTION_RE_FIG.match(p_text or ""):
                 kind, norm = _classify_caption(p_text or "")
@@ -286,7 +339,7 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                     pending_caption_fig = norm or p_text or None
                     pending_caption_tbl = None
                 else:
-                    # caption без ключевого слова — пока игнорируем, не мешаем
+                    # caption без ключевого слова — игнорируем
                     pass
                 continue
 
@@ -307,7 +360,7 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                 pending_caption_fig = None
                 continue
 
-            # Обычный текст — копим в буфер, но запомним attrs последнего абзаца
+            # Обычный текст — копим в буфер
             if p_text:
                 last_para_attrs = _paragraph_attrs(block)
                 buf.append(p_text)
@@ -343,11 +396,13 @@ def parse_pdf(path: str) -> List[Dict[str, Any]]:
     Простой парсинг PDF:
     - постраничный текст (element_type='page')
     - попытка извлечения простых таблиц (element_type='table')
+    - эвристическое извлечение списка литературы (element_type='reference')
     """
     out: List[Dict[str, Any]] = []
     with pdfplumber.open(path) as pdf:
         for i, page in enumerate(pdf.pages, 1):
             text = page.extract_text() or ""
+
             out.append({
                 "title": f"Стр. {i}",
                 "level": 1,
@@ -357,6 +412,7 @@ def parse_pdf(path: str) -> List[Dict[str, Any]]:
                 "element_type": "page",
                 "attrs": {"numbers": _extract_numbers(text)}
             })
+
             # простые таблицы (если распознаны)
             try:
                 tables = page.extract_tables()
@@ -384,6 +440,33 @@ def parse_pdf(path: str) -> List[Dict[str, Any]]:
                             })
                     except Exception:
                         pass
+
+            # эвристика для списка литературы на странице
+            has_sources_kw = bool(SOURCES_TITLE_RE.search(text))
+            ref_lines = []
+            for line in (text.splitlines() or []):
+                line = line.strip()
+                if not line:
+                    continue
+                m = REF_LINE_RE.match(line)
+                if m:
+                    idx = int(m.group(1) or m.group(2))
+                    tail = (m.group(3) or "").strip()
+                    ref_lines.append((idx, tail))
+
+            # если есть явные признаки — добавим как отдельные элементы
+            if has_sources_kw and len(ref_lines) >= 3:
+                for idx, tail in ref_lines:
+                    out.append({
+                        "title": f"Источник {idx}",
+                        "level": 2,
+                        "text": tail,
+                        "page": i,
+                        "section_path": f"Стр. {i} / Источник {idx}",
+                        "element_type": "reference",
+                        "attrs": {"ref_index": idx, "numbers": _extract_numbers(tail)}
+                    })
+
     return out
 
 # -------- .doc -> .docx без офисов (Aspose.Words) + альтернативы --------

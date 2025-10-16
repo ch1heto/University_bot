@@ -1,70 +1,68 @@
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from typing import List, Dict
-from .config import Cfg
+# app/polza_client.py
+from typing import List, Dict, Any
+import logging
+from openai import OpenAI
 
-# ----------------- HTTP сессия с ретраями -----------------
+from .config import Cfg  # берём ключ, базовый URL и имена моделей из одного места
 
-HDR = {
-    "Authorization": f"Bearer {Cfg.POLZA_KEY}",
-    "Content-Type": "application/json",
-}
 
-# Таймауты: (connect, read)
-TIMEOUT = (15, 120)
-
-_session = requests.Session()
-_retries = Retry(
-    total=3,            # всего попыток
-    connect=3,
-    read=3,
-    backoff_factor=1.5, # 0s, 1.5s, 3s, 4.5s ...
-    status_forcelist=[429, 502, 503, 504],
-    allowed_methods=frozenset({"GET", "POST"}),
+# Один общий клиент Polza/OpenAI
+_client = OpenAI(
+    base_url=Cfg.BASE_POLZA,   # например: "https://api.polza.ai/api/v1"
+    api_key=Cfg.POLZA_KEY,     # .env: POLZA_API_KEY=...
 )
-_adapter = HTTPAdapter(max_retries=_retries)
-_session.mount("https://", _adapter)
-_session.mount("http://", _adapter)
 
-def _post(path: str, *, json: dict) -> requests.Response:
-    url = f"{Cfg.BASE_POLZA}{path}"
-    return _session.post(url, headers=HDR, json=json, timeout=TIMEOUT)
+__all__ = ["embeddings", "chat_with_gpt", "probe_embedding_dim"]
 
-# ----------------- Публичные функции -----------------
 
 def embeddings(texts: List[str]) -> List[List[float]]:
     """
-    Возвращает список эмбеддингов для переданных текстов.
-    В случае сетевой/HTTP-ошибки возбуждает исключение — вызывающая сторона
-    (retrieval._embed_query) уже оборачивает вызов в try/except.
+    Получить эмбеддинги для списка текстов.
+    Возвращает список векторов float[]. Пустой ввод -> пустой список.
     """
-    r = _post(
-        "/embeddings",
-        json={"model": Cfg.POLZA_EMB, "input": texts},
-    )
-    r.raise_for_status()
-    data = r.json().get("data", [])
-    return [item["embedding"] for item in data]
+    if not texts:
+        return []
+    try:
+        resp = _client.embeddings.create(
+            model=Cfg.POLZA_EMB,   # например: "openai/text-embedding-3-large"
+            input=texts,
+        )
+        # Новый SDK возвращает объекты, а не словари
+        return [item.embedding for item in resp.data]
+    except Exception as e:
+        logging.exception(f"Ошибка при получении эмбеддингов: {e}")
+        raise
 
-def chat(messages: List[Dict], temperature: float = 0.2, max_tokens: int = 800) -> str:
+
+def chat_with_gpt(
+    messages: List[Dict[str, Any]],
+    temperature: float = 0.2,
+    max_tokens: int = 800,
+) -> str:
     """
-    Возвращает ответ модели как строку.
-    При сетевой/HTTP-ошибке НЕ падает — выдаёт вежливый фолбэк,
-    чтобы бот продолжал работу.
+    Отправить диалог в чат-модель и вернуть текстовый ответ.
     """
     try:
-        r = _post(
-            "/chat/completions",
-            json={
-                "model": Cfg.POLZA_CHAT,
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-            },
+        cmpl = _client.chat.completions.create(
+            model=Cfg.POLZA_CHAT,  # например: "openai/gpt-4o"
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
         )
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"]
-    except requests.exceptions.RequestException:
-        return ("Сейчас нет связи с модельным сервером. "
-                "Повторите запрос чуть позже.")
+        content = cmpl.choices[0].message.content or ""
+        return content.strip()
+    except Exception as e:
+        logging.error(f"Ошибка при запросе к чат-модели: {e}")
+        return "Произошла ошибка при обработке запроса. Попробуйте позже."
+
+
+def probe_embedding_dim(default: int | None = None) -> int | None:
+    """
+    Вспомогательно: вернуть размерность текущей эмбеддинг-модели.
+    Полезно, чтобы сверять с сохранённой размерностью в индексе.
+    """
+    try:
+        vec = embeddings(["__probe__"])[0]
+        return len(vec)
+    except Exception:
+        return default

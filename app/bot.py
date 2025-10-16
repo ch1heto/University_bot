@@ -1,6 +1,9 @@
+# app/bot.py
 import re
 import os
 import html
+import json
+import logging
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 
@@ -9,6 +12,7 @@ from .db import (
     ensure_user, get_conn,
     set_document_indexer_version, get_document_indexer_version,
     CURRENT_INDEXER_VERSION,
+    update_document_meta, delete_document_chunks,
 )
 from .parsing import parse_docx, parse_pdf, parse_doc, save_upload
 from .indexing import index_document
@@ -17,6 +21,7 @@ from .retrieval import (
     _mk_table_pattern, _mk_figure_pattern, keyword_find,
 )
 from .ace import ace_once, agent_no_context
+from .polza_client import probe_embedding_dim  # используем для профиля эмбеддингов
 
 # утилиты
 from .utils import safe_filename, sha256_bytes, split_for_telegram, infer_doc_kind
@@ -58,7 +63,7 @@ except Exception:
             """
             SELECT page, section_path, text
             FROM chunks
-            WHERE owner_id=? AND doc_id=?
+            WHERE owner_id=? AND doc_id=? 
               AND (text LIKE '[Заголовок]%%'
                    OR text LIKE '%%Цель%%'
                    OR text LIKE '%%Задач%%'
@@ -186,7 +191,7 @@ def _insert_document(con, owner_id: int, kind: str, path: str,
     return doc_id
 
 
-# ------------- Подсказка «какие таблицы есть» -------------
+# ------------- Подсказки: таблицы и источники -------------
 
 _TABLE_QUERY_HINT = re.compile(r"\bтаблиц", re.IGNORECASE)
 
@@ -202,19 +207,50 @@ def _plural_tables(n: int) -> str:
         return "таблицы"
     return "таблиц"
 
+def _last_segment(name: str) -> str:
+    """Берём последний сегмент после / и чистим мусор."""
+    s = (name or "").strip()
+    if "/" in s:
+        s = s.split("/")[-1].strip()
+    # убираем префикс [Таблица] если такой есть
+    if s.startswith("[Таблица]"):
+        s = s[len("[Таблица]"):].strip()
+    # нормализуем тире
+    s = re.sub(r"\s*[-–—]\s*", " — ", s)
+    s = re.sub(r"\s+", " ", s).strip(" .")
+    return s
+
+_TABLE_TITLE_RE = re.compile(r"(?i)\bтаблица\s+(\d+(?:\.\d+)*)(?:\s*[—\-–]\s*(.+))?")
+
+def _parse_table_title(text: str) -> tuple[str | None, str | None]:
+    """
+    Вернёт (номер, заголовок) если удалось распарсить.
+    """
+    t = (text or "").strip()
+    m = _TABLE_TITLE_RE.search(t)
+    if not m:
+        return (None, None)
+    num = m.group(1)
+    title = (m.group(2) or "").strip()
+    return (num, title or None)
+
+def _shorten(s: str, limit: int = 120) -> str:
+    s = (s or "").strip()
+    if len(s) <= limit:
+        return s
+    return s[:limit-1].rstrip() + "…"
+
 async def _list_tables_if_asked(uid: int, doc_id: int, q_text: str) -> str | None:
     """
-    Общий вопрос «какие таблицы есть…»:
-    1) если в chunks есть element_type — берём table/table_row;
-    2) иначе — по префиксам и свободному тексту (чувствительность к регистру отключена).
-    Отвечаем сразу списком и количеством, без RAG.
+    На общий вопрос «какие/сколько таблиц» выдаём короткие строки:
+    • Таблица 2.1 — Название (r×c)
     """
     if not _TABLE_QUERY_HINT.search(q_text) or re.search(r"\b\d+([.,]\d+)?\b", q_text):
         return None
 
     con = get_conn()
     cur = con.cursor()
-    has_type = _table_has_columns(con, "chunks", ["element_type"])
+    has_type = _table_has_columns(con, "chunks", ["element_type", "attrs"])
     if has_type:
         cur.execute(
             """
@@ -230,7 +266,6 @@ async def _list_tables_if_asked(uid: int, doc_id: int, q_text: str) -> str | Non
             (doc_id, uid),
         )
     else:
-        # Расширенный поиск: по префиксу, по section_path и просто по упоминанию "таблица" в тексте
         cur.execute(
             """
             SELECT DISTINCT
@@ -251,21 +286,143 @@ async def _list_tables_if_asked(uid: int, doc_id: int, q_text: str) -> str | Non
             """,
             (doc_id, uid),
         )
-    items = [r["base_name"] for r in cur.fetchall() if r["base_name"]]
+    base_items = [r["base_name"] for r in cur.fetchall() if r["base_name"]]
+    base_items = sorted(set(base_items), key=lambda s: s.lower())
+
+    lines = []
+    for base in base_items:
+        # пробуем вытащить «короткий заголовок» и размеры
+        short = _last_segment(base)
+
+        num, title = (None, None)
+        attrs = None
+        # сперва возьмём корневой элемент таблицы, если есть
+        cur.execute(
+            """
+            SELECT text, attrs FROM chunks
+            WHERE owner_id=? AND doc_id=? AND element_type='table'
+              AND (section_path=? OR section_path LIKE ? || ' [row %')
+            ORDER BY id ASC LIMIT 1
+            """,
+            (uid, doc_id, base, base),
+        )
+        row = cur.fetchone()
+        sample_text = row["text"] if row else ""
+        if row and row["attrs"]:
+            try:
+                attrs = json.loads(row["attrs"])
+            except Exception:
+                attrs = None
+
+        # если из текста ничего не поняли — попробуем из base/short
+        num, title = _parse_table_title(sample_text)
+        if not num:
+            num, title = _parse_table_title(short)
+        if not num:
+            # как минимум вернём короткое имя
+            display = short
+        else:
+            display = f"Таблица {num}" + (f" — {title}" if title else "")
+
+        # добавим краткое описание по размерам (если знаем)
+        if isinstance(attrs, dict):
+            r = attrs.get("n_rows")
+            c = attrs.get("n_cols")
+            if isinstance(r, int) and isinstance(c, int) and r > 0 and c > 0:
+                display += f" ({r}×{c})"
+
+        lines.append("• " + _shorten(display, 140))
+
     con.close()
 
-    if not items:
+    if not lines:
         return "В документе таблиц не найдено."
 
-    items = sorted(set(items), key=lambda s: s.lower())
-    total = len(items)
-    shown = items[:30]
+    total = len(lines)
+    shown = lines[:30]
     tail = total - len(shown)
     header = f"Нашёл {total} { _plural_tables(total) }:"
-    body = "• " + "\n• ".join(shown)
+    if tail > 0:
+        shown.append(f"… и ещё {tail}")
+    return header + "\n" + "\n".join(shown)
+
+
+# --- Источники (список литературы / references) ---
+
+_SOURCES_HINT = re.compile(
+    r"\b(источник(?:и|ов)?|список\s+литературы|библиограф\w*|references?)\b",
+    re.IGNORECASE
+)
+_REF_LINE_RE = re.compile(r"^\s*(?:\[\d+\]|\d+\.)\s+.+", re.MULTILINE)
+
+async def _list_sources_if_asked(uid: int, doc_id: int, q_text: str) -> str | None:
+    if not _SOURCES_HINT.search(q_text or ""):
+        return None
+
+    con = get_conn()
+    cur = con.cursor()
+
+    # 1) сначала пробуем разделы с соответствующим названием
+    cur.execute(
+        """
+        SELECT text FROM chunks
+        WHERE owner_id=? AND doc_id=? AND (
+            lower(section_path) LIKE '%источник%'
+         OR lower(section_path) LIKE '%литератур%'
+         OR lower(section_path) LIKE '%библиограф%'
+         OR lower(section_path) LIKE '%reference%'
+        )
+        ORDER BY page ASC, id ASC
+        """,
+        (uid, doc_id),
+    )
+    rows = cur.fetchall()
+    items: list[str] = []
+    for r in rows:
+        t = (r["text"] or "").strip()
+        if not t:
+            continue
+        # из блока текста вытащим «построчно» библиографические записи
+        for line in _REF_LINE_RE.findall(t):
+            line = re.sub(r"\s+", " ", line).strip().rstrip(".")
+            items.append(line)
+
+    # 2) если раздел не нашли — пробуем во всём документе по шаблону ссылок
+    if not items:
+        cur.execute(
+            "SELECT text FROM chunks WHERE owner_id=? AND doc_id=? ORDER BY page ASC, id ASC",
+            (uid, doc_id),
+        )
+        for r in cur.fetchall():
+            t = (r["text"] or "")
+            for line in _REF_LINE_RE.findall(t):
+                line = re.sub(r"\s+", " ", line).strip().rstrip(".")
+                items.append(line)
+
+    con.close()
+
+    # нормализуем и отфильтруем дубли
+    seen = set()
+    normed = []
+    for it in items:
+        k = it.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        normed.append(it)
+
+    if not normed:
+        return "Раздел «Источники/Список литературы» не найден или пуст."
+
+    total = len(normed)
+    shown = normed[:30]
+    tail = total - len(shown)
+    body = "\n".join(f"{i+1}. {shown[i]}" for i in range(len(shown)))
+    header = f"Нашёл {total} источников:"
     if tail > 0:
         body += f"\n… и ещё {tail}"
     return header + "\n" + body
+
 
 # --------- быстрый ответ: наличие практической части ---------
 _PRACTICAL_Q = re.compile(r"(есть ли|наличие|присутствует ли|имеется ли).{0,40}практическ", re.IGNORECASE)
@@ -291,7 +448,7 @@ def _has_practical_part(uid: int, doc_id: int) -> bool:
     return row is not None
 
 
-# ------------- ГОСТ-интент и проверка -------------
+# ------------- ГОСТ-интент и проверка ------------- 
 
 _GOST_HINT = re.compile(r"\b(гост|оформлени|шрифт|межстроч|кегл|выравнивани|поля|оформить)\w*\b", re.IGNORECASE)
 
@@ -320,7 +477,6 @@ async def _maybe_run_gost(m: types.Message, uid: int, doc_id: int, text: str) ->
     text_rep = render_report(report, max_issues=25)
     await _send(m, text_rep)
     return True
-
 
 # ------------------------------ helpers ------------------------------
 
@@ -440,6 +596,7 @@ async def start(m: types.Message):
 
 async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: str):
     q_text = (q_text or "").strip()
+    logging.debug(f"Получен запрос от пользователя: {q_text}")
     if not q_text:
         await _send(m, "Вопрос пустой. Напишите, что именно вас интересует по ВКР.")
         return
@@ -462,12 +619,17 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
             await _send(m, "В документе явных упоминаний практической части не найдено.")
         return
 
-    # --- СПИСОК ТАБЛИЦ: показываем и продолжаем ---
-    tables_hint_shown = False
-    hint = await _list_tables_if_asked(uid, doc_id, q_text)
-    if hint:
-        await _send(m, hint)
-        tables_hint_shown = True  # без return
+    # --- СПИСОК ИСТОЧНИКОВ ---
+    src_hint = await _list_sources_if_asked(uid, doc_id, q_text)
+    if src_hint:
+        await _send(m, src_hint)
+        return  # завершаем — пользователю нужен именно список источников
+
+    # --- СПИСОК ТАБЛИЦ ---
+    tbl_hint = await _list_tables_if_asked(uid, doc_id, q_text)
+    if tbl_hint:
+        await _send(m, tbl_hint)
+        return  # завершаем — не запускаем лишний RAG/ACE
 
     # 0) Точный verbatim-fallback по цитате (до всего остального)
     vb_hits = verbatim_find(uid, doc_id, q_text)
@@ -497,30 +659,22 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
             await _send(m, "\n\n".join(parts))
             return
 
-    # --- очищаем вопрос, если уже показали список таблиц ---
-    q_for_ace = q_text
-    if tables_hint_shown:
-        q_for_ace = re.sub(r"(?is)какие.+?таблиц[аиы]?(?:\?|$)", "", q_for_ace).strip()
-        if not q_for_ace:
-            q_for_ace = "Дай развёрнутое описание содержания работы: тема, цель, задачи, структура и ключевые выводы."
-
     # 2) «суть/кратко» — обзорный контекст и сразу ACE
-    if is_summary_intent(q_for_ace):
+    if is_summary_intent(q_text):
         ctx = overview_context(uid, doc_id, max_chars=6000)
         if not ctx:
             ctx = _first_chunks_context(uid, doc_id, n=12, max_chars=6000)
         if ctx:
-            reply = ace_once(q_for_ace, ctx)
+            reply = ace_once(q_text, ctx)
             await _send(m, reply)
             return
-        # если и это пусто — продолжаем обычным путём
 
     # 3) Гибридный контекст (lex + semantic)
-    ctx = best_context(uid, doc_id, q_for_ace, max_chars=6000)
+    ctx = best_context(uid, doc_id, q_text, max_chars=6000)
 
     # 4) fallback: чистый retrieve БЕЗ жёсткого порога
     if not ctx:
-        hits = retrieve(uid, doc_id, q_for_ace, top_k=8)
+        hits = retrieve(uid, doc_id, q_text, top_k=8)
         if hits:
             ctx = build_context(hits)
 
@@ -534,8 +688,55 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
         return
 
     # 6) Ответ — ACE (строго по контексту)
-    reply = ace_once(q_for_ace, ctx)
+    reply = ace_once(q_text, ctx)
     await _send(m, reply)
+
+
+# ------------------------------ эмбеддинг-профиль ------------------------------
+
+def _current_embedding_profile() -> str:
+    """
+    Подпись текущей эмбеддинг-модели для сохранения в documents.layout_profile.
+    Формат: 'emb=<MODEL>|dim=<D>' (dim может отсутствовать, если не удалось пробить).
+    """
+    dim = probe_embedding_dim(None)
+    if dim:
+        return f"emb={Cfg.POLZA_EMB}|dim={dim}"
+    return f"emb={Cfg.POLZA_EMB}"
+
+def _needs_reindex_by_embeddings(con, doc_id: int) -> bool:
+    """
+    Возвращает True, если документ должен быть переиндексирован из-за смены
+    модели/размерности эмбеддингов (или отсутствия профиля).
+    """
+    if not _table_has_columns(con, "documents", ["layout_profile"]):
+        return True  # старая БД — лучше переиндексировать
+    cur = con.cursor()
+    cur.execute("SELECT layout_profile FROM documents WHERE id=?", (doc_id,))
+    row = cur.fetchone()
+    stored = (row["layout_profile"] or "") if row else ""
+    if not stored:
+        return True  # профиль не записан — обновим
+    # сравним модель
+    cur_model = Cfg.POLZA_EMB.strip().lower()
+    stored_model = ""
+    stored_dim = None
+    for part in stored.split("|"):
+        part = (part or "").strip().lower()
+        if part.startswith("emb="):
+            stored_model = part[4:]
+        if part.startswith("dim="):
+            try:
+                stored_dim = int(part[4:])
+            except Exception:
+                stored_dim = None
+    if stored_model and stored_model != cur_model:
+        return True
+    # сравним размерность, если можем её пробить
+    cur_dim = probe_embedding_dim(None)
+    if cur_dim and stored_dim and stored_dim != cur_dim:
+        return True
+    return False
 
 
 # ------------------------------ загрузка файла ------------------------------
@@ -560,16 +761,24 @@ async def handle_doc(m: types.Message):
 
     if existing_id:
         existing_ver = get_document_indexer_version(existing_id) or 0
+
+        # проверка профиля эмбеддингов
+        need_reindex = False
+        try:
+            if _needs_reindex_by_embeddings(con, existing_id):
+                need_reindex = True
+        except Exception:
+            # на всякий случай — если что-то пошло не так с проверкой, безопаснее переиндексировать
+            need_reindex = True
+
         if existing_ver < CURRENT_INDEXER_VERSION:
+            need_reindex = True
+
+        if need_reindex:
             # обновим путь/хэши и переиндексируем
             filename = safe_filename(f"{m.from_user.id}_{doc.file_name}")
             path = save_upload(data, filename, Cfg.UPLOAD_DIR)
-            cur = con.cursor()
-            cur.execute(
-                "UPDATE documents SET path=?, content_sha256=?, file_uid=? WHERE id=? AND owner_id=?",
-                (path, sha256, file_uid, existing_id, uid),
-            )
-            con.commit()
+            update_document_meta(existing_id, path=path, content_sha256=sha256, file_uid=file_uid)
             con.close()
 
             try:
@@ -577,14 +786,16 @@ async def handle_doc(m: types.Message):
                 if sum(len(s.get("text") or "") for s in sections) < 500:
                     await _send(m, "Похоже, файл пустой или это скан-PDF без текста.")
                     return
-                con2 = get_conn()
-                cur2 = con2.cursor()
-                cur2.execute("DELETE FROM chunks WHERE doc_id=? AND owner_id=?", (existing_id, uid))
-                con2.commit()
-                con2.close()
+
+                # очистим старые чанки и проиндексируем заново
+                delete_document_chunks(existing_id, uid)
                 index_document(uid, existing_id, sections)
                 invalidate_cache(uid, existing_id)
+
+                # обновим версии/профиль
                 set_document_indexer_version(existing_id, CURRENT_INDEXER_VERSION)
+                update_document_meta(existing_id, layout_profile=_current_embedding_profile())
+
             except Exception as e:
                 await _send(m, f"Не удалось переиндексировать документ #{existing_id}: {e}")
                 return
@@ -629,6 +840,8 @@ async def handle_doc(m: types.Message):
     index_document(uid, doc_id, sections)
     invalidate_cache(uid, doc_id)
     set_document_indexer_version(doc_id, CURRENT_INDEXER_VERSION)
+    update_document_meta(doc_id, layout_profile=_current_embedding_profile())
+
     ACTIVE_DOC[uid] = doc_id
 
     caption = (m.caption or "").strip()
