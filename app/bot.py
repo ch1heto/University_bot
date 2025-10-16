@@ -24,6 +24,7 @@ from .utils import safe_filename, sha256_bytes, split_for_telegram, infer_doc_ki
 # гибридный контекст: семантика + FTS/LIKE
 from .lexsearch import best_context
 
+
 # --------------------- форматирование и отправка ---------------------
 
 _BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
@@ -266,6 +267,29 @@ async def _list_tables_if_asked(uid: int, doc_id: int, q_text: str) -> str | Non
         body += f"\n… и ещё {tail}"
     return header + "\n" + body
 
+# --------- быстрый ответ: наличие практической части ---------
+_PRACTICAL_Q = re.compile(r"(есть ли|наличие|присутствует ли|имеется ли).{0,40}практическ", re.IGNORECASE)
+
+def _has_practical_part(uid: int, doc_id: int) -> bool:
+    """Есть ли в документе явные упоминания практической части (в тексте или названиях разделов)."""
+    con = get_conn()
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT 1
+        FROM chunks
+        WHERE owner_id=? AND doc_id=? AND (
+            lower(section_path) LIKE '%практическ%' OR
+            lower(text)         LIKE '%практическ%'
+        )
+        LIMIT 1
+        """,
+        (uid, doc_id),
+    )
+    row = cur.fetchone()
+    con.close()
+    return row is not None
+
 
 # ------------- ГОСТ-интент и проверка -------------
 
@@ -430,11 +454,20 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
     if await _maybe_run_gost(m, uid, doc_id, q_text):
         return
 
-    # Быстрый список таблиц (общий вопрос)
+    # Быстрый ответ: «есть ли практическая часть?»
+    if _PRACTICAL_Q.search(q_text):
+        if _has_practical_part(uid, doc_id):
+            await _send(m, "В документе найдены упоминания практической части (по вхождению «практическ…» в тексте/разделах).")
+        else:
+            await _send(m, "В документе явных упоминаний практической части не найдено.")
+        return
+
+    # --- СПИСОК ТАБЛИЦ: показываем и продолжаем ---
+    tables_hint_shown = False
     hint = await _list_tables_if_asked(uid, doc_id, q_text)
     if hint:
         await _send(m, hint)
-        return
+        tables_hint_shown = True  # без return
 
     # 0) Точный verbatim-fallback по цитате (до всего остального)
     vb_hits = verbatim_find(uid, doc_id, q_text)
@@ -464,23 +497,30 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
             await _send(m, "\n\n".join(parts))
             return
 
+    # --- очищаем вопрос, если уже показали список таблиц ---
+    q_for_ace = q_text
+    if tables_hint_shown:
+        q_for_ace = re.sub(r"(?is)какие.+?таблиц[аиы]?(?:\?|$)", "", q_for_ace).strip()
+        if not q_for_ace:
+            q_for_ace = "Дай развёрнутое описание содержания работы: тема, цель, задачи, структура и ключевые выводы."
+
     # 2) «суть/кратко» — обзорный контекст и сразу ACE
-    if is_summary_intent(q_text):
+    if is_summary_intent(q_for_ace):
         ctx = overview_context(uid, doc_id, max_chars=6000)
         if not ctx:
             ctx = _first_chunks_context(uid, doc_id, n=12, max_chars=6000)
         if ctx:
-            reply = ace_once(q_text, ctx)
+            reply = ace_once(q_for_ace, ctx)
             await _send(m, reply)
             return
         # если и это пусто — продолжаем обычным путём
 
     # 3) Гибридный контекст (lex + semantic)
-    ctx = best_context(uid, doc_id, q_text, max_chars=6000)
+    ctx = best_context(uid, doc_id, q_for_ace, max_chars=6000)
 
     # 4) fallback: чистый retrieve БЕЗ жёсткого порога
     if not ctx:
-        hits = retrieve(uid, doc_id, q_text, top_k=8)
+        hits = retrieve(uid, doc_id, q_for_ace, top_k=8)
         if hits:
             ctx = build_context(hits)
 
@@ -494,7 +534,7 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
         return
 
     # 6) Ответ — ACE (строго по контексту)
-    reply = ace_once(q_text, ctx)
+    reply = ace_once(q_for_ace, ctx)
     await _send(m, reply)
 
 
