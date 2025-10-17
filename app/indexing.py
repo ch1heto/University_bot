@@ -1,4 +1,5 @@
 # app/indexing.py
+import re
 import json
 import numpy as np
 from typing import List, Dict, Any, Iterable
@@ -14,11 +15,13 @@ def _norm(s: str | None) -> str:
 
 def _prefix(section: Dict[str, Any]) -> str:
     """
-    Короткий префикс контекста для каждого чанка (повышает качество поиска).
+    Короткий префикс контекста для большинства чанков (повышает качество поиска).
     Примеры:
       [Заголовок] Введение
       [Таблица] стр.3 Таблица 2.1 — Состав выборки
       [Текст] стр.5 Глава 2. Методика исследования
+    ВАЖНО: для element_type='reference' префиксы НЕ используются — в text пишем
+    только саму запись источника.
     """
     et = (section.get("element_type") or "").lower()
     title = _norm(section.get("title")) or "Документ"
@@ -32,8 +35,6 @@ def _prefix(section: Dict[str, Any]) -> str:
         pfx_parts.append("[Рисунок]")
     elif et == "page":
         pfx_parts.append("[Страница]")
-    elif et == "reference":
-        pfx_parts.append("[Источник]")  # Новый префикс для источников
     else:
         pfx_parts.append("[Текст]")
 
@@ -51,9 +52,10 @@ def _yield_chunks_for_section(
     Генерирует чанки для одной секции.
     Возвращает кортежи: (text, meta, element_type, attrs_dict)
 
-    - Таблицы -> одна строка = один чанк (element_type='table_row', attrs: row_index).
-    - Заголовки -> отдельный маленький чанк (element_type='heading').
-    - Источники — каждый источник как отдельный чанк (element_type='reference').
+    - Таблицы -> сначала корневой чанк (element_type='table' с описанием),
+                 затем одна строка = один чанк (element_type='table_row', attrs.row_index).
+    - Заголовки -> отдельный малый чанк (element_type='heading').
+    - Источники -> один чанк на запись (element_type='reference'); в text — ТОЛЬКО текст записи.
     - Остальной текст -> split_into_chunks(...) (element_type='paragraph' или исходный для page/figure).
     """
     et = (section.get("element_type") or "").lower()
@@ -62,40 +64,55 @@ def _yield_chunks_for_section(
     page = section.get("page")
     base_attrs = dict(section.get("attrs") or {})
     text = section.get("text") or ""
-    prefix = _prefix(section)
 
-    # Заголовок — отдельный небольшой чанк
+    # Заголовок — отдельный небольшой чанк с префиксом
     if et == "heading":
-        head_txt = f"{prefix}"
+        head_txt = _prefix(section)
         yield head_txt, {"page": page, "section_path": section_path}, "heading", base_attrs
         return
 
-    # Источник — отдельный чанк
+    # Источник — отдельный чанк: в text ТОЛЬКО содержимое записи без служебных префиксов
     if et == "reference":
-        ref_title = f"{prefix} — {title}"
-        yield ref_title, {"page": page, "section_path": section_path}, "reference", base_attrs
+        ref_text = (text or "").strip()
+        if ref_text:
+            yield ref_text, {"page": page, "section_path": section_path}, "reference", base_attrs
         return
 
-    # Таблица — построчно
+    # Таблица — корневой чанк + построчно
     if et == "table":
+        # Сформируем краткое описание корневого чанка
+        cap_num = base_attrs.get("caption_num") or base_attrs.get("label")
+        cap_tail = base_attrs.get("caption_tail") or base_attrs.get("title")
+        header_preview = base_attrs.get("header_preview")
+
+        # Попробуем вытащить хвост из заголовка "Таблица N — Хвост"
+        tail_from_title = None
+        m = re.search(r"(?i)\bтаблица\s+\d+(?:[.,]\d+)*\s*[—\-–]\s*(.+)", _norm(title))
+        if m:
+            tail_from_title = _norm(m.group(1))
+
+        root_text = cap_tail or header_preview or tail_from_title or "(таблица)"
+        # Корневой чанк — нужен, чтобы в БД были attrs таблицы (для последующих списков/ответов)
+        yield root_text, {"page": page, "section_path": section_path}, "table", base_attrs
+
+        # Построчные чанки
         lines = [ln.strip() for ln in (text or "").splitlines() if ln and ln.strip()]
         if not lines:
-            # Индексируем факт существования пустой таблицы
-            yield f"{prefix}\n(пустая таблица)", {"page": page, "section_path": section_path}, "table", base_attrs
             return
         for i, row in enumerate(lines[:max_table_rows], 1):
             attrs = dict(base_attrs)
             attrs["row_index"] = i
             yield (
-                f"{prefix} | ряд {i}\n{row}",
+                row,  # только содержимое строки
                 {"page": page, "section_path": f"{section_path} [row {i}]"},
                 "table_row",
                 attrs,
             )
         return
 
-    # Фигуры / страницы / обычные абзацы
+    # Фигуры / страницы / обычные абзацы — делим на чанки, добавляем префикс как контекст
     base = text if isinstance(text, str) else str(text)
+    prefix = _prefix(section)
     for ch in split_into_chunks(base):
         if not ch.strip():
             continue
@@ -126,11 +143,11 @@ def index_document(
 ) -> None:
     """
     Индексирует документ:
-    - строит чанки с богатыми префиксами;
-    - таблицы индексируются построчно (element_type='table_row', attrs.row_index);
-    - эмбеддинги считаются пакетами (batch_size);
-    - пишет в таблицу chunks: (doc_id, owner_id, page, section_path, text, [element_type, attrs], embedding).
-      element_type/attrs пишутся только если соответствующие колонки есть в схеме БД.
+    - Источники: element_type='reference', text = чистый текст записи, attrs.ref_index сохраняется как есть.
+    - Таблицы: корневой чанк с описанием (element_type='table') + построчно (element_type='table_row', attrs.row_index).
+    - Заголовки: короткие чанки (element_type='heading').
+    - Остальное: обычные текстовые чанки с префиксом в начале, чтобы улучшить поиск.
+    - Эмбеддинги считаются пакетами (batch_size) и пишутся в таблицу chunks.
     """
     rows_text: List[str] = []
     rows_meta: List[Dict[str, Any]] = []

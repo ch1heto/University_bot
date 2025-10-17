@@ -136,22 +136,41 @@ def _paragraph_attrs(p: Paragraph) -> dict:
 
 # ----------------------------- tables -----------------------------
 
+def _table_row_strings(tbl: Table) -> List[str]:
+    """Возвращает строки таблицы: одна строка = ряд, ячейки через ' | ' (с учётом merged)."""
+    lines: List[str] = []
+    try:
+        for row in tbl.rows:
+            cells = []
+            for c in row.cells:
+                cells.append(_clean(c.text))
+            # убираем повторы смежных ячеек (merge-эффект)
+            dedup = []
+            for i, x in enumerate(cells):
+                if i == 0 or x != cells[i - 1]:
+                    dedup.append(x)
+            line = " | ".join([x for x in dedup if x]).strip(" |")
+            if line:
+                lines.append(line)
+    except Exception:
+        pass
+    return lines
+
 def _table_to_text(tbl: Table) -> str:
-    """Таблица → текст: одна строка = ряд, ячейки через ' | ' (удаляем повторы от merged)."""
-    lines = []
-    for row in tbl.rows:
-        cells = []
-        for c in row.cells:
-            cells.append(_clean(c.text))
-        # убираем повторы смежных ячеек (merge-эффект)
-        dedup = []
-        for i, x in enumerate(cells):
-            if i == 0 or x != cells[i - 1]:
-                dedup.append(x)
-        line = " | ".join(dedup).strip(" |")
-        if line:
-            lines.append(line)
+    lines = _table_row_strings(tbl)
     return "\n".join(lines)
+
+def _table_header_preview(tbl: Table, limit: int = 160) -> Optional[str]:
+    """Краткое описание из первой непустой строки таблицы."""
+    lines = _table_row_strings(tbl)
+    if not lines:
+        return None
+    hdr = lines[0].strip()
+    if not hdr:
+        return None
+    if len(hdr) > limit:
+        hdr = hdr[:limit - 1].rstrip() + "…"
+    return hdr
 
 def _table_attrs(tbl: Table) -> dict:
     try:
@@ -162,12 +181,12 @@ def _table_attrs(tbl: Table) -> dict:
         n_cols = len(tbl.columns)
     except Exception:
         n_cols = None
-    return {"n_rows": n_rows, "n_cols": n_cols}
+    return {"n_rows": n_rows, "n_cols": n_cols, "header_preview": _table_header_preview(tbl)}
 
 # ----------------------------- caption helpers -----------------------------
 
 CAPTION_RE_TABLE = re.compile(
-    r"^\s*(табл(?:ица)?|table)\.?\s*(\d+(?:[.,]\d+)?)(?:\s*[-—:]\s*(.*))?\s*$",
+    r"^\s*(?:табл(?:ица)?|table)\.?\s*(\d+(?:[.,]\d+)*)(?:\s*[-—:]\s*(.*))?\s*$",
     re.IGNORECASE
 )
 CAPTION_RE_FIG = re.compile(
@@ -175,24 +194,53 @@ CAPTION_RE_FIG = re.compile(
     re.IGNORECASE
 )
 
-def _classify_caption(text: str) -> Tuple[Optional[str], Optional[str]]:
+def _classify_caption(text: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """
-    Возвращает (kind, normalized_title):
-      kind ∈ {'table','figure', None}
-      normalized_title вида 'Таблица 2.1 — Подпись' / 'Рисунок 1.3 — Подпись'
+    Возвращает (kind, number_label, tail) или (None, None, None).
+    number_label в формате '2.1', tail — подпись (может быть пустой).
     """
     t = (text or "").strip()
     m = CAPTION_RE_TABLE.match(t)
     if m:
-        num, tail = m.group(2), (m.group(3) or "").strip()
-        title = f"Таблица {num}" + (f" — {tail}" if tail else "")
-        return "table", title
+        num = (m.group(1) or "").replace(",", ".")
+        tail = (m.group(2) or "").strip()
+        return "table", num, tail
     m = CAPTION_RE_FIG.match(t)
     if m:
-        num, tail = m.group(2), (m.group(3) or "").strip()
-        title = f"Рисунок {num}" + (f" — {tail}" if tail else "")
-        return "figure", title
-    return None, None
+        num = (m.group(2) or "").replace(",", ".")
+        tail = (m.group(3) or "").strip()
+        return "figure", num, tail
+    return None, None, None
+
+def _compose_table_title(num: Optional[str], tail: Optional[str]) -> str:
+    if num and tail:
+        return f"Таблица {num} — {tail}"
+    if num:
+        return f"Таблица {num}"
+    if tail:
+        return tail  # без слова «Таблица», если номера нет
+    return "Таблица"
+
+def _is_title_candidate(text: str, attrs: dict) -> bool:
+    """Эвристика: короткий центрированный абзац — кандидат в название таблицы."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if CAPTION_RE_TABLE.match(t) or CAPTION_RE_FIG.match(t):
+        return False  # это не «название», это сам номер
+    if len(t) < 3 or len(t) > 200:
+        return False
+    al = (attrs or {}).get("alignment")
+    if al not in {"center", "right", "left"}:
+        return False
+    # не списочный элемент
+    if (attrs or {}).get("is_list"):
+        return False
+    # слишком «цифровая» строка — не подпись
+    digits = len(re.findall(r"\d", t))
+    if digits > max(8, len(t) // 3):
+        return False
+    return True
 
 # ----------------------------- sources helpers -----------------------------
 
@@ -227,11 +275,14 @@ def _hpath_str(stack: List[str]) -> str:
 
 def parse_docx(path: str) -> List[Dict[str, Any]]:
     """
-    Парсим .docx с поддержкой заголовков, таблиц, базового форматирования, пометок о картинках и
-    корректной обработкой подписей (таблица/рисунок). Для секций формируем иерархический section_path
-    по стеку заголовков: 'Глава 1 / 1.1 Введение / Таблица 1.1 — ...'.
-    Также распознаём раздел «Источники/Список литературы/Библиография/References» и помечаем его
-    элементы как element_type='reference'.
+    Парсим .docx с поддержкой заголовков, таблиц, базового форматирования и
+    аккуратной обработкой подписей к таблицам:
+      • «Таблица 2.1 — …» (однострочная),
+      • «Таблица 3.2» + следующий центрированный заголовок,
+      • центрированный заголовок перед строкой «Таблица 3.2»,
+      • если номера нет — берём ближайший центрированный заголовок,
+      • как фолбэк — первая строка таблицы.
+    Элементы литературы помечаем element_type='reference'.
     """
     doc = Docx(path)
 
@@ -246,9 +297,13 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
     # состояние: находимся ли в разделе «Источники»
     in_sources = False
 
-    # ожидаемая подпись
-    pending_caption_tbl: Optional[str] = None
-    pending_caption_fig: Optional[str] = None
+    # состояние по подписям
+    pending_tbl_num: Optional[str] = None          # например '3.2'
+    pending_tbl_tail: Optional[str] = None         # текст подписи (если есть)
+    awaiting_tail: bool = False                    # видели «Таблица N», ждём подпись строкой ниже
+    last_title_candidate: Optional[str] = None     # запомненный короткий центрированный абзац
+    last_title_candidate_age: int = 999            # «возраст» кандидата (в блоках)
+
     table_counter = 0
     figure_counter = 0
 
@@ -271,33 +326,54 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
             buf.clear()
             last_para_attrs = None
 
+    def consume_title_candidate() -> Optional[str]:
+        """Забираем и сбрасываем сохранённый заголовок-кандидат."""
+        nonlocal last_title_candidate, last_title_candidate_age
+        t = last_title_candidate
+        last_title_candidate = None
+        last_title_candidate_age = 999
+        return t
+
+    def consider_flush_stale_candidate():
+        """Если кандидат «залежался», возвращаем его в обычный текст."""
+        nonlocal last_title_candidate, last_title_candidate_age, buf
+        if last_title_candidate and last_title_candidate_age > 3:
+            # слишком давно — считаем обычным абзацем
+            buf.append(last_title_candidate)
+            last_title_candidate = None
+            last_title_candidate_age = 999
+
     for block in _iter_block_items(doc):
+        # возраст кандидатного заголовка увеличиваем каждый блок
+        last_title_candidate_age = last_title_candidate_age + 1
+
         if isinstance(block, Paragraph):
             p_text = _clean(block.text)
             p_style = ((block.style and block.style.name) or "").lower()
 
             # Заголовок раздела
             if p_style.startswith("heading"):
+                consider_flush_stale_candidate()
                 flush_text_section()
                 title = p_text or "Без названия"
                 try:
                     level = max(1, int(p_style.replace("heading", "")))
                 except Exception:
                     level = 1
-                # обновляем стек заголовков
                 if len(heading_stack) < level:
                     heading_stack += [""] * (level - len(heading_stack))
                 heading_stack = heading_stack[:level]
                 heading_stack[level - 1] = title
 
-                # режим «Источники»
                 in_sources = _is_sources_title(title)
 
-                # сбрасываем ожидаемые подписи
-                pending_caption_tbl = None
-                pending_caption_fig = None
+                # сброс ожидаемых подписей
+                pending_tbl_num = None
+                pending_tbl_tail = None
+                awaiting_tail = False
+                last_title_candidate = None
+                last_title_candidate_age = 999
 
-                # отдельная секция для самого заголовка
                 sections.append({
                     "title": title,
                     "level": level,
@@ -309,8 +385,9 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                 })
                 continue
 
-            # Если мы в разделе Источников — каждый непустой абзац трактуем как запись reference
+            # Раздел «Источники»
             if in_sources and p_text:
+                consider_flush_stale_candidate()
                 flush_text_section()
                 idx, tail = _parse_reference_line(p_text)
                 attrs = _paragraph_attrs(block)
@@ -329,25 +406,29 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                 })
                 continue
 
-            # Подпись (caption) — разруливаем двусмысленность
-            if p_style == "caption" or CAPTION_RE_TABLE.match(p_text or "") or CAPTION_RE_FIG.match(p_text or ""):
-                kind, norm = _classify_caption(p_text or "")
-                if kind == "table":
-                    pending_caption_tbl = norm or p_text or None
-                    pending_caption_fig = None
-                elif kind == "figure":
-                    pending_caption_fig = norm or p_text or None
-                    pending_caption_tbl = None
+            # Попытка распознать подписи к таблицам
+            kind, num, tail = _classify_caption(p_text or "")
+            if kind == "table":
+                # встретили строку «Таблица N [— подпись]»
+                pending_tbl_num = num
+                if tail:
+                    pending_tbl_tail = tail
+                    awaiting_tail = False
                 else:
-                    # caption без ключевого слова — игнорируем
-                    pass
+                    # ждём подпись отдельной строкой ниже
+                    pending_tbl_tail = None
+                    awaiting_tail = True
+                # если прямо перед этим был центрированный кандидат — используем его как хвост
+                if awaiting_tail and last_title_candidate and last_title_candidate_age <= 1:
+                    pending_tbl_tail = consume_title_candidate()
+                    awaiting_tail = False
+                # не добавляем этот абзац в обычный текст
                 continue
-
-            # Абзац с картинкой → фиксируем как «Рисунок»
-            if _paragraph_has_image(block):
+            elif kind == "figure":
+                consider_flush_stale_candidate()
                 flush_text_section()
                 figure_counter += 1
-                fig_title = pending_caption_fig or f"Рисунок {figure_counter}"
+                fig_title = _compose_table_title(num, tail).replace("Таблица", "Рисунок")
                 sections.append({
                     "title": fig_title,
                     "level": max(1, level + 1),
@@ -357,10 +438,29 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                     "element_type": "figure",
                     "attrs": _paragraph_attrs(block)
                 })
-                pending_caption_fig = None
+                pending_tbl_num = None
+                pending_tbl_tail = None
+                awaiting_tail = False
                 continue
 
-            # Обычный текст — копим в буфер
+            # Короткий центрированный текст — потенциальный заголовок
+            attrs_here = _paragraph_attrs(block)
+            if _is_title_candidate(p_text, attrs_here):
+                # если до этого была «Таблица N» без хвоста — это и есть хвост
+                if awaiting_tail and pending_tbl_num and not pending_tbl_tail:
+                    pending_tbl_tail = p_text
+                    awaiting_tail = False
+                    # не добавляем в текст
+                    continue
+                # иначе запомним как «предварительный» заголовок до ближайшей таблицы/номера
+                last_title_candidate = p_text
+                last_title_candidate_age = 0
+                # не добавляем в текст пока
+                continue
+
+            # Обычный текст — копим в буфер,
+            # а «залежавшийся» кандидат вернём в текст
+            consider_flush_stale_candidate()
             if p_text:
                 last_para_attrs = _paragraph_attrs(block)
                 buf.append(p_text)
@@ -368,23 +468,68 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
 
         # Таблица
         if isinstance(block, Table):
+            consider_flush_stale_candidate()
             flush_text_section()
             table_counter += 1
-            t_title = pending_caption_tbl or f"Таблица {table_counter}"
+
+            # 1) составляем подпись таблицы по приоритетам
+            caption_source = "none"
+            num_final: Optional[str] = None
+            tail_final: Optional[str] = None
+
+            if pending_tbl_num:
+                num_final = pending_tbl_num
+                if pending_tbl_tail:
+                    tail_final = pending_tbl_tail
+                    caption_source = "single_line" if not awaiting_tail else "two_lines_after"
+                elif last_title_candidate and last_title_candidate_age <= 1:
+                    tail_final = consume_title_candidate()
+                    caption_source = "two_lines_after"
+            elif last_title_candidate and last_title_candidate_age <= 1:
+                # заголовок перед таблицей, номера нет
+                tail_final = consume_title_candidate()
+                caption_source = "two_lines_before"
+
+            # 2) фолбэк: если названия всё ещё нет — взять первую строку таблицы
             t_text = _table_to_text(block) or "(пустая таблица)"
+            attrs_tbl = _table_attrs(block) | {"numbers": _extract_numbers(t_text)}
+
+            if not tail_final and attrs_tbl.get("header_preview"):
+                tail_final = attrs_tbl["header_preview"]
+                if caption_source == "none":
+                    caption_source = "header_row"
+
+            # 3) Компоновка «человеческого» заголовка и атрибутов
+            t_title = _compose_table_title(num_final, tail_final)
+            # дублируем поля в двух именах для обратной совместимости
+            attrs_tbl["caption_num"] = num_final
+            attrs_tbl["caption_tail"] = tail_final
+            attrs_tbl["label"] = num_final
+            attrs_tbl["title"] = tail_final
+            attrs_tbl["caption_source"] = caption_source
+
             sections.append({
-                "title": t_title,
+                "title": t_title or f"Таблица {table_counter}",
                 "level": max(1, level + 1),
                 "text": t_text,
                 "page": None,
-                "section_path": _hpath_str(heading_stack + [t_title]),
+                "section_path": _hpath_str(heading_stack + [t_title or f"Таблица {table_counter}"]),
                 "element_type": "table",
-                "attrs": _table_attrs(block) | {"numbers": _extract_numbers(t_text)}
+                "attrs": attrs_tbl
             })
-            pending_caption_tbl = None
+
+            # сброс состояния
+            pending_tbl_num = None
+            pending_tbl_tail = None
+            awaiting_tail = False
+            last_title_candidate = None
+            last_title_candidate_age = 999
             continue
 
     # «Хвост» текста
+    # если кандидат остался и не был использован — считаем обычным текстом
+    if last_title_candidate:
+        buf.append(last_title_candidate)
     flush_text_section()
 
     return sections
@@ -422,21 +567,39 @@ def parse_pdf(path: str) -> List[Dict[str, Any]]:
                 for ti, rows in enumerate(tables, 1):
                     try:
                         lines = []
+                        max_cols = 0
                         for row in rows or []:
                             row = [_clean(c) for c in (row or [])]
+                            max_cols = max(max_cols, len(row))
                             line = " | ".join([c for c in row if c])
                             if line:
                                 lines.append(line)
                         t_text = "\n".join(lines)
                         if t_text.strip():
+                            label = f"{i}.{ti}"
+                            header_preview = (lines[0] if lines else None)
+                            if header_preview and len(header_preview) > 160:
+                                header_preview = header_preview[:159].rstrip() + "…"
+                            attrs = {
+                                "caption_num": label,
+                                "caption_tail": header_preview,
+                                "label": label,
+                                "title": header_preview,
+                                "caption_source": "header_row" if header_preview else "none",
+                                "n_rows": len(rows or []),
+                                "n_cols": max_cols if max_cols > 0 else None,
+                                "header_preview": header_preview,
+                                "numbers": _extract_numbers(t_text),
+                            }
+                            human = _compose_table_title(label, header_preview)
                             out.append({
-                                "title": f"Таблица {i}.{ti}",
+                                "title": human,
                                 "level": 2,
                                 "text": t_text,
                                 "page": i,
-                                "section_path": f"Стр. {i} / Таблица {i}.{ti}",
+                                "section_path": f"Стр. {i} / {human}",
                                 "element_type": "table",
-                                "attrs": {"numbers": _extract_numbers(t_text)}
+                                "attrs": attrs
                             })
                     except Exception:
                         pass
@@ -450,11 +613,13 @@ def parse_pdf(path: str) -> List[Dict[str, Any]]:
                     continue
                 m = REF_LINE_RE.match(line)
                 if m:
-                    idx = int(m.group(1) or m.group(2))
+                    try:
+                        idx = int(m.group(1) or m.group(2))
+                    except Exception:
+                        continue
                     tail = (m.group(3) or "").strip()
                     ref_lines.append((idx, tail))
 
-            # если есть явные признаки — добавим как отдельные элементы
             if has_sources_kw and len(ref_lines) >= 3:
                 for idx, tail in ref_lines:
                     out.append({
