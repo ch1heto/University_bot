@@ -1,3 +1,4 @@
+# app/utils.py
 from __future__ import annotations
 import os
 import re
@@ -30,11 +31,36 @@ def clip(s: str, max_len: int = 200) -> str:
     s = s or ""
     return s if len(s) <= max_len else (s[: max_len - 1] + "…")
 
+def _smart_cut_point(text: str, start: int, limit: int) -> int:
+    """
+    Ищем «хорошую» границу разрыва (двойной перевод строки / перевод строки / точка / пробел)
+    в окне [start, start+limit]. Возвращаем индекс конца чанка.
+    """
+    end = min(len(text), start + limit)
+    window = text[start:end]
+    # приоритетные места разрыва
+    for pat in ("\n\n", "\n", ". ", " "):
+        pos = window.rfind(pat)
+        if pos != -1 and (start + pos) - start > int(limit * 0.6):  # не рвём слишком рано
+            return start + pos + len(pat.strip())
+    return end
+
 def split_for_telegram(s: str, limit: int = 3900) -> Iterator[str]:
-    """Режем длинные сообщения под ограничения Telegram."""
+    """
+    Режем длинные сообщения под ограничения Telegram, стараясь рвать по «хорошим» границам.
+    Важно: уже готовый текст должен быть безопасен для HTML (экранирование делается снаружи).
+    """
     s = s or ""
-    for i in range(0, len(s), limit):
-        yield s[i : i + limit]
+    if len(s) <= limit:
+        yield s
+        return
+    i = 0
+    while i < len(s):
+        j = _smart_cut_point(s, i, limit)
+        chunk = s[i:j].rstrip()
+        if chunk:
+            yield chunk
+        i = j
 
 # ------------------------- ФАЙЛЫ / ХЕШИ -------------------------
 
@@ -59,11 +85,15 @@ def ensure_dir(path: str | os.PathLike[str]) -> Path:
     return p
 
 def save_bytes(data: bytes, filename: str, dirpath: str = "./uploads") -> str:
-    """Сохранить байты в файл (создаст папку при необходимости). Возвращает абсолютный путь."""
+    """
+    Сохранить байты в файл (создаст папку при необходимости). Возвращает абсолютный путь.
+    Имя проходит через safe_filename для страховки.
+    """
     d = ensure_dir(dirpath)
-    fp = d / filename
+    safe_name = safe_filename(filename)
+    fp = d / safe_name
     fp.write_bytes(data)
-    return str(fp)
+    return str(fp.resolve())
 
 def file_ext_lower(name: str) -> str:
     """Расширение файла в нижнем регистре (с точкой), либо ''."""
@@ -76,27 +106,45 @@ def file_ext_lower(name: str) -> str:
 
 _SLUG_BAD = re.compile(r"[^0-9A-Za-zА-Яа-яЁё _.\-]+")
 _MULTI_DOT = re.compile(r"\.{2,}")
+_PATH_SEP = re.compile(r"[\\/]+")
+_WINDOWS_RESERVED = {
+    "con", "prn", "aux", "nul",
+    *(f"com{i}" for i in range(1, 10)),
+    *(f"lpt{i}" for i in range(1, 10)),
+}
 
 def safe_filename(name: str, max_len: int = 180) -> str:
     """
     Делает «безопасное» имя файла:
     - нормализует Unicode (NFKC),
-    - вычищает опасные символы, двойные точки,
-    - ограничивает длину.
+    - вычищает опасные символы, слэши, двойные точки,
+    - избегает зарезервированных имён Windows,
+    - ограничивает длину (с сохранением расширения, если возможно).
     """
     name = name or "file"
     name = unicodedata.normalize("NFKC", name)
     name = name.replace("\x00", "")
-    name = _SLUG_BAD.sub("_", name)
+    name = _PATH_SEP.sub("_", name)          # убираем / и \
+    name = _SLUG_BAD.sub("_", name)          # убираем неожиданные символы
+    name = _MULTI_DOT.sub(".", name)         # схлопываем цепочки точек
     name = name.strip(" .\t\r\n")
-    name = _MULTI_DOT.sub(".", name)
     if not name:
         name = "file"
-    if len(name) > max_len:
-        stem = Path(name).stem[: max_len - 16] or "file"
-        ext = (Path(name).suffix or "")[:12]
-        name = stem + ext
-    return name
+
+    stem = Path(name).stem or "file"
+    ext = (Path(name).suffix or "")
+    # Windows reserved
+    if stem.lower() in _WINDOWS_RESERVED:
+        stem = f"_{stem}"
+
+    # Ограничение длины
+    if len(stem) + len(ext) > max_len:
+        # оставляем расширение (до 12 символов)
+        ext = ext[:12]
+        room = max_len - len(ext)
+        stem = stem[: max(1, room - 1)]
+    out = (stem + ext) if (stem + ext) else "file"
+    return out
 
 # ------------------------- JSON -------------------------
 
@@ -151,6 +199,15 @@ def coalesce(*vals, default: Any = None) -> Any:
             return v
     return default
 
+def file_is_probably_pdf(path: str | os.PathLike[str]) -> bool:
+    """Быстрая эвристика по сигнатуре PDF."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(5)
+        return head == b"%PDF-"
+    except Exception:
+        return False
+
 def infer_doc_kind(filename: str | None) -> str:
     """
     Грубая типизация по расширению:
@@ -161,33 +218,23 @@ def infer_doc_kind(filename: str | None) -> str:
         return "thesis"
     return "file"
 
-# ------------------------- НОВАЯ ФУНКЦИЯ: РАЗБИТИЕ ДОКУМЕНТА НА ЧАСТИ -------------------------
+# ------------------------- РАЗБИТИЕ ДЛЯ ДОЛГИХ ТЕКСТОВ -------------------------
 
 def split_document(text: str, max_chunk_size: int = 3000) -> List[str]:
     """
-    Разбивает текст на части, чтобы каждая часть не превышала заданный размер в символах.
-    Это нужно для обработки больших документов, которые могут не поместиться в запрос к GPT-5.
-    
-    :param text: Текст документа, который нужно разделить.
-    :param max_chunk_size: Максимальный размер части в символах.
-    :return: Список частей текста, каждая из которых имеет размер не более max_chunk_size.
+    Разбивает текст на части, чтобы каждая часть не превышала max_chunk_size символов.
+    Ставит разрывы по «хорошим» границам (параграф/строка/слово), когда возможно.
     """
-    # Разбиваем текст на строки, чтобы сохранить структуру
-    chunks = []
-    current_chunk = ""
-    
-    # Разделяем текст на строки
-    for line in text.splitlines():
-        # Добавляем строку в текущий чанк, если не превышает максимальный размер
-        if len(current_chunk) + len(line) + 1 <= max_chunk_size:
-            current_chunk += (line + "\n")
-        else:
-            # Если превышает, сохраняем текущий чанк и начинаем новый
-            chunks.append(current_chunk.strip())
-            current_chunk = line + "\n"
-    
-    # Добавляем последний чанк, если он не пустой
-    if current_chunk.strip():
-        chunks.append(current_chunk.strip())
-    
-    return chunks
+    text = text or ""
+    if len(text) <= max_chunk_size:
+        return [text] if text else []
+
+    parts: List[str] = []
+    i = 0
+    while i < len(text):
+        j = _smart_cut_point(text, i, max_chunk_size)
+        chunk = text[i:j].strip()
+        if chunk:
+            parts.append(chunk)
+        i = j
+    return parts

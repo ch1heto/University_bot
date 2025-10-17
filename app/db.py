@@ -1,11 +1,12 @@
+# app/db.py
 import sqlite3
 from pathlib import Path
-from typing import Optional, Iterable, Tuple
+from typing import Optional, Iterable
 from .config import Cfg
 
 # Текущая версия индексатора (повышай при изменении логики парсинга/индексации)
-# Было 2; повышаем до 3 из-за новых типов чанков/attrs и префиксов.
-CURRENT_INDEXER_VERSION = 3
+# Было 3; повышаем до 4 из-за улучшенного извлечения figures/references и атрибутов.
+CURRENT_INDEXER_VERSION = 4
 
 # Базовые таблицы (минимальный набор столбцов, совместимый со старыми БД)
 _BASE_SCHEMA_SQL = """
@@ -88,14 +89,15 @@ def _ensure_indexes(con: sqlite3.Connection) -> None:
 
     # Индексы по новым колонкам (если они появились)
     dcols = _table_info(con, "documents")
+    # ⚠️ НЕ делаем их UNIQUE, чтобы миграции не падали при существующих дубликатах.
     if {"owner_id", "content_sha256"}.issubset(dcols):
         cur.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS uix_documents_owner_sha "
+            "CREATE INDEX IF NOT EXISTS idx_documents_owner_sha "
             "ON documents(owner_id, content_sha256)"
         )
     if {"owner_id", "file_uid"}.issubset(dcols):
         cur.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS uix_documents_owner_fileid "
+            "CREATE INDEX IF NOT EXISTS idx_documents_owner_fileid "
             "ON documents(owner_id, file_uid)"
         )
     if "indexer_version" in dcols:
@@ -107,6 +109,11 @@ def _ensure_indexes(con: sqlite3.Connection) -> None:
     ccols = _table_info(con, "chunks")
     if "element_type" in ccols:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_type ON chunks(element_type)")
+        # Частые фильтры вида owner_id=?, doc_id=?, element_type='reference'|'figure'|'table'
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chunks_owner_doc_type "
+            "ON chunks(owner_id, doc_id, element_type)"
+        )
     if "section_path" in ccols:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_section_path ON chunks(section_path)")
 
@@ -117,9 +124,14 @@ def _ensure_fts(con: sqlite3.Connection) -> None:
     """
     Опционально создаём FTS5-таблицу для лексического поиска.
     Если FTS5 недоступен в сборке SQLite — просто пропускаем.
+    Rebuild делаем только при первичном создании.
     """
     cur = con.cursor()
     try:
+        # Было ли уже?
+        cur.execute("SELECT COUNT(1) FROM sqlite_master WHERE type='table' AND name='chunks_fts'")
+        existed = bool(cur.fetchone()[0])
+
         # content=chunks, content_rowid=id — будем синхронизировать триггерами
         cur.execute(
             "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts "
@@ -145,9 +157,10 @@ def _ensure_fts(con: sqlite3.Connection) -> None:
         """)
         con.commit()
 
-        # Первичная инициализация индекса (на случай существующих строк)
-        cur.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
-        con.commit()
+        # Первичная инициализация индекса — только если таблица создана впервые
+        if not existed:
+            cur.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
+            con.commit()
     except sqlite3.OperationalError:
         # FTS5 может быть недоступен — игнорируем
         con.rollback()
@@ -181,6 +194,7 @@ def get_conn() -> sqlite3.Connection:
     # Немного тюнинга SQLite
     con.execute("PRAGMA journal_mode=WAL;")
     con.execute("PRAGMA synchronous=NORMAL;")
+    con.execute("PRAGMA foreign_keys=ON;")
     return con
 
 
@@ -191,7 +205,13 @@ def ensure_user(tg_id: str) -> int:
     cur = con.cursor()
     cur.execute("INSERT OR IGNORE INTO users(tg_id) VALUES (?)", (tg_id,))
     cur.execute("SELECT id FROM users WHERE tg_id = ?", (tg_id,))
-    uid = cur.fetchone()["id"]
+    row = cur.fetchone()
+    if not row:
+        # На всякий случай — повторная попытка
+        cur.execute("INSERT OR IGNORE INTO users(tg_id) VALUES (?)", (tg_id,))
+        cur.execute("SELECT id FROM users WHERE tg_id = ?", (tg_id,))
+        row = cur.fetchone()
+    uid = int(row["id"])
     con.commit()
     con.close()
     return uid
@@ -282,7 +302,7 @@ def insert_document(owner_id: int,
     doc_id = cur.lastrowid
     con.commit()
     con.close()
-    return doc_id
+    return int(doc_id)
 
 
 def update_document_meta(doc_id: int,
@@ -320,20 +340,20 @@ def delete_document_chunks(doc_id: int, owner_id: int) -> int:
     con = get_conn()
     cur = con.cursor()
     cur.execute("SELECT COUNT(*) AS c FROM chunks WHERE doc_id=? AND owner_id=?", (doc_id, owner_id))
-    cnt = cur.fetchone()["c"]
+    cnt = int(cur.fetchone()["c"])
     cur.execute("DELETE FROM chunks WHERE doc_id=? AND owner_id=?", (doc_id, owner_id))
     con.commit()
     con.close()
-    return int(cnt)
+    return cnt
 
 
 def count_document_chunks(doc_id: int, owner_id: int) -> int:
     con = get_conn()
     cur = con.cursor()
     cur.execute("SELECT COUNT(*) AS c FROM chunks WHERE doc_id=? AND owner_id=?", (doc_id, owner_id))
-    cnt = cur.fetchone()["c"]
+    cnt = int(cur.fetchone()["c"])
     con.close()
-    return int(cnt)
+    return cnt
 
 
 # ----------------------------- public API: FTS utils -----------------------------
@@ -342,10 +362,10 @@ def has_fts() -> bool:
     try:
         con = get_conn()
         cur = con.cursor()
-        cur.execute("SELECT 1 FROM chunks_fts LIMIT 1")
-        _ = cur.fetchone()
+        cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks_fts'")
+        ok = bool(cur.fetchone()[0])
         con.close()
-        return True
+        return ok
     except Exception:
         return False
 

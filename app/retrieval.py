@@ -2,10 +2,10 @@
 import re
 import json
 import numpy as np
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Any
 
 from .db import get_conn
-from .polza_client import embeddings  # только эмбеддинги; чат не используется здесь
+from .polza_client import embeddings, vision_describe  # эмбеддинги + vision
 
 # Кэш векторов на процесс: (owner_id, doc_id) -> {"mat": np.ndarray [N,D], "meta": list[dict]}
 _DOC_CACHE: dict[tuple[int, int], dict] = {}
@@ -61,6 +61,7 @@ def _load_doc(owner_id: int, doc_id: int) -> dict:
     meta, vecs = [], []
     for r in rows:
         if has_ext:
+            # sqlite3.Row: есть keys()
             et = (r["element_type"] or "").lower() if "element_type" in r.keys() else ""
             attrs_raw = r["attrs"] if "attrs" in r.keys() else None
             try:
@@ -77,7 +78,8 @@ def _load_doc(owner_id: int, doc_id: int) -> dict:
                     "attrs": attrs,
                 }
             )
-            vecs.append(np.frombuffer(r["embedding"], dtype=np.float32))
+            emb = r["embedding"]
+            vecs.append(np.frombuffer(emb, dtype=np.float32))
         else:
             meta.append(
                 {
@@ -90,10 +92,11 @@ def _load_doc(owner_id: int, doc_id: int) -> dict:
                     "attrs": {},
                 }
             )
-            vecs.append(np.frombuffer(r["embedding"], dtype=np.float32))
+            emb = r["embedding"]
+            vecs.append(np.frombuffer(emb, dtype=np.float32))
 
-    mat = np.vstack(vecs)  # [N, D]
-    # Нормируем по L2 для косинуса
+    # Сшиваем и нормируем L2
+    mat = np.vstack(vecs).astype(np.float32, copy=False)  # [N, D]
     norms = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-9
     mat = (mat / norms).astype(np.float32, copy=False)
 
@@ -140,11 +143,11 @@ def _chunk_type(meta: Dict) -> str:
 def _query_signals(q: str) -> Dict[str, bool]:
     ql = (q or "").lower()
     return {
-        "ask_table":   bool(re.search(r"\bтабл|таблица\b", ql)),
-        "ask_figure":  bool(re.search(r"\bрис\.?|рисунок\b", ql)),
-        "ask_heading": bool(re.search(r"\bглава\b|\bраздел\b|\bвведение\b|\bзаключение\b", ql)),
+        "ask_table":   bool(re.search(r"\b(табл|таблица|table)\b", ql)),
+        "ask_figure":  bool(re.search(r"\b(рис\.?|рисунок|figure|fig\.?)\b", ql)),
+        "ask_heading": bool(re.search(r"\b(глава|раздел|введение|заключение|heading|chapter|section)\b", ql)),
         "ask_sources": bool(re.search(r"\bисточник(?:и|ов)?\b|\bсписок\s+литературы\b|\bбиблиограф", ql) or
-                            re.search(r"\breferences?\b", ql)),
+                            re.search(r"\breferences?\b|bibliograph\w*", ql)),
     }
 
 # ---------------------------
@@ -176,15 +179,19 @@ def retrieve(owner_id: int, doc_id: int, query: str, top_k: int = 8) -> List[Dic
 
     sims = pack["mat"] @ q  # косинус
     N = sims.shape[0]
+    if N == 0:
+        return []
+
     # Возьмём побольше кандидатов для переранжа
     prelim_k = max(top_k * 3, top_k, 16)
     prelim_k = min(prelim_k, N)
     if prelim_k <= 0:
         return []
 
-    # Быстрый выбор top-prelim_k без полного сортирования
-    idx = np.argpartition(-sims, range(prelim_k))[:prelim_k]
-    idx = idx[np.argsort(-sims[idx])]  # фикс: argsort латиницей
+    # Быстрый выбор top-prelim_k без полного сортирования (фикс argpartition)
+    # Берём индексы наибольших значений
+    part_idx = np.argpartition(sims, -prelim_k)[-prelim_k:]
+    idx = part_idx[np.argsort(-sims[part_idx])]
 
     # Переранж: тип чанка/совпадения номеров/чисел
     sig = _query_signals(query)
@@ -206,17 +213,20 @@ def retrieve(owner_id: int, doc_id: int, query: str, top_k: int = 8) -> List[Dic
         if sig["ask_table"] and ctype in {"table", "table_row"}:
             score += 0.10
         if sig["ask_figure"] and ctype == "figure":
-            score += 0.08
+            score += 0.12
         if sig["ask_heading"] and ctype == "heading":
             score += 0.05
         if sig["ask_sources"] and ctype == "reference":
-            score += 0.25  # заметный буст для списка литературы
+            score += 0.30  # заметный буст для списка литературы
+        # Если не просили источники — слегка штрафуем reference, чтобы они не лезли в общий контекст
+        if (not sig["ask_sources"]) and ctype == "reference":
+            score -= 0.10
 
         # Совпадение конкретного номера таблицы/рисунка
         if tab_rgx and tab_rgx.search(text):
             score += 0.22
         if fig_rgx and fig_rgx.search(text):
-            score += 0.22
+            score += 0.24
 
         # Совпадение чисел (до +0.10 суммарно)
         if q_nums:
@@ -233,7 +243,17 @@ def retrieve(owner_id: int, doc_id: int, query: str, top_k: int = 8) -> List[Dic
 
     # Финальная сортировка по новым скорингам
     rescored.sort(key=lambda x: -x[1])
-    best = rescored[:top_k]
+
+    # Если не просили источники — фильтруем явные reference из финальных top_k (жёсткая защита)
+    filtered: List[Tuple[int, float]] = []
+    for i, sc in rescored:
+        if len(filtered) >= top_k:
+            break
+        if (not sig["ask_sources"]) and _chunk_type(pack["meta"][i]) == "reference":
+            continue
+        filtered.append((i, sc))
+
+    best = filtered[:top_k]
 
     out: List[Dict] = []
     for i, sc in best:
@@ -284,26 +304,54 @@ def invalidate_cache(owner_id: int, doc_id: int):
 
 def _mk_table_pattern(q: str) -> Optional[str]:
     """
-    Пытаемся вытащить номер таблицы N.M из вопроса.
-    Поддерживаем формы: 'таблица 3.1', 'табл. 3,1', нечувствительно к регистру.
+    Пытаемся вытащить номер таблицы из вопроса.
+    Поддерживаем формы:
+      - 'таблица 3.1', 'табл. 3,1'
+      - 'table 2.4'
+      - допускаем '№'
+      - допускаем буквенный префикс 'А.1' / 'П1.2'
     Возвращаем паттерн regex или None.
     """
-    m = re.search(r"табл(?:ица)?\.?\s*(\d+)\s*[.,]\s*(\d+)", q, re.IGNORECASE)
+    ql = (q or "")
+    m = re.search(r"(табл(?:ица)?|table)\s*(?:№\s*)?([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)", ql, re.IGNORECASE)
     if not m:
         return None
-    num = f"{m.group(1)}[.,]{m.group(2)}"
-    return rf"(табл(?:ица)?\.?\s*{num})"
+    raw = m.group(2).strip()
+    # нормализуем 'A . 1,2' -> 'A\.? *1[.,]2'
+    raw = re.sub(r"\s+", " ", raw)
+    raw = raw.replace(" ", "")
+    # A.1 или П1.2 или 3.1
+    if re.match(r"^[A-Za-zA-Яа-я]\d", raw):
+        # П1.2 -> П\s*1[.,]2
+        letter = raw[0]
+        rest = raw[1:]
+        rest = re.sub(r"\.", "[.,]", rest)
+        pat_num = rf"{re.escape(letter)}\.?\s*{re.escape(rest)}"
+    else:
+        pat_num = re.sub(r"\.", "[.,]", re.escape(raw))
+    return rf"(?:табл(?:ица)?|table)\s*\.?\s*(?:№\s*)?{pat_num}"
 
 
 def _mk_figure_pattern(q: str) -> Optional[str]:
     """
-    Поиск 'рисунок 2.4' / 'рис. 2,4'.
+    Поиск 'рисунок 2.4' / 'рис. 2,4' / 'figure 3' / 'fig. 1' / 'рис. А.1'.
+    Возвращаем паттерн regex или None.
     """
-    m = re.search(r"рис(?:унок)?\.?\s*(\d+)\s*[.,]\s*(\d+)", q, re.IGNORECASE)
+    ql = (q or "")
+    m = re.search(r"(рис(?:унок)?|fig(?:ure)?\.?)\s*(?:№\s*)?([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)", ql, re.IGNORECASE)
     if not m:
         return None
-    num = f"{m.group(1)}[.,]{m.group(2)}"
-    return rf"(рис(?:унок)?\.?\s*{num})"
+    raw = m.group(2).strip()
+    raw = re.sub(r"\s+", " ", raw)
+    raw = raw.replace(" ", "")
+    if re.match(r"^[A-Za-zA-Яа-я]\d", raw):
+        letter = raw[0]
+        rest = raw[1:]
+        rest = re.sub(r"\.", "[.,]", rest)
+        pat_num = rf"{re.escape(letter)}\.?\s*{re.escape(rest)}"
+    else:
+        pat_num = re.sub(r"\.", "[.,]", re.escape(raw))
+    return rf"(?:рис(?:унок)?|fig(?:ure)?\.?)\s*\.?\s*(?:№\s*)?{pat_num}"
 
 
 def keyword_find(owner_id: int, doc_id: int, pattern: str, max_hits: int = 3) -> List[Dict]:
@@ -338,3 +386,276 @@ def keyword_find(owner_id: int, doc_id: int, pattern: str, max_hits: int = 3) ->
             if len(hits) >= max_hits:
                 break
     return hits
+
+# =======================================================================
+#                НОВОЕ: «РИСУНКИ» — СЧЁТЧИК, СПИСОК, КАРТОЧКИ
+# =======================================================================
+
+# «Рисунок 3.2 — ...», «Рисунок 5: ...», «Figure 2 — ...»
+_FIG_TITLE_RE = re.compile(
+    r"(?i)\b(?:рис(?:унок)?|figure)\s+([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)\b(?:\s*[—\-–:]\s*(.+))?"
+)
+
+def _shorten(s: str, limit: int = 120) -> str:
+    s = (s or "").strip()
+    if len(s) <= limit:
+        return s
+    return s[:limit - 1].rstrip() + "…"
+
+def _last_segment(name: str) -> str:
+    """Берём «хвост» из длинных путей section_path."""
+    s = (name or "").strip()
+    if "/" in s:
+        s = s.split("/")[-1].strip()
+    s = re.sub(r"^\[\s*рисунок\s*\]\s*", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*[-–—]\s*", " — ", s)
+    s = re.sub(r"\s+", " ", s).strip(" .")
+    return s
+
+def _parse_figure_title(text: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Извлекаем номер и хвост подписи из строки вида 'Рисунок 2.3 — Название'.
+    Возвращает (num, title).
+    """
+    t = (text or "").strip()
+    m = _FIG_TITLE_RE.search(t)
+    if not m:
+        return (None, None)
+    raw_num = (m.group(1) or "").strip()
+    raw_num = raw_num.replace(" ", "")
+    num = raw_num.replace(",", ".") or None
+    title = (m.group(2) or "").strip() or None
+    return (num, title)
+
+def _distinct_figure_basenames(uid: int, doc_id: int) -> List[str]:
+    """
+    Собираем уникальные имена «рисунков» по section_path (совместимо со старыми индексами,
+    где использовался префикс '[Рисунок]' в тексте).
+    """
+    con = get_conn()
+    cur = con.cursor()
+    if _table_has_columns(con, "chunks", ["element_type"]):
+        cur.execute(
+            """
+            SELECT DISTINCT section_path
+            FROM chunks
+            WHERE owner_id=? AND doc_id=? AND element_type='figure'
+            ORDER BY section_path ASC
+            """,
+            (uid, doc_id),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT DISTINCT section_path
+            FROM chunks
+            WHERE owner_id=? AND doc_id=? AND text LIKE '[Рисунок]%%'
+            ORDER BY section_path ASC
+            """,
+            (uid, doc_id),
+        )
+    rows = cur.fetchall()
+    con.close()
+    return [r["section_path"] for r in rows if r["section_path"]]
+
+def count_figures(uid: int, doc_id: int) -> int:
+    """Сколько всего «рисунков» в документе (по уникальным section_path)."""
+    return len(_distinct_figure_basenames(uid, doc_id))
+
+def list_figures(uid: int, doc_id: int, limit: int = 25) -> Dict[str, object]:
+    """
+    Возвращает короткий список «рисунков»:
+      { "count": N, "list": [ 'Рисунок 2.1 — Схема …', ... ], "more": M }
+    """
+    bases = _distinct_figure_basenames(uid, doc_id)
+    items: List[str] = []
+    for base in bases:
+        # пробуем извлечь номер/хвост из хвоста section_path
+        tail = _last_segment(base)
+        num, title = _parse_figure_title(tail)
+        if num and title:
+            items.append(f"Рисунок {num} — {_shorten(title)}")
+        elif num:
+            items.append(f"Рисунок {num}")
+        elif tail:
+            items.append(_shorten(tail))
+        else:
+            items.append("Рисунок")
+    items = [x for x in items if x]
+    return {
+        "count": len(bases),
+        "list": items[:limit],
+        "more": max(0, len(items) - limit),
+    }
+
+def _collect_images_for_section(cur, uid: int, doc_id: int, section_path: str) -> List[str]:
+    """Подтягиваем images из attrs по всем чанкам данной секции (на случай, если не в первом)."""
+    images: List[str] = []
+    try:
+        cur.execute(
+            """
+            SELECT attrs FROM chunks
+            WHERE owner_id=? AND doc_id=? AND section_path=? AND attrs IS NOT NULL
+            ORDER BY id ASC LIMIT 10
+            """,
+            (uid, doc_id, section_path),
+        )
+        rows = cur.fetchall() or []
+        for rr in rows:
+            try:
+                obj = json.loads(rr["attrs"] or "{}")
+                imgs = obj.get("images") or []
+                for p in imgs:
+                    if p and p not in images:
+                        images.append(p)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return images
+
+def describe_figures_by_numbers(
+    uid: int,
+    doc_id: int,
+    numbers: List[str],
+    sample_chunks: int = 2,
+    *,
+    use_vision: bool = True,
+    lang: str = "ru",
+    vision_first_image_only: bool = True,
+) -> List[Dict[str, Any]]:
+    """
+    Возвращает карточки по явным номерам «рисунков».
+
+    Формат одной карточки:
+      {
+        "num": "2.3",
+        "display": "Рисунок 2.3 — Название",
+        "where": {"page": 7, "section_path": ".../Рисунок 2.3 — Название"},
+        "images": ["/uploads/.."],
+        "highlights": ["краткая строка контекста", ...],
+        "vision": {"description": "...", "tags": [...] }  # если use_vision и есть изображение
+      }
+    """
+    if not numbers:
+        return []
+
+    # нормализуем N,M → N.M
+    want = sorted({str(n).replace(",", ".").strip() for n in numbers if n and str(n).strip()})
+    con = get_conn()
+    cur = con.cursor()
+    cards: List[Dict[str, Any]] = []
+
+    has_ext = _table_has_columns(con, "chunks", ["element_type", "attrs"])
+
+    for num in want:
+        # 1) ищем по element_type='figure' и секции с нужным номером
+        found = None
+        if has_ext:
+            cur.execute(
+                """
+                SELECT page, section_path, text, attrs
+                FROM chunks
+                WHERE owner_id=? AND doc_id=? AND element_type='figure'
+                  AND (section_path LIKE ? COLLATE NOCASE
+                       OR text LIKE ? COLLATE NOCASE)
+                ORDER BY id ASC LIMIT 1
+                """,
+                (uid, doc_id, f"%Рисунок {num}%", f"%Рисунок {num}%"),
+            )
+            found = cur.fetchone()
+        # 2) fallback для старых индексов — по тексту
+        if not found:
+            sel = "SELECT page, section_path, text" + (", attrs" if has_ext else "")
+            cur.execute(
+                f"""
+                {sel}
+                FROM chunks
+                WHERE owner_id=? AND doc_id=? AND (text LIKE '[Рисунок]%%' OR section_path LIKE '%%Рисунок %%')
+                  AND (section_path LIKE ? COLLATE NOCASE OR text LIKE ? COLLATE NOCASE)
+                ORDER BY id ASC LIMIT 1
+                """,
+                (uid, doc_id, f"%Рисунок {num}%", f"%Рисунок {num}%"),
+            )
+            found = cur.fetchone()
+
+        if not found:
+            # не нашли — пропускаем номер
+            continue
+
+        page = found["page"]
+        sec = found["section_path"]
+        tail = _last_segment(sec)
+        n_p, title_p = _parse_figure_title(tail)
+        display = f"Рисунок {n_p or num}" + (f" — {title_p}" if title_p else "")
+
+        # 2a) извлекаем images из attrs найденного чанка + по всей секции
+        images: List[str] = []
+        if has_ext and "attrs" in found.keys() and found["attrs"]:
+            try:
+                obj = json.loads(found["attrs"] or "{}")
+                imgs = obj.get("images") or []
+                for p in imgs:
+                    if p and p not in images:
+                        images.append(p)
+            except Exception:
+                pass
+        # добираем изображения из других чанков этой же секции (если есть)
+        images_extra = _collect_images_for_section(cur, uid, doc_id, sec)
+        for p in images_extra:
+            if p not in images:
+                images.append(p)
+
+        # 3) собираем 1–2 ближайших текстовых кусочка как «highlights»
+        cur.execute(
+            """
+            SELECT text FROM chunks
+            WHERE owner_id=? AND doc_id=? AND section_path=?
+            ORDER BY id ASC LIMIT ?
+            """,
+            (uid, doc_id, sec, max(1, sample_chunks)),
+        )
+        rows = cur.fetchall() or []
+        highlights: List[str] = []
+        for rr in rows:
+            t = (rr["text"] or "").strip()
+            # чистим возможный префикс "[Рисунок] ..."
+            t = re.sub(r"^\[\s*Рисунок\s*\]\s*", "", t, flags=re.IGNORECASE)
+            if t:
+                highlights.append(_shorten(t, 200))
+        # дополнительно, если пусто — берём любой соседний чанк из той же страницы
+        if not highlights:
+            cur.execute(
+                """
+                SELECT text FROM chunks
+                WHERE owner_id=? AND doc_id=? AND page=?
+                ORDER BY id ASC LIMIT 1
+                """,
+                (uid, doc_id, page),
+            )
+            rr = cur.fetchone()
+            if rr and rr["text"]:
+                highlights.append(_shorten(rr["text"], 200))
+
+        card: Dict[str, Any] = {
+            "num": num,
+            "display": display,
+            "where": {"page": page, "section_path": sec},
+            "images": images,
+            "highlights": highlights[:2],
+        }
+
+        # 4) vision-описание (опционально)
+        if use_vision and images:
+            try:
+                img_for_vision = images[0] if vision_first_image_only else images
+                vision = vision_describe(img_for_vision, lang=lang)
+                card["vision"] = vision
+            except Exception:
+                # мягкая деградация
+                card["vision"] = {"description": "описание изображения недоступно.", "tags": []}
+
+        cards.append(card)
+
+    con.close()
+    return cards
