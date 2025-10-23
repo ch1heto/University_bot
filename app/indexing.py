@@ -41,7 +41,7 @@ def _prefix(section: Dict[str, Any]) -> str:
     else:
         pfx_parts.append("[Текст]")
 
-    if page:
+    if page is not None:
         pfx_parts.append(f"стр.{page}")
     pfx_parts.append(title)
     return " ".join(pfx_parts)
@@ -193,7 +193,7 @@ def index_document(
     # Считаем эмбеддинги батчами
     idx = 0
     for batch in _batched(rows_text, batch_size):
-        vecs = embeddings(batch)  # list[list[float]]
+        vecs = embeddings(batch)  # list[list[float]] или np.ndarray
         if not vecs or len(vecs) != len(batch):
             raise RuntimeError("embeddings() вернул неожиданный размер результата.")
         for j, vec in enumerate(vecs):

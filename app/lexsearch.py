@@ -1,5 +1,6 @@
 from __future__ import annotations
 import re
+import sqlite3
 from typing import List, Dict, Any, Optional, Tuple
 
 from .db import get_conn
@@ -33,7 +34,7 @@ def _sanitize_like(q: str) -> str:
     # экранирование для LIKE
     return (q or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
-# ---------- безопасная сборка FTS5-запроса и SQL-литерала ----------
+# ---------- безопасная сборка FTS5-запроса ----------
 
 def _fts_escape_token(tok: str) -> str:
     # берём только разрешённые символы (в т.ч. кириллица), экранируем двойные кавычки
@@ -53,17 +54,12 @@ def _make_fts_query(raw: str) -> str:
     parts = [f'"{t}"*' for t in toks[:10]]  # ограничим до 10 токенов
     return " OR ".join(parts)
 
-def _sql_literal(s: str) -> str:
-    # SQL-литерал: одинарные кавычки удваиваем
-    return "'" + (s or "").replace("'", "''") + "'"
-
-
 # ------------------------- core: lex search -------------------------
 
 def lex_search(owner_id: int, doc_id: int, query: str, limit: int = 20) -> List[Dict[str, Any]]:
     """
     Лексический поиск по документу:
-    - если есть FTS5 (chunks_fts) — используем MATCH (строка-запрос как SQL-литерал),
+    - если есть FTS5 (chunks_fts) — используем MATCH (строка-запрос параметризуется),
     - иначе fallback на LIKE.
     Возвращает [{id, page, section_path, text, score, source}], где source ∈ {"fts","like"}.
     score: для bm25 — значение ранга (чем МЕНЬШЕ, тем лучше), без bm25 — 1.0; для LIKE — эвристика.
@@ -80,19 +76,18 @@ def lex_search(owner_id: int, doc_id: int, query: str, limit: int = 20) -> List[
         if not fts_q:
             con.close()
             return []
-        fts_lit = _sql_literal(fts_q)
         cur = con.cursor()
-        # пробуем с bm25 (может отсутствовать в сборке)
         try:
-            sql = f"""
+            # Вариант с bm25() — может отсутствовать в сборке sqlite
+            sql = """
             SELECT c.id, c.page, c.section_path, c.text, bm25(chunks_fts) AS rank
-            FROM chunks_fts f
-            JOIN chunks c ON c.id = f.rowid
-            WHERE c.owner_id = ? AND c.doc_id = ? AND f.chunks_fts MATCH {fts_lit}
-            ORDER BY rank ASC
+            FROM chunks_fts
+            JOIN chunks c ON c.id = chunks_fts.rowid
+            WHERE c.owner_id = ? AND c.doc_id = ? AND chunks_fts MATCH ?
+            ORDER BY rank ASC, c.id ASC
             LIMIT ?
             """
-            cur.execute(sql, (owner_id, doc_id, limit))
+            cur.execute(sql, (owner_id, doc_id, fts_q, limit))
             for r in cur.fetchall():
                 rows.append({
                     "id": r["id"],
@@ -102,16 +97,17 @@ def lex_search(owner_id: int, doc_id: int, query: str, limit: int = 20) -> List[
                     "score": float(r["rank"]),
                     "source": "fts"
                 })
-        except Exception:
-            # без bm25 — хотя бы фильтруем по FTS
-            sql = f"""
+        except sqlite3.OperationalError:
+            # Без bm25 — просто MATCH + стабильный порядок
+            sql = """
             SELECT c.id, c.page, c.section_path, c.text
-            FROM chunks_fts f
-            JOIN chunks c ON c.id = f.rowid
-            WHERE c.owner_id = ? AND c.doc_id = ? AND f.chunks_fts MATCH {fts_lit}
+            FROM chunks_fts
+            JOIN chunks c ON c.id = chunks_fts.rowid
+            WHERE c.owner_id = ? AND c.doc_id = ? AND chunks_fts MATCH ?
+            ORDER BY c.id ASC
             LIMIT ?
             """
-            cur.execute(sql, (owner_id, doc_id, limit))
+            cur.execute(sql, (owner_id, doc_id, fts_q, limit))
             for r in cur.fetchall():
                 rows.append({
                     "id": r["id"],
@@ -156,7 +152,6 @@ def lex_search(owner_id: int, doc_id: int, query: str, limit: int = 20) -> List[
     con.close()
     rows.sort(key=lambda x: x["score"])  # лучше сверху
     return rows[:limit]
-
 
 # ----------------------- hybrid: semantic + lex -----------------------
 
@@ -230,7 +225,6 @@ def hybrid_search(owner_id: int,
             "score": float(sc)
         })
     return merged
-
 
 # ----------------------- helpers for bot usage -----------------------
 

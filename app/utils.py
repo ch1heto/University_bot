@@ -42,7 +42,7 @@ def _smart_cut_point(text: str, start: int, limit: int) -> int:
     for pat in ("\n\n", "\n", ". ", " "):
         pos = window.rfind(pat)
         if pos != -1 and (start + pos) - start > int(limit * 0.6):  # не рвём слишком рано
-            return start + pos + len(pat.strip())
+            return start + pos + len(pat)
     return end
 
 def split_for_telegram(s: str, limit: int = 3900) -> Iterator[str]:

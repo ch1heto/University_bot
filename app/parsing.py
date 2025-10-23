@@ -948,7 +948,7 @@ def parse_pdf(path: str) -> List[Dict[str, Any]]:
                 except Exception:
                     images_with_bbox = []
 
-            # ВАЖНО: согласуем системы координат (fitz: ноль снизу → в top-систему pdfplumber)
+            # ВАЖНО: согласуем системы координат (fitz: ноль внизу → в top-систему pdfplumber)
             page_height = float(page.height or 0.0)
             for im in images_with_bbox:
                 try:

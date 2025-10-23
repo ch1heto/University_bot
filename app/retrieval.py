@@ -61,7 +61,6 @@ def _load_doc(owner_id: int, doc_id: int) -> dict:
     meta, vecs = [], []
     for r in rows:
         if has_ext:
-            # sqlite3.Row: есть keys()
             et = (r["element_type"] or "").lower() if "element_type" in r.keys() else ""
             attrs_raw = r["attrs"] if "attrs" in r.keys() else None
             try:
@@ -108,7 +107,24 @@ def _load_doc(owner_id: int, doc_id: int) -> dict:
 # Вспомогалки сигналы/классы
 # ---------------------------
 
-_NUM_RE = re.compile(r"\b\d+(?:[.,]\d+)?%?\b")
+_NUM_RE = re.compile(r"\b\d[\d\s.,]*%?\b")
+
+_CLEAN_MARKERS_RE = re.compile(
+    r"^\s*\[(?:таблица|рисунок|заголовок|страница)\]\s*|"
+    r"\s*\[\s*row\s*\d+\s*\]\s*|"
+    r"\s*\(\d+\s*[×x]\s*\d+\)\s*$",
+    re.IGNORECASE
+)
+
+def _clean_for_ctx(s: str) -> str:
+    if not s:
+        return ""
+    t = _CLEAN_MARKERS_RE.sub("", s)
+    t = t.replace("\u00A0", " ")                # NBSP -> пробел
+    t = t.replace("–", "-").replace("—", "-")   # нормализуем тире
+    t = re.sub(r"\s+\|\s+", " — ", t)           # "a | b | c" -> "a — b — c"
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
 
 def _extract_numbers(s: str) -> set[str]:
     return set(_NUM_RE.findall(s or ""))
@@ -188,8 +204,7 @@ def retrieve(owner_id: int, doc_id: int, query: str, top_k: int = 8) -> List[Dic
     if prelim_k <= 0:
         return []
 
-    # Быстрый выбор top-prelim_k без полного сортирования (фикс argpartition)
-    # Берём индексы наибольших значений
+    # Быстрый выбор top-prelim_k без полного сортирования
     part_idx = np.argpartition(sims, -prelim_k)[-prelim_k:]
     idx = part_idx[np.argsort(-sims[part_idx])]
 
@@ -211,40 +226,43 @@ def retrieve(owner_id: int, doc_id: int, query: str, top_k: int = 8) -> List[Dic
 
         # Тематические бусты по типу чанка
         if sig["ask_table"] and ctype in {"table", "table_row"}:
-            score += 0.10
-        if sig["ask_figure"] and ctype == "figure":
             score += 0.12
+        if sig["ask_figure"] and ctype == "figure":
+            score += 0.14
         if sig["ask_heading"] and ctype == "heading":
-            score += 0.05
+            score += 0.06
         if sig["ask_sources"] and ctype == "reference":
-            score += 0.30  # заметный буст для списка литературы
-        # Если не просили источники — слегка штрафуем reference, чтобы они не лезли в общий контекст
+            score += 0.35
+        # если источники не просили — пусть уходят вниз, но не исчезают полностью
         if (not sig["ask_sources"]) and ctype == "reference":
-            score -= 0.10
+            score -= 0.12
 
         # Совпадение конкретного номера таблицы/рисунка
         if tab_rgx and tab_rgx.search(text):
-            score += 0.22
-        if fig_rgx and fig_rgx.search(text):
             score += 0.24
+        if fig_rgx and fig_rgx.search(text):
+            score += 0.26
 
-        # Совпадение чисел (до +0.10 суммарно)
+        # Совпадение чисел (до +0.12 суммарно)
         if q_nums:
             c_nums = _extract_numbers(text)
             inter = len(q_nums & c_nums)
             if inter:
-                score += min(0.02 * inter, 0.10)
+                score += min(0.025 * inter, 0.12)
 
-        # Лёгкий штраф для «страниц», если не спрашивали именно про разделы/структуру
+        # Лёгкий штраф для «страниц», если не спрашивали про структуру
         if ctype == "page" and not (sig["ask_table"] or sig["ask_figure"] or sig["ask_heading"] or sig["ask_sources"]):
-            score -= 0.02
+            score -= 0.03
+
+        # Пустые/очень короткие текстовые чанки — мягкий штраф
+        if len((text or "").strip()) < 30:
+            score -= 0.04
 
         rescored.append((int(i), score))
 
     # Финальная сортировка по новым скорингам
     rescored.sort(key=lambda x: -x[1])
 
-    # Если не просили источники — фильтруем явные reference из финальных top_k (жёсткая защита)
     filtered: List[Tuple[int, float]] = []
     for i, sc in rescored:
         if len(filtered) >= top_k:
@@ -253,7 +271,7 @@ def retrieve(owner_id: int, doc_id: int, query: str, top_k: int = 8) -> List[Dic
             continue
         filtered.append((i, sc))
 
-    best = filtered[:top_k]
+    best = (filtered or rescored)[:top_k]
 
     out: List[Dict] = []
     for i, sc in best:
@@ -272,16 +290,16 @@ def retrieve(owner_id: int, doc_id: int, query: str, top_k: int = 8) -> List[Dic
 
 def build_context(snippets: List[Dict], max_chars: int = 6000) -> str:
     """
-    Склеивает фрагменты ТОЛЬКО текстом без каких-либо ссылочных пометок
-    (никаких страниц/разделов в квадратных скобках). Блоки разделяются пустой строкой.
+    Склеиваем контекст, предварительно очищая служебные метки и нормализуя пробелы/тире.
+    Страницы/разделы не вставляем — только чистый текст.
     """
     parts: List[str] = []
     total = 0
     for s in snippets:
-        block = (s.get("text") or "").strip()
+        raw = (s.get("text") or "")
+        block = _clean_for_ctx(raw)
         if not block:
             continue
-        # Урезаем последний блок, чтобы не превысить max_chars
         if total + len(block) > max_chars:
             remaining = max_chars - total
             if remaining <= 0:
@@ -317,18 +335,17 @@ def _mk_table_pattern(q: str) -> Optional[str]:
     if not m:
         return None
     raw = m.group(2).strip()
-    # нормализуем 'A . 1,2' -> 'A\.? *1[.,]2'
-    raw = re.sub(r"\s+", " ", raw)
-    raw = raw.replace(" ", "")
-    # A.1 или П1.2 или 3.1
-    if re.match(r"^[A-Za-zA-Яа-я]\d", raw):
-        # П1.2 -> П\s*1[.,]2
+    raw = re.sub(r"\s+", " ", raw).replace(" ", "")
+    # Буквенный префикс?
+    if re.match(r"^[A-Za-zА-Яа-я]\d", raw):
         letter = raw[0]
         rest = raw[1:]
-        rest = re.sub(r"\.", "[.,]", rest)
-        pat_num = rf"{re.escape(letter)}\.?\s*{re.escape(rest)}"
+        # экранируем, а затем превращаем '\.' в '[.,]'
+        rest_esc = re.escape(rest)
+        rest_pat = re.sub(r"\\\.", "[.,]", rest_esc)
+        pat_num = rf"{re.escape(letter)}\.?\s*{rest_pat}"
     else:
-        pat_num = re.sub(r"\.", "[.,]", re.escape(raw))
+        pat_num = re.sub(r"\\\.", "[.,]", re.escape(raw))
     return rf"(?:табл(?:ица)?|table)\s*\.?\s*(?:№\s*)?{pat_num}"
 
 
@@ -342,15 +359,15 @@ def _mk_figure_pattern(q: str) -> Optional[str]:
     if not m:
         return None
     raw = m.group(2).strip()
-    raw = re.sub(r"\s+", " ", raw)
-    raw = raw.replace(" ", "")
-    if re.match(r"^[A-Za-zA-Яа-я]\d", raw):
+    raw = re.sub(r"\s+", " ", raw).replace(" ", "")
+    if re.match(r"^[A-Za-zА-Яа-я]\d", raw):
         letter = raw[0]
         rest = raw[1:]
-        rest = re.sub(r"\.", "[.,]", rest)
-        pat_num = rf"{re.escape(letter)}\.?\s*{re.escape(rest)}"
+        rest_esc = re.escape(rest)
+        rest_pat = re.sub(r"\\\.", "[.,]", rest_esc)
+        pat_num = rf"{re.escape(letter)}\.?\s*{rest_pat}"
     else:
-        pat_num = re.sub(r"\.", "[.,]", re.escape(raw))
+        pat_num = re.sub(r"\\\.", "[.,]", re.escape(raw))
     return rf"(?:рис(?:унок)?|fig(?:ure)?\.?)\s*\.?\s*(?:№\s*)?{pat_num}"
 
 

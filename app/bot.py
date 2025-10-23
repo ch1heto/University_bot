@@ -6,22 +6,25 @@ import json
 import logging
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
-
+from .answer_builder import generate_answer
 from .config import Cfg
 from .db import (
     ensure_user, get_conn,
     set_document_indexer_version, get_document_indexer_version,
     CURRENT_INDEXER_VERSION,
     update_document_meta, delete_document_chunks,
+    set_user_active_doc, get_user_active_doc,  # ⬅️ добавили персистентное состояние
 )
 from .parsing import parse_docx, parse_pdf, parse_doc, save_upload
 from .indexing import index_document
-from .retrieval import (
-    retrieve, build_context, invalidate_cache,
-    _mk_table_pattern, _mk_figure_pattern, keyword_find,  # оставим для совместимости
-)
-from .ace import ace_once, agent_no_context
+from .retrieval import retrieve, build_context, invalidate_cache  # лишние утилиты убрали
+from .intents import detect_intents
 from .polza_client import probe_embedding_dim, chat_with_gpt  # ⬅️ добавили chat_with_gpt
+
+# НОВОЕ: оркестратор приёма/обогащения (OCR таблиц-картинок, нормализация чисел)
+from .ingest_orchestrator import enrich_sections
+# НОВОЕ: аналитика таблиц
+from .analytics import analyze_table_by_num
 
 # утилиты
 from .utils import safe_filename, sha256_bytes, split_for_telegram, infer_doc_kind
@@ -72,7 +75,7 @@ except Exception:
             """
             SELECT page, section_path, text
             FROM chunks
-            WHERE owner_id=? AND doc_id=? 
+            WHERE owner_id=? AND doc_id=?
               AND (text LIKE '[Заголовок]%%'
                    OR text LIKE '%%Цель%%'
                    OR text LIKE '%%Задач%%'
@@ -152,8 +155,8 @@ def topical_check(text: str) -> str | None:
     """
     t = (text or "").lower()
     if not any(w in t for w in _ALLOWED_HINT_WORDS):
-        return ("Подсказка: я сильнее отвечаю по теме ВКР (структура, методология, ГОСТ, "
-                "литобзор, антиплагиат). Если пришлёте файл диплома — смогу отвечать по содержанию.")
+        return ("Подсказка: сильнее всего отвечаю по содержанию ВКР (главы, таблицы, рисунки, выводы). "
+                "Если пришлёте файл диплома — смогу объяснять прямо по вашему тексту.")
     return None
 
 
@@ -437,7 +440,7 @@ def _has_practical_part(uid: int, doc_id: int) -> bool:
     return row is not None
 
 
-# ------------- ГОСТ-интент и проверка ------------- 
+# ------------- ГОСТ-интент и проверка -------------
 
 _GOST_HINT = re.compile(r"\b(гост|оформлени|шрифт|межстроч|кегл|выравнивани|поля|оформить)\w*\b", re.IGNORECASE)
 
@@ -570,82 +573,82 @@ def verbatim_find(owner_id: int, doc_id: int, q_text: str, max_hits: int = 3) ->
 async def start(m: types.Message):
     ensure_user(str(m.from_user.id))
     await _send(m,
-        "Привет! Я ассистент по ВКР. Пришли файл диплома (.doc/.docx/) — я его проиндексирую и буду отвечать по содержанию.\n"
-        "Можно прикрепить подпись-вопрос к файлу или задавать вопросы позже отдельными сообщениями.\n"
-        "💳 Оплата и статус:\n"
-        "• /buy — оплатить подписку\n"
-        "• /status — статус подписки/пробного лимита\n\n"
+        "Привет! Я репетитор по твоей ВКР. Пришли .doc/.docx — я проиндексирую и буду объяснять содержание: главы простым языком, смысл таблиц/рисунков, конспекты к защите. Можешь прикрепить вопрос к файлу или написать его отдельным сообщением."
     )
 
+# ------------------------------ /diag ------------------------------
 
-# ======================= НОВАЯ МУЛЬТИ-ИНТЕНТ ЛОГИКА =======================
+@dp.message(Command("diag"))
+async def cmd_diag(m: types.Message):
+    uid = ensure_user(str(m.from_user.id))
+    doc_id = ACTIVE_DOC.get(uid) or get_user_active_doc(uid)
+    if not doc_id:
+        await _send(m, "Активного документа нет. Пришлите файл (.doc/.docx/.pdf) сначала.")
+        return
 
-# Понимаем: 2.1, 3, A.1, А.1, П1.2 и т.п. (для таблиц)
-_NUM_IN_TEXT = re.compile(r"(?i)\bтабл(?:ица)?\.?\s*([a-zа-я]\.?[\s-]?\d+(?:[.,]\d+)*|\d+(?:[.,]\d+)*)\b")
-# Понимаем запросы про рисунки/картинки/диаграммы/графики/схемы и т.п.
-_FIG_ANY = re.compile(
-    r"\b(рисун\w*|рис(?:\.|унок)?|figure|fig\.?|картин\w*|изображен\w*|диаграмм\w*|график\w*|схем\w*|иллюстрац\w*)\b",
-    re.IGNORECASE
-)
-# Понимаем номера рисунков: «рис. 2.3», «рисунок 4», «figure 1.2», «fig. 3»
-_FIG_NUM_IN_TEXT = re.compile(r"(?i)\b(?:рис(?:\.|унок)?|figure|fig\.?|картин\w*)\s*(?:№\s*)?(\d+(?:[.,]\d+)*)\b")
+    # базовые метрики из БД
+    con = get_conn()
+    cur = con.cursor()
+    cur.execute("SELECT path FROM documents WHERE id=? AND owner_id=?", (doc_id, uid))
+    row = cur.fetchone()
+    path = row["path"] if row else "—"
 
-def _detect_intents(text: str) -> dict:
-    """
-    Из одного сообщения вытаскиваем все задачи, чтобы ответ был один, но полный.
-    """
-    t = (text or "").strip()
-    intents = {
-        "language": "ру",
-        "tables": {"want": False, "count": False, "list": False, "describe": [], "limit": 25},
-        "sources": {"want": False, "count": False, "list": False, "limit": 25},
-        "figures": {"want": False, "count": False, "list": False, "describe": [], "limit": 25},  # ⬅️ НОВОЕ
-        "summary": bool(is_summary_intent(t)),
-        "practical": bool(_PRACTICAL_Q.search(t or "")),
-        "general_question": None,
-    }
+    cur.execute("SELECT COUNT(*) AS c FROM chunks WHERE owner_id=? AND doc_id=?", (uid, doc_id))
+    chunks_cnt = int(cur.fetchone()["c"])
 
-    # Язык (очень грубо)
-    if re.search(r"[a-z]{3,}", t) and not re.search(r"[а-я]{3,}", t, re.IGNORECASE):
-        intents["language"] = "en"
+    con.close()
 
-    # Таблицы
-    if _TABLE_ANY.search(t):
-        intents["tables"]["want"] = True
-        if _COUNT_HINT.search(t):
-            intents["tables"]["count"] = True
-        if _WHICH_HINT.search(t) or re.search(r"\b(какие таблиц|список таблиц)\b", t, re.IGNORECASE):
-            intents["tables"]["list"] = True
-        nums = [n.replace(",", ".").replace(" ", "") for n in _NUM_IN_TEXT.findall(t)]
-        if nums:
-            intents["tables"]["describe"] = sorted(set(nums), key=lambda x: [int(p) if p.isdigit() else p for p in re.split(r"[.]", x)])
+    tables_cnt = _count_tables(uid, doc_id)
+    figures_cnt = _list_figures_db(uid, doc_id, limit=999999)["count"]
+    sources_cnt = _count_sources(uid, doc_id)
+    indexer_ver = get_document_indexer_version(doc_id) or 0
 
-    # Источники
-    if _SOURCES_HINT.search(t):
-        intents["sources"]["want"] = True
-        if _COUNT_HINT.search(t):
-            intents["sources"]["count"] = True
-        if _WHICH_HINT.search(t) or "список" in t.lower():
-            intents["sources"]["list"] = True
+    txt = (
+        f"Диагностика документа #{doc_id}\n"
+        f"— Путь: {path}\n"
+        f"— Чанков: {chunks_cnt}\n"
+        f"— Таблиц: {tables_cnt}\n"
+        f"— Рисунков: {figures_cnt}\n"
+        f"— Источников: {sources_cnt}\n"
+        f"— Версия индексатора: {indexer_ver} (текущая {CURRENT_INDEXER_VERSION})\n"
+    )
+    await _send(m, txt)
 
-    # Рисунки
-    if _FIG_ANY.search(t):
-        intents["figures"]["want"] = True
-        if _COUNT_HINT.search(t):
-            intents["figures"]["count"] = True
-        if _WHICH_HINT.search(t) or re.search(r"\b(какие рисунк|список рисунк)\w*\b", t, re.IGNORECASE):
-            intents["figures"]["list"] = True
-        nums_f = [n.replace(",", ".").strip() for n in _FIG_NUM_IN_TEXT.findall(t)]
-        if nums_f:
-            def _key(v: str):
-                return [int(p) if p.isdigit() else p for p in v.split(".")]
-            intents["figures"]["describe"] = sorted(set(nums_f), key=_key)
 
-    # Остаток как общий вопрос
-    intents["general_question"] = t
+# ------------------------------ /reindex ------------------------------
 
-    logging.debug("INTENTS: %s", json.dumps(intents, ensure_ascii=False))
-    return intents
+@dp.message(Command("reindex"))
+async def cmd_reindex(m: types.Message):
+    uid = ensure_user(str(m.from_user.id))
+    doc_id = ACTIVE_DOC.get(uid) or get_user_active_doc(uid)
+    if not doc_id:
+        await _send(m, "Активного документа нет. Пришлите файл сначала.")
+        return
+
+    con = get_conn()
+    cur = con.cursor()
+    cur.execute("SELECT path FROM documents WHERE id=? AND owner_id=?", (doc_id, uid))
+    row = cur.fetchone()
+    con.close()
+
+    if not row:
+        await _send(m, "Не смог найти путь к файлу. Загрузите документ заново.")
+        return
+
+    path = row["path"]
+    try:
+        sections = _parse_by_ext(path)
+        # обогащаем секции перед индексом
+        sections = enrich_sections(sections, doc_kind=os.path.splitext(path)[1].lower().strip("."))
+        delete_document_chunks(doc_id, uid)
+        index_document(uid, doc_id, sections)
+        invalidate_cache(uid, doc_id)
+        set_document_indexer_version(doc_id, CURRENT_INDEXER_VERSION)
+        update_document_meta(doc_id, layout_profile=_current_embedding_profile())
+        await _send(m, f"Документ #{doc_id} переиндексирован.")
+    except Exception as e:
+        logging.exception("reindex failed: %s", e)
+        await _send(m, f"Не удалось переиндексировать документ: {e}")
 
 
 # ---------- Рисунки: вспомогательные функции (локальные, без зависимостей от retrieval.py) ----------
@@ -779,8 +782,10 @@ async def _ensure_modalities_indexed(m: types.Message, uid: int, doc_id: int, in
     path = row["path"]
     try:
         sections = _parse_by_ext(path)
+        # НОВОЕ: обогащение — распознаем таблицы на картинках/нормализуем числа
+        sections = enrich_sections(sections, doc_kind=os.path.splitext(path)[1].lower().strip("."))
     except Exception as e:
-        logging.exception("re-parse failed: %s", e)
+        logging.exception("re-parse/enrich failed: %s", e)
         return
 
     # Смотрим, появилось ли то, чего не хватало
@@ -862,7 +867,7 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
             "describe": [],
         }
 
-        # describe по конкретным номерам
+        # describe по конкретным номерам + точные расчеты
         desc_cards = []
         if intents["tables"]["describe"]:
             con = get_conn()
@@ -920,17 +925,25 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
                 display = _compose_display_from_attrs(attrs_json, base, first_row_text)
                 display = _strip_table_prefix(display)
 
+                # НОВОЕ: точная аналитика по таблице
+                stats = None
+                try:
+                    stats = analyze_table_by_num(uid, doc_id, num, max_series=6)
+                except Exception:
+                    stats = None
+
                 desc_cards.append({
                     "num": num,
                     "display": display,
                     "where": {"page": row["page"], "section_path": row["section_path"]},
                     "highlights": highlights,
+                    "stats": stats,  # ⬅️ добавили
                 })
             con.close()
 
         facts["tables"]["describe"] = desc_cards
 
-    # ----- Рисунки (НОВОЕ) -----
+    # ----- Рисунки -----
     if intents["figures"]["want"]:
         lst = _list_figures_db(uid, doc_id, limit=intents["figures"]["limit"])
         figs_block = {
@@ -1042,96 +1055,6 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
     return facts
 
 
-_RULES_MD = (
-    "1) Ответь одним сообщением, закрой все подпункты вопроса.\n"
-    "2) Заголовки таблиц: если есть номер → «Таблица N — Название»; если номера нет — только название.\n"
-    "3) Не выводи служебные метки и размеры (никаких [Таблица], «ряд 1», «(6×7)»).\n"
-    "4) В списках покажи не более 25 строк, затем «… и ещё M», если есть.\n"
-    "5) Не придумывай факты вне блока Facts; если данных нет — скажи честно.\n"
-)
-
-def _compose_answer(question: str, facts: dict, lang: str = "ru") -> str:
-    """Готовим markdown-контекст для модели и просим её красиво «сшить» ответ."""
-    def md_list(arr: list[str], max_show: int, more: int | None) -> str:
-        out = []
-        for x in (arr or [])[:max_show]:
-            out.append(f"- {x}")
-        if more and more > 0:
-            out.append(f"… и ещё {more}")
-        return "\n".join(out)
-
-    parts = []
-
-    # Таблицы
-    tables = facts.get("tables") or {}
-    if tables:
-        block = []
-        if "count" in tables:
-            block.append(f"count: {tables.get('count', 0)}")
-        if tables.get("list"):
-            block.append("list:\n" + md_list(tables["list"], 25, tables.get("more", 0)))
-        if tables.get("describe"):
-            cards = []
-            for c in tables["describe"]:
-                cards.append({
-                    "num": c.get("num"),
-                    "display": c.get("display"),
-                    "where": c.get("where"),
-                    "highlights": c.get("highlights", [])[:2],
-                })
-            block.append("describe:\n" + json.dumps(cards, ensure_ascii=False, indent=2))
-        parts.append("- Tables:\n  " + "\n  ".join(block))
-
-    # Рисунки (НОВОЕ)
-    figures = facts.get("figures") or {}
-    if figures:
-        block = []
-        block.append(f"count: {figures.get('count', 0)}")
-        if figures.get("list"):
-            block.append("list:\n" + md_list(figures["list"], 25, figures.get("more", 0)))
-        if figures.get("describe_lines"):
-            lines = "\n".join([f"- {ln}" for ln in figures["describe_lines"]])
-            block.append("describe:\n" + lines)
-        parts.append("- Figures:\n  " + "\n  ".join(block))
-
-    # Источники
-    sources = facts.get("sources") or {}
-    if sources:
-        block = []
-        block.append(f"count: {sources.get('count', 0)}")
-        if sources.get("list"):
-            block.append("list:\n" + md_list(sources["list"], 25, sources.get("more", 0)))
-        parts.append("- Sources:\n  " + "\n  ".join(block))
-
-    # Практическая часть
-    if "practical_present" in facts:
-        parts.append(f"- PracticalPartPresent: {bool(facts['practical_present'])}")
-
-    # Краткое содержание (если просили)
-    if "summary_text" in facts:
-        parts.append("- Summary:\n  " + (facts["summary_text"][:1200] + ("…" if len(facts["summary_text"]) > 1200 else "")).replace("\n", "\n  "))
-
-    # Вербатим-цитаты
-    if facts.get("verbatim_hits"):
-        hits_md = []
-        for h in facts["verbatim_hits"]:
-            page = h.get('page')
-            sec = (h.get('section_path') or "").strip()
-            page_str = (str(page) if page is not None else "?")
-            where = f'в разделе «{sec}», стр. {page_str}' if sec else f'на стр. {page_str}'
-            hits_md.append(f"- Match {where}: «{h['snippet']}»")
-        parts.append("- Citations:\n  " + "\n  ".join(hits_md))
-
-    # Общий контекст (для ответа на общий вопрос)
-    if "general_ctx" in facts:
-        parts.append("- Context:\n  " + (facts["general_ctx"][:1500] + ("…" if len(facts["general_ctx"]) > 1500 else "")).replace("\n", "\n  "))
-
-    facts_md = "[Facts]\n" + "\n".join(parts) + "\n\n[Rules]\n" + _RULES_MD
-
-    reply = ace_once(question, facts_md)
-    return reply
-
-
 # ------------------------------ FULLREAD: модель читает весь файл ------------------------------
 
 def _full_document_text(owner_id: int, doc_id: int, *, limit_chars: int | None = None) -> str:
@@ -1204,240 +1127,6 @@ def _fullread_try_answer(uid: int, doc_id: int, q_text: str) -> str | None:
         return None
 
 
-# ------------------------------ DIAGNOSTICS ------------------------------
-
-def _json_obj(x):
-    if not x:
-        return {}
-    if isinstance(x, dict):
-        return x
-    try:
-        return json.loads(x)
-    except Exception:
-        return {}
-
-def _diagnostics_text(uid: int, doc_id: int) -> str:
-    con = get_conn()
-    cur = con.cursor()
-
-    # path + indexer_version
-    cur.execute("SELECT path, indexer_version FROM documents WHERE id=? AND owner_id=?", (doc_id, uid))
-    drow = cur.fetchone()
-    path = (drow["path"] if drow else None) or "?"
-    idx_ver = int((drow["indexer_version"] or 0) if drow else 0)
-
-    # totals
-    cur.execute("SELECT COUNT(*) AS c FROM chunks WHERE owner_id=? AND doc_id=?", (uid, doc_id))
-    total = int(cur.fetchone()["c"] or 0)
-
-    # groups
-    cur.execute("""
-        SELECT COALESCE(element_type,'NULL') AS et, COUNT(*) AS c
-        FROM chunks WHERE owner_id=? AND doc_id=? GROUP BY et ORDER BY c DESC
-    """, (uid, doc_id))
-    groups = [(r["et"], int(r["c"])) for r in cur.fetchall()]
-
-    # figures sample
-    cur.execute("""
-        SELECT page, section_path, text, attrs FROM chunks
-        WHERE owner_id=? AND doc_id=? AND element_type='figure'
-        ORDER BY id ASC LIMIT 5
-    """, (uid, doc_id))
-    figs = cur.fetchall() or []
-
-    # references sample
-    cur.execute("""
-        SELECT page, section_path, text, attrs FROM chunks
-        WHERE owner_id=? AND doc_id=? AND element_type='reference'
-        ORDER BY id ASC LIMIT 5
-    """, (uid, doc_id))
-    refs = cur.fetchall() or []
-
-    # tables sample (base names)
-    cur.execute("""
-        SELECT DISTINCT
-            CASE WHEN instr(section_path, ' [row ')>0
-                 THEN substr(section_path, 1, instr(section_path,' [row ')-1)
-            ELSE section_path END AS base_name
-        FROM chunks
-        WHERE owner_id=? AND doc_id=? AND element_type IN ('table','table_row')
-        LIMIT 8
-    """, (uid, doc_id))
-    tbls = [r["base_name"] for r in cur.fetchall() if r["base_name"]]
-
-    con.close()
-
-    lines = []
-    lines.append(f"Диагностика документа #{doc_id}")
-    lines.append(f"Путь: {path}")
-    lines.append(f"Версия индексатора: {idx_ver} (актуальная: {CURRENT_INDEXER_VERSION})")
-    lines.append(f"Всего чанков: {total}")
-    if groups:
-        lines.append("По element_type:")
-        for et, cnt in groups:
-            lines.append(f"— {et}: {cnt}")
-
-    if tbls:
-        lines.append("\nПримеры таблиц (base):")
-        for t in tbls:
-            lines.append(f"• {t}")
-
-    if figs:
-        lines.append("\nПримеры рисунков:")
-        for r in figs:
-            a = _json_obj(r["attrs"])
-            imgs = a.get("images") or []
-            tail = a.get("caption_tail") or a.get("title")
-            num = a.get("caption_num") or a.get("label")
-            lines.append(f"• {r['section_path']} | num={num} | tail={tail} | images={len(imgs)}")
-
-    if refs:
-        lines.append("\nПримеры источников:")
-        for r in refs:
-            a = _json_obj(r["attrs"])
-            idx = a.get("ref_index")
-            text = (r["text"] or "").strip()
-            if len(text) > 200:
-                text = text[:199] + "…"
-            lines.append(f"• [{idx}] {text}")
-
-    return "\n".join(lines)
-
-
-@dp.message(Command("diag"))
-async def cmd_diag(m: types.Message):
-    uid = ensure_user(str(m.from_user.id))
-    doc_id = ACTIVE_DOC.get(uid)
-    if not doc_id:
-        await _send(m, "Активного документа нет. Пришлите файл сначала.")
-        return
-    txt = _diagnostics_text(uid, doc_id)
-    await _send(m, txt)
-
-
-@dp.message(Command("reindex"))
-async def cmd_reindex(m: types.Message):
-    uid = ensure_user(str(m.from_user.id))
-    doc_id = ACTIVE_DOC.get(uid)
-    if not doc_id:
-        await _send(m, "Сначала пришлите файл (активного документа нет).")
-        return
-
-    con = get_conn()
-    cur = con.cursor()
-    cur.execute("SELECT path FROM documents WHERE id=? AND owner_id=?", (doc_id, uid))
-    row = cur.fetchone()
-    con.close()
-    if not row:
-        await _send(m, "Не нашёл путь к файлу документа.")
-        return
-
-    path = row["path"]
-    try:
-        sections = _parse_by_ext(path)
-    except Exception as e:
-        await _send(m, f"Не удалось перепарсить: {e}")
-        return
-
-    try:
-        _reindex_with_sections(uid, doc_id, sections)
-        await _send(m, "Документ перепроиндексирован текущим парсером. Попробуйте снова задать вопрос про рисунки/источники.")
-    except Exception as e:
-        await _send(m, f"Ошибка переиндексации: {e}")
-
-
-@dp.message(Command("doc"))
-async def cmd_doc(m: types.Message):
-    uid = ensure_user(str(m.from_user.id))
-    doc_id = ACTIVE_DOC.get(uid)
-    if not doc_id:
-        await _send(m, "Активного документа нет.")
-        return
-    con = get_conn()
-    cur = con.cursor()
-    cur.execute("SELECT path, indexer_version FROM documents WHERE id=? AND owner_id=?", (doc_id, uid))
-    row = cur.fetchone()
-    con.close()
-    p = row["path"] if row else "?"
-    v = int((row["indexer_version"] or 0) if row else 0)
-    await _send(m, f"Активный документ: #{doc_id}\nПуть: {p}\nВерсия индексатора: {v} (текущая {CURRENT_INDEXER_VERSION})")
-
-
-# ------------------------------ основной ответчик ------------------------------
-
-async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: str):
-    q_text = (q_text or "").strip()
-    logging.debug(f"Получен запрос от пользователя: {q_text}")
-    if not q_text:
-        await _send(m, "Вопрос пустой. Напишите, что именно вас интересует по ВКР.")
-        return
-
-    # Безопасность — всегда
-    viol = safety_check(q_text)
-    if viol:
-        await _send(m, viol + " Задайте корректный вопрос по ВКР.")
-        return
-
-    # ГОСТ-проверка по запросу
-    if await _maybe_run_gost(m, uid, doc_id, q_text):
-        return
-
-    # ====== NEW: режим, где модель читает ВЕСЬ файл (FULLREAD_MODE=direct) ======
-    if (Cfg.FULLREAD_MODE or "off") == "direct":
-        fr_answer = _fullread_try_answer(uid, doc_id, q_text)
-        if fr_answer:
-            await _send(m, fr_answer)
-            return
-        # иначе тихо падаем в стандартный RAG/lexsearch
-
-    # Единый мульти-интент пайплайн (стандартный режим)
-    intents = _detect_intents(q_text)
-
-    # >>> Самоисцеление индекса под запрос (если старый документ без figures/reference)
-    await _ensure_modalities_indexed(m, uid, doc_id, intents)
-
-    facts = _gather_facts(uid, doc_id, intents)
-    reply = _compose_answer(q_text, facts, lang=intents.get("language", "ru"))
-    await _send(m, reply)
-
-
-# ------------------------------ эмбеддинг-профиль ------------------------------
-
-def _current_embedding_profile() -> str:
-    dim = probe_embedding_dim(None)
-    if dim:
-        return f"emb={Cfg.POLZA_EMB}|dim={dim}"
-    return f"emb={Cfg.POLZA_EMB}"
-
-def _needs_reindex_by_embeddings(con, doc_id: int) -> bool:
-    if not _table_has_columns(con, "documents", ["layout_profile"]):
-        return True
-    cur = con.cursor()
-    cur.execute("SELECT layout_profile FROM documents WHERE id=?", (doc_id,))
-    row = cur.fetchone()
-    stored = (row["layout_profile"] or "") if row else ""
-    if not stored:
-        return True
-    cur_model = Cfg.POLZA_EMB.strip().lower()
-    stored_model = ""
-    stored_dim = None
-    for part in stored.split("|"):
-        part = (part or "").strip().lower()
-        if part.startswith("emb="):
-            stored_model = part[4:]
-        if part.startswith("dim="):
-            try:
-                stored_dim = int(part[4:])
-            except Exception:
-                stored_dim = None
-    if stored_model and stored_model != cur_model:
-        return True
-    cur_dim = probe_embedding_dim(None)
-    if cur_dim and stored_dim and stored_dim != cur_dim:
-        return True
-    return False
-
-
 # ------------------------------ загрузка файла ------------------------------
 
 @dp.message(F.document)
@@ -1478,9 +1167,14 @@ async def handle_doc(m: types.Message):
             con.close()
 
             try:
+                # парсим и ОБОГАЩАЕМ перед индексом
                 sections = _parse_by_ext(path)
-                if sum(len(s.get("text") or "") for s in sections) < 500:
-                    await _send(m, "Похоже, файл пустой или это скан-PDF без текста.")
+                sections = enrich_sections(sections, doc_kind=os.path.splitext(path)[1].lower().strip("."))
+                # проверяем «пустой» уже после enrich
+                if sum(len(s.get("text") or "") for s in sections) < 500 and not any(
+                    s.get("element_type") in ("table", "table_row", "figure") for s in sections
+                ):
+                    await _send(m, "Похоже, файл не содержит текста/структур. Убедитесь, что загружен .docx с «живыми» таблицами. Если таблицы были картинками — я их распознаю автоматически.")
                     return
 
                 delete_document_chunks(existing_id, uid)
@@ -1495,6 +1189,7 @@ async def handle_doc(m: types.Message):
                 return
 
             ACTIVE_DOC[uid] = existing_id
+            set_user_active_doc(uid, existing_id)  # ⬅️ персистентно
             caption = (m.caption or "").strip()
             await _send(m, f"Документ #{existing_id} переиндексирован. Готов отвечать.")
             if caption:
@@ -1503,6 +1198,7 @@ async def handle_doc(m: types.Message):
 
         con.close()
         ACTIVE_DOC[uid] = existing_id
+        set_user_active_doc(uid, existing_id)  # ⬅️ персистентно
         caption = (m.caption or "").strip()
         await _send(m, f"Этот файл уже загружен ранее как документ #{existing_id}. Использую его.")
         if caption:
@@ -1513,17 +1209,19 @@ async def handle_doc(m: types.Message):
     filename = safe_filename(f"{m.from_user.id}_{doc.file_name}")
     path = save_upload(data, filename, Cfg.UPLOAD_DIR)
 
-    # 4) парсим
+    # 4) парсим и ОБОГАЩАЕМ
     try:
         sections = _parse_by_ext(path)
+        sections = enrich_sections(sections, doc_kind=os.path.splitext(path)[1].lower().strip("."))
     except Exception as e:
         await _send(m, f"Не удалось обработать файл: {e}")
         return
 
-    # 5) пустой/скан
-    if sum(len(s.get("text") or "") for s in sections) < 500:
-        await _send(m, "Похоже, файл пустой или это скан-PDF без текста. "
-                       "Загрузите, пожалуйста, DOC/DOCX или текстовый PDF.")
+    # 5) проверка объёма — уже после enrich
+    if sum(len(s.get("text") or "") for s in sections) < 500 and not any(
+        s.get("element_type") in ("table", "table_row", "figure") for s in sections
+    ):
+        await _send(m, "Похоже, файл не содержит текста/структур. Загрузите текстовый DOC/DOCX; таблицы-картинки я распознаю автоматически.")
         return
 
     # 6) документ → БД и индексация
@@ -1537,6 +1235,7 @@ async def handle_doc(m: types.Message):
     update_document_meta(doc_id, layout_profile=_current_embedding_profile())
 
     ACTIVE_DOC[uid] = doc_id
+    set_user_active_doc(uid, doc_id)  # ⬅️ персистентно
 
     caption = (m.caption or "").strip()
     if caption:
@@ -1546,21 +1245,100 @@ async def handle_doc(m: types.Message):
         await _send(m, f"Готово. Документ #{doc_id} проиндексирован. Можете задавать вопросы по работе.")
 
 
+# ------------------------------ основной ответчик ------------------------------
+
+async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: str):
+    q_text = (q_text or "").strip()
+    logging.debug(f"Получен запрос от пользователя: {q_text}")
+    if not q_text:
+        await _send(m, "Вопрос пустой. Напишите, что именно вас интересует по ВКР.")
+        return
+
+    # Безопасность — всегда
+    viol = safety_check(q_text)
+    if viol:
+        await _send(m, viol + " Задайте корректный вопрос по ВКР.")
+        return
+
+    # ГОСТ-проверка по запросу
+    if await _maybe_run_gost(m, uid, doc_id, q_text):
+        return
+
+    # ====== NEW: режим, где модель читает ВЕСЬ файл (FULLREAD_MODE=direct) ======
+    if (Cfg.FULLREAD_MODE or "off") == "direct":
+        fr_answer = _fullread_try_answer(uid, doc_id, q_text)
+        if fr_answer:
+            await _send(m, fr_answer)
+            return
+        # иначе тихо падаем в стандартный RAG/lexsearch
+
+    # Единый мульти-интент пайплайн (стандартный режим)
+    intents = detect_intents(q_text)
+
+    # >>> Самоисцеление индекса под запрос (если старый документ без figures/reference)
+    await _ensure_modalities_indexed(m, uid, doc_id, intents)
+
+    facts = _gather_facts(uid, doc_id, intents)
+    reply = generate_answer(q_text, facts, language=intents.get("language", "ru"))
+    await _send(m, reply)
+
+
+# ------------------------------ эмбеддинг-профиль ------------------------------
+
+def _current_embedding_profile() -> str:
+    dim = probe_embedding_dim(None)
+    if dim:
+        return f"emb={Cfg.POLZA_EMB}|dim={dim}"
+    return f"emb={Cfg.POLZA_EMB}"
+
+def _needs_reindex_by_embeddings(con, doc_id: int) -> bool:
+    if not _table_has_columns(con, "documents", ["layout_profile"]):
+        return True
+    cur = con.cursor()
+    cur.execute("SELECT layout_profile FROM documents WHERE id=?", (doc_id,))
+    row = cur.fetchone()
+    stored = (row["layout_profile"] or "") if row else ""
+    if not stored:
+        return True
+    cur_model = Cfg.POLZA_EMB.strip().lower()
+    stored_model = ""
+    stored_dim = None
+    for part in stored.split("|"):
+        part = (part or "").strip().lower()
+        if part.startswith("emb="):
+            stored_model = part[4:]
+        if part.startswith("dim="):
+            try:
+                stored_dim = int(part[4:])
+            except Exception:
+                stored_dim = None
+    if stored_model and stored_model != cur_model:
+        return True
+    cur_dim = probe_embedding_dim(None)
+    if cur_dim and stored_dim and stored_dim != cur_dim:
+        return True
+    return False
+
+
 # ------------------------------ обычный текст ------------------------------
 
 @dp.message(F.text & ~F.via_bot & ~F.text.startswith("/"))
 async def qa(m: types.Message):
     uid = ensure_user(str(m.from_user.id))
     doc_id = ACTIVE_DOC.get(uid)
+
+    # НОВОЕ: если в памяти нет — поднимем из БД (устойчивость к рестартам процесса)
+    if not doc_id:
+        persisted = get_user_active_doc(uid)
+        if persisted:
+            ACTIVE_DOC[uid] = persisted
+            doc_id = persisted
+
     text = (m.text or "").strip()
 
+    # Строгий режим: без активного документа не отвечаем по содержанию
     if not doc_id:
-        # Мягкая подсказка, но не блокируем ответ
-        hint = topical_check(text)
-        if hint:
-            await _send(m, hint)
-        reply = agent_no_context(text)
-        await _send(m, reply)
+        await _send(m, "Сначала пришлите файл (.doc/.docx/.pdf). Без него я не отвечаю по содержанию.")
         return
 
     await respond_with_answer(m, uid, doc_id, text)

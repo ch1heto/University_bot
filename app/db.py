@@ -11,8 +11,9 @@ CURRENT_INDEXER_VERSION = 4
 # Базовые таблицы (минимальный набор столбцов, совместимый со старыми БД)
 _BASE_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS users (
-    id     INTEGER PRIMARY KEY AUTOINCREMENT,
-    tg_id  TEXT NOT NULL UNIQUE
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    tg_id           TEXT NOT NULL UNIQUE,
+    active_doc_id   INTEGER            -- nullable, «активный документ» пользователя
 );
 
 CREATE TABLE IF NOT EXISTS documents (
@@ -55,6 +56,11 @@ def _ensure_columns(con: sqlite3.Connection) -> None:
     """Добавляем недостающие колонки (безопасно для старых БД)."""
     cur = con.cursor()
 
+    # users: active_doc_id
+    ucols = _table_info(con, "users")
+    if "active_doc_id" not in ucols:
+        cur.execute("ALTER TABLE users ADD COLUMN active_doc_id INTEGER")
+
     # documents: content_sha256, file_uid, indexer_version, layout_profile
     dcols = _table_info(con, "documents")
     if "content_sha256" not in dcols:
@@ -82,11 +88,8 @@ def _ensure_indexes(con: sqlite3.Connection) -> None:
 
     # Общие индексы
     cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uix_users_tg_id ON users(tg_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_users_active_doc ON users(active_doc_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_documents_owner ON documents(owner_id)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_doc_owner ON chunks(doc_id, owner_id)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_owner ON chunks(owner_id)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_doc_owner_page ON chunks(doc_id, owner_id, page)")
-
     # Индексы по новым колонкам (если они появились)
     dcols = _table_info(con, "documents")
     # ⚠️ НЕ делаем их UNIQUE, чтобы миграции не падали при существующих дубликатах.
@@ -107,6 +110,17 @@ def _ensure_indexes(con: sqlite3.Connection) -> None:
         )
 
     ccols = _table_info(con, "chunks")
+    # Часто фильтруем по owner_id, doc_id
+    if {"owner_id", "doc_id"}.issubset(ccols):
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chunks_owner_doc "
+            "ON chunks(owner_id, doc_id)"
+        )
+    if {"owner_id", "doc_id", "section_path"}.issubset(ccols):
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chunks_owner_doc_section "
+            "ON chunks(owner_id, doc_id, section_path)"
+        )
     if "element_type" in ccols:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_type ON chunks(element_type)")
         # Частые фильтры вида owner_id=?, doc_id=?, element_type='reference'|'figure'|'table'
@@ -380,3 +394,23 @@ def fts_rebuild() -> None:
     except Exception:
         # Если FTS нет — просто тихо выходим
         pass
+
+# ----------------------------- public API: user state -----------------------------
+
+def set_user_active_doc(user_id: int, doc_id: Optional[int]) -> None:
+    """Сохраняем ID «активного» документа для пользователя (NULL, чтобы очистить)."""
+    con = get_conn()
+    cur = con.cursor()
+    cur.execute("UPDATE users SET active_doc_id=? WHERE id=?", (doc_id, user_id))
+    con.commit()
+    con.close()
+
+def get_user_active_doc(user_id: int) -> Optional[int]:
+    """Возвращаем ID активного документа пользователя (или None)."""
+    con = get_conn()
+    cur = con.cursor()
+    cur.execute("SELECT active_doc_id FROM users WHERE id=?", (user_id,))
+    row = cur.fetchone()
+    con.close()
+    val = row["active_doc_id"] if row else None
+    return (int(val) if val is not None else None)

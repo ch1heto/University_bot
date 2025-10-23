@@ -16,7 +16,7 @@ from aiogram.filters import Command
 try:
     # aiogram 3.x base middleware
     from aiogram import BaseMiddleware
-except Exception:  # совместимость на всякий случай
+except Exception:  # совместимость на всякий случай (aiogram 2.x)
     from aiogram.dispatcher.middlewares.base import BaseMiddleware  # type: ignore
 from aiogram import Router
 
@@ -29,6 +29,7 @@ try:
 except Exception:
     pass
 
+
 def _env_int(key: str, default: int) -> int:
     """Безопасно читаем int из .env (обрезаем пробелы и кавычки)."""
     raw = os.getenv(key, str(default))
@@ -40,11 +41,13 @@ def _env_int(key: str, default: int) -> int:
     except Exception:
         return default
 
+
 def _env_str(key: str, default: str) -> str:
     raw = os.getenv(key, default)
     if raw is None:
         return default
     return raw.strip().strip("'\"")
+
 
 FREE_MESSAGES = _env_int("PAYWALL_FREE_MESSAGES", 10)
 SUB_DAYS = _env_int("PAYWALL_SUB_DAYS", 30)
@@ -61,8 +64,7 @@ PAY_LINK_TEMPLATE = _env_str(
 def _parse_admin_ids(env_val: Optional[str]) -> set[int]:
     ids: set[int] = set()
     if not env_val:
-        # бэкап: одиночная переменная PAYWALL_ADMIN_ID
-        env_val = os.getenv("PAYWALL_ADMIN_ID", "")
+        env_val = os.getenv("PAYWALL_ADMIN_ID", "")  # бэкап: одиночная переменная
     env_val = (env_val or "").replace(";", ",")
     for part in env_val.split(","):
         part = part.strip().strip("'\"")
@@ -74,7 +76,11 @@ def _parse_admin_ids(env_val: Optional[str]) -> set[int]:
             pass
     return ids
 
+
 ADMIN_IDS = _parse_admin_ids(os.getenv("PAYWALL_ADMIN_IDS"))
+
+# Разрешить полностью отключить стену оплат (напр. на dev)
+PAYWALL_DISABLED = _env_str("PAYWALL_DISABLED", "0").lower() in {"1", "true", "yes", "y", "on"}
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Хранилище (отдельный SQLite, чтобы не трогать вашу БД)
@@ -104,19 +110,28 @@ CREATE INDEX IF NOT EXISTS idx_invoices_user ON invoices(user_id);
 def _utc_now_ts() -> int:
     return int(time.time())
 
+
 @contextmanager
 def _db() -> Iterable[sqlite3.Connection]:
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
     con.row_factory = sqlite3.Row
+    # немного тюнинга SQLite
+    try:
+        con.execute("PRAGMA journal_mode=WAL;")
+        con.execute("PRAGMA synchronous=NORMAL;")
+    except Exception:
+        pass
     try:
         yield con
         con.commit()
     finally:
         con.close()
 
+
 def _init_db() -> None:
     with _db() as con:
         con.executescript(SCHEMA_SQL)
+
 
 def _ensure_user(user_id: int) -> None:
     with _db() as con:
@@ -124,6 +139,7 @@ def _ensure_user(user_id: int) -> None:
             "INSERT OR IGNORE INTO users(user_id, free_used, sub_until_ts, updated_ts) VALUES(?,?,?,?)",
             (user_id, 0, None, _utc_now_ts()),
         )
+
 
 def _get_user_state(user_id: int) -> Tuple[int, Optional[int]]:
     with _db() as con:
@@ -133,7 +149,9 @@ def _get_user_state(user_id: int) -> Tuple[int, Optional[int]]:
         ).fetchone()
         if not row:
             return (0, None)
-        return (int(row["free_used"] or 0), (int(row["sub_until_ts"]) if row["sub_until_ts"] is not None else None))
+        return (int(row["free_used"] or 0),
+                (int(row["sub_until_ts"]) if row["sub_until_ts"] is not None else None))
+
 
 def _set_free_used(user_id: int, value: int) -> None:
     with _db() as con:
@@ -141,6 +159,7 @@ def _set_free_used(user_id: int, value: int) -> None:
             "UPDATE users SET free_used=?, updated_ts=? WHERE user_id=?",
             (value, _utc_now_ts(), user_id),
         )
+
 
 def _inc_free_used(user_id: int) -> int:
     with _db() as con:
@@ -151,6 +170,7 @@ def _inc_free_used(user_id: int) -> int:
         row = con.execute("SELECT free_used FROM users WHERE user_id=?", (user_id,)).fetchone()
         return int(row["free_used"] or 0)
 
+
 def _set_sub_until(user_id: int, until_ts: int) -> None:
     with _db() as con:
         con.execute(
@@ -158,14 +178,38 @@ def _set_sub_until(user_id: int, until_ts: int) -> None:
             (until_ts, _utc_now_ts(), user_id),
         )
 
+
 def _create_invoice(user_id: int, amount: int, currency: str) -> str:
-    invoice_id = uuid.uuid4().hex[:12]
+    # страховка от крайне маловероятной коллизии PK
+    for _ in range(3):
+        invoice_id = uuid.uuid4().hex[:12]
+        try:
+            with _db() as con:
+                con.execute(
+                    "INSERT INTO invoices(invoice_id, user_id, amount, currency, status, created_ts) VALUES(?,?,?,?,?,?)",
+                    (invoice_id, user_id, amount, currency, "pending", _utc_now_ts()),
+                )
+            return invoice_id
+        except sqlite3.IntegrityError:
+            continue
+    # если уж совсем невезёт — добавим время в секундах
+    invoice_id = f"{uuid.uuid4().hex[:10]}{int(time.time())%100}"
     with _db() as con:
         con.execute(
             "INSERT INTO invoices(invoice_id, user_id, amount, currency, status, created_ts) VALUES(?,?,?,?,?,?)",
             (invoice_id, user_id, amount, currency, "pending", _utc_now_ts()),
         )
     return invoice_id
+
+
+def _get_invoice_user(invoice_id: str) -> Optional[int]:
+    with _db() as con:
+        row = con.execute(
+            "SELECT user_id FROM invoices WHERE invoice_id=?",
+            (invoice_id,),
+        ).fetchone()
+        return (int(row["user_id"]) if row else None)
+
 
 def _mark_invoice_succeeded(invoice_id: str) -> Optional[int]:
     with _db() as con:
@@ -181,17 +225,21 @@ def _mark_invoice_succeeded(invoice_id: str) -> Optional[int]:
         )
         return int(row["user_id"])
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Бизнес-правила
 # ──────────────────────────────────────────────────────────────────────────────
 def _is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
+
 def _is_sub_active(user_id: int) -> bool:
     _, until_ts = _get_user_state(user_id)
     if until_ts is None:
         return False
-    return until_ts > _utc_now_ts()
+    # «активна до» — включительно до указанной секунды
+    return until_ts >= _utc_now_ts()
+
 
 def _subscription_until_str(ts: Optional[int]) -> str:
     if not ts:
@@ -199,11 +247,17 @@ def _subscription_until_str(ts: Optional[int]) -> str:
     dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone()
     return dt.strftime("%d.%m.%Y %H:%M")
 
+
 def _activate_subscription(user_id: int, days: int) -> int:
-    until = _utc_now_ts() + int(days) * 24 * 3600
+    now = _utc_now_ts()
+    # если уже есть подписка — продлим от текущего конца, а не от «сейчас»
+    _, until_ts = _get_user_state(user_id)
+    base = max(now, int(until_ts or 0))
+    until = base + int(days) * 24 * 3600
     _set_sub_until(user_id, until)
     _set_free_used(user_id, 0)
     return until
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Инлайн-кнопки (заглушка оплаты)
@@ -216,6 +270,7 @@ def _pay_keyboard(invoice_id: str, user_id: int) -> types.InlineKeyboardMarkup:
     ]
     return types.InlineKeyboardMarkup(inline_keyboard=kb)
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Middleware: отслеживание лимита и показ pay-кнопки
 # ──────────────────────────────────────────────────────────────────────────────
@@ -226,6 +281,7 @@ class PaywallConfig:
     amount: int = AMOUNT
     currency: str = CURRENCY
 
+
 class PaywallMiddleware(BaseMiddleware):
     def __init__(self, bot: Bot, cfg: PaywallConfig):
         super().__init__()
@@ -233,21 +289,25 @@ class PaywallMiddleware(BaseMiddleware):
         self.cfg = cfg
 
     async def __call__(self, handler, event: types.Message, data):
+        # Если отключено переменной окружения — полностью пропускаем
+        if PAYWALL_DISABLED:
+            return await handler(event, data)
+
         # применяем только к сообщениям
         if not isinstance(event, types.Message):
             return await handler(event, data)
 
-        user_id = event.from_user.id if event.from_user else None
-        if not user_id:
+        if not event.from_user:
             return await handler(event, data)
 
+        user_id = event.from_user.id
         _ensure_user(user_id)
 
         # админы не лимитируются
         if _is_admin(user_id):
             return await handler(event, data)
 
-        # команды не учитываем и не блокируем
+        # команды пропускаем и не считаем
         text = (event.text or "").strip()
         if text.startswith("/"):
             return await handler(event, data)
@@ -256,7 +316,7 @@ class PaywallMiddleware(BaseMiddleware):
         if _is_sub_active(user_id):
             return await handler(event, data)
 
-        # проверяем лимит ДО инкремента: на 11-м блокируем
+        # проверяем лимит ДО инкремента: на N+1 блокируем
         used, _ = _get_user_state(user_id)
         if used >= self.cfg.free_messages:
             # показываем клавиатуру оплаты (создадим "инвойс" заглушки)
@@ -273,10 +333,12 @@ class PaywallMiddleware(BaseMiddleware):
         _inc_free_used(user_id)
         return await handler(event, data)
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Хэндлеры команд и колбэков
 # ──────────────────────────────────────────────────────────────────────────────
 router = Router(name="paywall")
+
 
 @router.message(Command("status"))
 async def cmd_status(m: types.Message):
@@ -293,6 +355,7 @@ async def cmd_status(m: types.Message):
         f"• Бесплатных сообщений осталось: {remaining}/{FREE_MESSAGES}"
     )
 
+
 @router.message(Command("buy"))
 async def cmd_buy(m: types.Message):
     user_id = m.from_user.id
@@ -304,6 +367,7 @@ async def cmd_buy(m: types.Message):
         "Нажмите кнопку ниже для перехода к оплате.",
         reply_markup=kb
     )
+
 
 @router.message(Command("reset_trial"))
 async def cmd_reset_trial(m: types.Message):
@@ -324,24 +388,45 @@ async def cmd_reset_trial(m: types.Message):
     _set_free_used(target_id, 0)
     await m.answer(f"Счётчик бесплатных сообщений для user_id={target_id} сброшен.")
 
-@router.message(Command("admin"))
-async def cmd_admin(m: types.Message):
-    """Панель администратора (только для ADMIN_IDS)."""
-    if not _is_admin(m.from_user.id):
+
+@router.message(Command("grant"))
+async def cmd_grant(m: types.Message):
+    """/grant <user_id> <days> — продлить/выдать подписку (только админы)."""
+    user_id = m.from_user.id
+    if not _is_admin(user_id):
         await m.answer("Эта команда доступна только администраторам.")
         return
+    parts = (m.text or "").split()
+    if len(parts) < 3:
+        await m.answer("Использование: /grant <user_id> <days>")
+        return
+    try:
+        target_id = int(parts[1])
+        days = int(parts[2])
+    except Exception:
+        await m.answer("Неверные аргументы. Пример: /grant 123456789 30")
+        return
+    _ensure_user(target_id)
+    until_ts = _activate_subscription(target_id, days)
     await m.answer(
-        "🛠 Админ-панель\n"
-        "Команды:\n"
-        "• /reset_trial <user_id> — сбросить счётчик пробных сообщений пользователю.\n"
-        "• /status — посмотреть свой статус.\n"
-        "• /buy — создать инвойс (демо) и кнопку оплаты для себя."
+        f"Готово. Подписка user_id={target_id} продлена/выдана до { _subscription_until_str(until_ts) }."
     )
+
 
 @router.callback_query(F.data.startswith("pay:confirm:"))
 async def cb_confirm_paid(cb: types.CallbackQuery):
     data = cb.data or ""
     invoice_id = data.split("pay:confirm:", 1)[-1].strip()
+    inv_user = _get_invoice_user(invoice_id)
+    if not inv_user:
+        await cb.answer("Инвойс не найден", show_alert=True)
+        return
+
+    # (не обязательно, но корректно) разрешим подтверждать только владельцу инвойса
+    if cb.from_user and cb.from_user.id != inv_user and not _is_admin(cb.from_user.id):
+        await cb.answer("Этот счёт принадлежит другому пользователю.", show_alert=True)
+        return
+
     user_id_from_invoice = _mark_invoice_succeeded(invoice_id)
     if not user_id_from_invoice:
         await cb.answer("Инвойс не найден", show_alert=True)
@@ -359,10 +444,15 @@ async def cb_confirm_paid(cb: types.CallbackQuery):
         f"• Подписка активна до: {until_human}\n"
     )
 
-    await cb.message.edit_reply_markup(reply_markup=None)
-    await cb.message.answer("✅ Оплата подтверждена. Подписка активирована!")
-    await cb.message.answer(receipt)
+    if cb.message:
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await cb.message.answer("✅ Оплата подтверждена. Подписка активирована!")
+        await cb.message.answer(receipt)
     await cb.answer("Готово", show_alert=False)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Публичная точка подключения
@@ -374,7 +464,7 @@ def setup_paywall(dp: Dispatcher, bot: Bot) -> None:
     """
     _init_db()
 
-    # Middleware — ставим на обработку всех апдейтов (так безопаснее для разных версий aiogram)
+    # Middleware — ставим на обновления (для v3 это корректно; остальные события просто проходят)
     dp.update.middleware(PaywallMiddleware(bot, PaywallConfig()))
 
     # Роутер с командами/колбэками
