@@ -7,7 +7,8 @@ import json
 import logging
 import mimetypes
 import os
-from typing import List, Dict, Any, Optional, Union, Tuple
+import re
+from typing import List, Dict, Any, Optional, Union, Tuple, Iterable
 
 from openai import OpenAI
 
@@ -18,13 +19,14 @@ from .config import Cfg  # ключи/модели/базовый URL
 # Клиент Polza (OpenAI-совместимый)
 # -----------------------------
 _client = OpenAI(
-    base_url=Cfg.BASE_POLZA,   # напр.: "https://api.polza.ai/api/v1"
+    base_url=(Cfg.BASE_POLZA or "").rstrip("/"),
     api_key=Cfg.POLZA_KEY,
 )
 
 __all__ = [
     "embeddings",
     "chat_with_gpt",
+    "chat_with_gpt_stream",
     "probe_embedding_dim",
     "vision_describe",
     "vision_describe_many",
@@ -35,9 +37,74 @@ __all__ = [
 # Внутренние хелперы
 # -----------------------------
 
+# Удаляем управляющие символы, которые могут поломать JSON в SSE потоках (кроме \t, \r, \n)
+_CTRL_BAD = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
+
+def _sanitize_text_for_json(s: str) -> str:
+    """
+    Убираем символы управления + U+2028/U+2029 (line/para sep), которые иногда не экранируются.
+    """
+    t = (s or "")
+    t = _CTRL_BAD.sub(" ", t)
+    t = t.replace("\u2028", " ").replace("\u2029", " ")
+    return t
+
+
+def _sanitize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Санитизируем текстовые фрагменты сообщений:
+    - message['content'] если это str;
+    - content-парт {"type":"text","text":...} если контент — массив частей.
+    Остальные части (image_url и т.п.) не трогаем.
+    """
+    out: List[Dict[str, Any]] = []
+    for m in (messages or []):
+        mm = dict(m)
+        c = mm.get("content")
+        if isinstance(c, str):
+            mm["content"] = _sanitize_text_for_json(c)
+        elif isinstance(c, list):
+            parts: List[Any] = []
+            for p in c:
+                if isinstance(p, dict) and p.get("type") == "text":
+                    q = dict(p)
+                    q["text"] = _sanitize_text_for_json(str(q.get("text", "")))
+                    parts.append(q)
+                else:
+                    parts.append(p)
+            mm["content"] = parts
+        out.append(mm)
+    return out
+
+
+def _chunk_text(s: str, maxlen: int = 480) -> Iterable[str]:
+    """
+    Аккуратно режем длинный текст для отправки частями.
+    """
+    s = s or ""
+    if not s:
+        return []
+    i, n = 0, len(s)
+
+    def _cut_point(seg: str, limit: int) -> int:
+        if len(seg) <= limit:
+            return len(seg)
+        for token in ("\n", ". ", " "):
+            pos = seg.rfind(token, 0, limit)
+            if pos != -1:
+                return pos + (0 if token == "\n" else len(token))
+        return limit
+
+    while i < n:
+        cut = _cut_point(s[i:], maxlen)
+        yield s[i:i + cut]
+        i += cut
+
+
 def _file_bytes(path: str) -> bytes:
     with open(path, "rb") as f:
         return f.read()
+
 
 def _detect_mime(path: str, data: Optional[bytes] = None) -> str:
     # 1) по расширению
@@ -56,11 +123,13 @@ def _detect_mime(path: str, data: Optional[bytes] = None) -> str:
         return "image/tiff"
     return "application/octet-stream"
 
+
 def _to_data_url(path: str) -> str:
     raw = _file_bytes(path)
     mime = _detect_mime(path, raw)
     b64 = base64.b64encode(raw).decode("ascii")
     return f"data:{mime};base64,{b64}"
+
 
 def _sha256_file(path: str) -> str:
     h = hashlib.sha256()
@@ -69,14 +138,12 @@ def _sha256_file(path: str) -> str:
             h.update(chunk)
     return h.hexdigest()
 
+
 def _sanitize_description(s: str) -> str:
     """
-    Приводим ответ под вставку в «… изображено ___». Убираем служебные фразы,
-    сжимаем пробелы, оставляем одно предложение.
+    Приводим ответ под вставку в «… изображено ___». Убираем вводные, сжимаем до 1 предложения.
     """
     t = (s or "").strip()
-
-    # убираем дежурные вводные
     repl = {
         "На рисунке показано": "",
         "На рисунке изображено": "",
@@ -87,21 +154,14 @@ def _sanitize_description(s: str) -> str:
     }
     for k, v in repl.items():
         t = t.replace(k, v)
-
-    # ещё одна частая конструкция
     t = t.replace("Визуализируется", "изображена")
-
-    # одна строка
     t = " ".join(t.split())
-
-    # обрежем до первой точки, если модель разошлась
     if "." in t:
         t = t.split(".")[0] + "."
-
     return t if t else "содержимое изображения (описание не распознано)."
 
 
-# Простенький in-memory кэш (на процесс): (sha256, lang, model) -> {"description": ..., "tags": [...]}
+# Простенький in-memory кэш (на процесс)
 _VISION_CACHE: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
 
 
@@ -110,20 +170,16 @@ _VISION_CACHE: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
 # -----------------------------
 
 def embeddings(texts: List[str]) -> List[List[float]]:
-    """
-    Получить эмбеддинги для списка текстов.
-    Возвращает список векторов float[]. Пустой ввод -> пустой список.
-    """
     if not texts:
         return []
     try:
         resp = _client.embeddings.create(
-            model=Cfg.POLZA_EMB,   # напр.: "openai/text-embedding-3-large"
+            model=Cfg.POLZA_EMB,
             input=texts,
         )
         return [item.embedding for item in resp.data]
     except Exception as e:
-        logging.exception(f"Ошибка при получении эмбеддингов: {e}")
+        logging.exception("Ошибка при получении эмбеддингов: %s", e)
         raise
 
 
@@ -133,37 +189,95 @@ def chat_with_gpt(
     max_tokens: int = 800,
 ) -> str:
     """
-    Отправить диалог в чат-модель и вернуть текстовый ответ.
-    Совместимо с Polza (OpenAI Chat Completions API).
+    Нестримовый чат-вызов (с санацией сообщений).
     """
     try:
+        smsg = _sanitize_messages(messages)
         cmpl = _client.chat.completions.create(
-            model=Cfg.POLZA_CHAT,  # напр.: "openai/gpt-4o"
-            messages=messages,
+            model=Cfg.POLZA_CHAT,
+            messages=smsg,
             temperature=temperature,
             max_tokens=max_tokens,
         )
         content = cmpl.choices[0].message.content or ""
         return (content or "").strip()
     except Exception as e:
-        logging.error(f"Ошибка при запросе к чат-модели: {e}")
+        logging.error("Ошибка при запросе к чат-модели: %s", e)
         return "Произошла ошибка при обработке запроса. Попробуйте позже."
 
 
+def chat_with_gpt_stream(
+    messages: List[Dict[str, Any]],
+    temperature: float = 0.2,
+    max_tokens: int = 800,
+) -> Iterable[str]:
+    """
+    Стриминговая версия chat-комплишна (с санацией входа и устойчивым фолбэком).
+    Если стрим ломается ДО первой дельты — автоматически переключаемся на нестрим и
+    отдаём ответ кусками. Если ПОСЛЕ — просто завершаем поток без исключения.
+    """
+    def _gen():
+        stream = None
+        yielded_any = False
+        try:
+            smsg = _sanitize_messages(messages)
+            stream = _client.chat.completions.create(
+                model=Cfg.POLZA_CHAT,
+                messages=smsg,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=True,
+            )
+            # OpenAI SDK v1: по чанкам; контент в choices[0].delta.content
+            for chunk in stream:
+                try:
+                    choice = (chunk.choices or [None])[0]
+                    if not choice:
+                        continue
+                    delta = getattr(choice, "delta", None)
+                    if not delta:
+                        continue
+                    text = getattr(delta, "content", None) or ""
+                    if text:
+                        yielded_any = True
+                        yield text
+                except Exception as inner_e:
+                    # Спорный/неполный chunk — пропускаем
+                    logging.debug("stream chunk parse warning: %s", inner_e)
+                    continue
+        except Exception as e:
+            # Самая частая причина по логам: JSONDecodeError в openai._streaming.sse.json()
+            logging.error("chat_with_gpt_stream: stream aborted: %s", e)
+            if not yielded_any:
+                # Мягкий фолбэк: единый ответ → режем на части
+                try:
+                    answer = chat_with_gpt(messages, temperature=temperature, max_tokens=max_tokens)
+                    for part in _chunk_text(answer, 480):
+                        yield part
+                except Exception as e2:
+                    logging.exception("chat_with_gpt_stream fallback failed: %s", e2)
+        finally:
+            try:
+                if stream and hasattr(stream, "close"):
+                    stream.close()
+            except Exception:
+                pass
+
+    return _gen()
+
+
 def probe_embedding_dim(default: int | None = None) -> int | None:
-    """
-    Вспомогательно: вернуть размерность текущей эмбеддинг-модели.
-    Полезно, чтобы сверять с сохранённой размерностью в индексе.
-    """
     try:
-        vec = embeddings(["__probe__"])[0]
-        return len(vec)
+        vecs = embeddings(["__probe__"])
+        if not vecs:
+            return default
+        return len(vecs[0])
     except Exception:
         return default
 
 
 # -----------------------------
-# Vision: описание изображений через GPT-4o
+# Vision
 # -----------------------------
 
 def _vision_messages(
@@ -175,9 +289,8 @@ def _vision_messages(
     want_tags: bool
 ) -> str:
     """
-    Вспомогательный вызов chat.completions с fallback:
-    1) пробуем с response_format=json_object (если want_tags=True);
-    2) при ошибке повторяем без response_format.
+    Вызов chat.completions с контентом-массивом (image_url + текст).
+    Если want_tags=True — просим JSON (response_format=json_object); при ошибке — повторяем без него.
     """
     sys = system_hint or (
         "Ты помощник по дипломам. Дай краткое, деловое описание картинки, "
@@ -186,35 +299,38 @@ def _vision_messages(
         "затем 1–3 ключевые детали. Лаконично."
     )
 
-    # Первая попытка — с response_format (если нужно строго JSON)
+    # Готовим санитизированный контент (как массив частей)
+    sanitized = _sanitize_messages([{"role": "user", "content": content_parts}])[0]["content"]
+
     try:
-        cmpl = _client.chat.completions.create(
+        kwargs: Dict[str, Any] = dict(
             model=Cfg.POLZA_CHAT,
             messages=[
                 {"role": "system", "content": sys},
-                {"role": "user", "content": content_parts},
+                {"role": "user", "content": sanitized},
             ],
             temperature=temperature,
             max_tokens=max_tokens,
-            response_format={"type": "json_object"} if want_tags else None,
         )
+        if want_tags:
+            kwargs["response_format"] = {"type": "json_object"}
+        cmpl = _client.chat.completions.create(**kwargs)
         return (cmpl.choices[0].message.content or "").strip()
     except Exception as e:
-        # Лояльный фолбэк — без response_format
-        logging.warning(f"vision JSON response_format failed, retrying without it: {e}")
+        logging.warning("vision JSON response_format failed, retrying without it: %s", e)
         try:
             cmpl = _client.chat.completions.create(
                 model=Cfg.POLZA_CHAT,
                 messages=[
                     {"role": "system", "content": sys},
-                    {"role": "user", "content": content_parts},
+                    {"role": "user", "content": sanitized},
                 ],
                 temperature=temperature,
                 max_tokens=max_tokens,
             )
             return (cmpl.choices[0].message.content or "").strip()
         except Exception as e2:
-            logging.exception(f"vision_describe: обе попытки не удались: {e2}")
+            logging.exception("vision_describe: обе попытки не удались: %s", e2)
             return ""
 
 
@@ -229,28 +345,20 @@ def vision_describe(
 ) -> Dict[str, Any]:
     """
     Описывает изображение(я) «для подписи»: возвращает JSON {description, tags}.
-
-    • image_or_images — путь к файлу или список путей.
-    • lang — язык ответа ("ru"|"en"|"kk"), по умолчанию русский.
-    • want_tags — если True, попросим компактные теги (тип изображения/объекты).
-    • Возвращает: {"description": "...", "tags": ["...","..."]}
-
-    Реализация: Chat Completions с контентом вида:
-    [{"type":"text","text":...}, {"type":"image_url","image_url":{"url":"data:...base64"}}]
     """
     paths: List[str] = [image_or_images] if isinstance(image_or_images, str) else list(image_or_images or [])
     paths = [p for p in paths if p and os.path.exists(p)]
     if not paths:
         return {"description": "изображение отсутствует или не доступно.", "tags": []}
 
-    # кэш: все пути -> сводим в один ключ
+    # Кэш: все пути -> сводим в один ключ
     shas = [_sha256_file(p) for p in paths]
     multi_key = hashlib.sha256(("|".join(shas)).encode("utf-8")).hexdigest()
     cache_key = (multi_key, (lang or "ru").lower(), Cfg.POLZA_CHAT or "openai/gpt-4o")
     if cache_key in _VISION_CACHE:
         return _VISION_CACHE[cache_key]
 
-    # языковая подсказка
+    # Языковая подсказка
     lang_hint = {
         "ru": "Отвечай на русском.",
         "en": "Answer in English.",
@@ -272,7 +380,7 @@ def vision_describe(
         ),
     }.get((lang or "ru").lower(), "Верни JSON с полями 'description' и 'tags'.")
 
-    # контент: текст + 1..N изображений (data URL)
+    # Контент: текст + 1..N изображений (data URL)
     content_parts: List[Dict[str, Any]] = [{"type": "text", "text": f"{lang_hint} {instruction}"}]
     for p in paths:
         content_parts.append({"type": "image_url", "image_url": {"url": _to_data_url(p)}})
@@ -285,7 +393,7 @@ def vision_describe(
         want_tags=want_tags,
     )
 
-    # стараемся распарсить JSON; если не получилось — используем как есть
+    # Стараемся распарсить JSON; если не получилось — используем как есть
     desc: str = ""
     tags: List[str] = []
     if raw:
@@ -308,14 +416,11 @@ def vision_describe_many(
     images: List[str],
     lang: str = "ru",
     *,
-    per_image_limit: int = 4,  # параметр сохранён для обратной совместимости, сейчас не батчим
+    per_image_limit: int = 4,  # параметр сохранён для обратной совместимости
 ) -> List[Dict[str, Any]]:
     """
-    Возвращает **one-in → one-out**: на каждый путь — один словарь результата.
-    Внутри использует кэш по SHA256, так что повторяющиеся изображения не перегружают модель.
-
-    ПРИМЕЧАНИЕ: Раньше функция могла возвращать один результат на целый батч.
-    Теперь гарантируется длина результата == длине входного списка.
+    One-in → one-out: на каждый путь — один словарь результата.
+    Повторяющиеся изображения кешируются по SHA256.
     """
     out: List[Dict[str, Any]] = []
     for p in images or []:
@@ -325,6 +430,6 @@ def vision_describe_many(
         try:
             out.append(vision_describe(p, lang=lang))
         except Exception as e:
-            logging.exception(f"vision_describe_many: ошибка на файле {p}: {e}")
+            logging.exception("vision_describe_many: ошибка на файле %s: %s", p, e)
             out.append({"description": "описание недоступно из-за ошибки обработки.", "tags": []})
     return out

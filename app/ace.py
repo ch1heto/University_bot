@@ -1,10 +1,61 @@
+# app/ace.py
 from __future__ import annotations
 
 import re
 import json
-from typing import Dict, Any
+import asyncio
+from typing import Dict, Any, AsyncIterable, Iterable, List, Optional
 
-from .polza_client import chat_with_gpt  # Чат-модель (Polza/OpenAI-совместимая)
+from .polza_client import chat_with_gpt  # базовый нестримовый вызов (Polza/OpenAI-совместимый)
+from .config import Cfg
+
+# Стримовый вызов — опционален (может отсутствовать в сборке)
+try:
+    from .polza_client import chat_with_gpt_stream  # type: ignore
+except Exception:
+    chat_with_gpt_stream = None  # type: ignore
+
+
+__all__ = [
+    "ace_once", "ace_stream",
+    "agent_no_context",
+    "ace_fullread_once", "ace_fullread_stream",
+    "expand_text", "explain_answer", "draft_answer",
+    "critique_json", "edit_answer",
+    "expand_text_stream", "explain_answer_stream", "edit_answer_stream",
+    # новое — публичный доступ к шагам декомпозиции
+    "plan_subtasks", "answer_subpoint", "merge_subanswers",
+    # back-compat алиасы
+    "_plan_subtasks", "_answer_subpoint", "_merge_subanswers",
+]
+
+
+# -------------------- БЮДЖЕТЫ ТОКЕНОВ (читаются из Cfg, есть дефолты) --------------------
+
+ANSWER_MAX_TOKENS: int = getattr(Cfg, "ANSWER_MAX_TOKENS", 1200)
+EDITOR_MAX_TOKENS: int = getattr(Cfg, "EDITOR_MAX_TOKENS", 1400)
+CRITIC_MAX_TOKENS: int = getattr(Cfg, "CRITIC_MAX_TOKENS", 450)
+EXPLAIN_MAX_TOKENS: int = getattr(Cfg, "EXPLAIN_MAX_TOKENS", 1200)
+EXPAND_MAX_TOKENS: int = getattr(Cfg, "EXPAND_MAX_TOKENS", 1200)
+
+PLANNER_MAX_TOKENS: int = getattr(Cfg, "PLANNER_MAX_TOKENS", 400)
+PART_MAX_TOKENS: int = getattr(Cfg, "PART_MAX_TOKENS", 600)
+MERGE_MAX_TOKENS: int = getattr(Cfg, "MERGE_MAX_TOKENS", 1600)
+
+# fullread/map-reduce (часть уже есть в Cfg; добавим дефолты для надёжности)
+FULLREAD_MAX_SECTIONS = getattr(Cfg, "FULLREAD_MAX_SECTIONS", 60)
+FULLREAD_MAP_TOKENS = getattr(Cfg, "FULLREAD_MAP_TOKENS", 240)
+FULLREAD_REDUCE_TOKENS = getattr(Cfg, "FULLREAD_REDUCE_TOKENS", 900)
+FINAL_MAX_TOKENS: int = getattr(Cfg, "FINAL_MAX_TOKENS", 1600)
+
+# многошаговый порог качества (используется и в bot.py)
+MULTI_PASS_SCORE: int = getattr(Cfg, "MULTI_PASS_SCORE", 85)
+
+# планировщик
+MULTI_PLAN_ENABLED = getattr(Cfg, "MULTI_PLAN_ENABLED", True)
+MULTI_MIN_ITEMS = getattr(Cfg, "MULTI_MIN_ITEMS", 2)
+MULTI_MAX_ITEMS = getattr(Cfg, "MULTI_MAX_ITEMS", 12)
+
 
 # -------------------- СИСТЕМНЫЕ ПОДСКАЗКИ --------------------
 
@@ -76,7 +127,7 @@ SYS_EXPAND = (
     "Стилистика: академическая, нейтральная; 2–5 абзацев. Выведи только переработанный текст."
 )
 
-# «Объясни по-человечески» — тёплое развёрнутое объяснение
+# «Объясни по-человечески»
 SYS_EXPLAIN = (
     "Ты дружелюбный, но точный научный коммуникатор. Объясни содержание и смысл работы на основе КОНТЕКСТА. "
     "Можно давать интерпретации и упрощать формулировки, но НЕ выдумывай фактов и данных, не присутствующих в контексте. "
@@ -88,10 +139,54 @@ SYS_EXPLAIN = (
     "Тон: ясный, человеческий, без лишней канцелярщины."
 )
 
+# FULLREAD: системные подсказки
+SYS_FULLREAD = (
+    "Ты репетитор по дипломным работам. Тебе дан ПОЛНЫЙ текст ВКР/документа. "
+    "Отвечай строго по этому тексту, без внешних фактов. Если данных недостаточно — скажи, чего не хватает. "
+    "Если вопрос про таблицы/рисунки — опирайся на подписи и прилегающий текст; не придумывай номера/значения. "
+    "Цитируй короткими фрагментами при необходимости, без указания страниц."
+)
+
+SYS_FULLREAD_MAP = (
+    "Ты ассистент-экстрактор. Тебе дан фрагмент диплома и вопрос. "
+    "Извлеки ТОЛЬКО факты и мини-цитаты, относящиеся к вопросу. "
+    "Формат: краткие буллеты (до 8), без новых данных. Никаких длинных пересказов."
+)
+
+SYS_FULLREAD_REDUCE = (
+    "Ты репетитор по ВКР. Ниже — короткие факты из разных частей документа (map-выжимки). "
+    "Собери из них связный ответ на вопрос. Не выдумывай новых цифр/таблиц. "
+    "Если данных не хватает — отдельной строкой перечисли, чего не хватает."
+)
+
+# Новые подсказки для декомпозиции
+SYS_PLANNER = (
+    "Ты планировщик. Пользователь задал сложный вопрос с подпунктами. "
+    "Разбей его на нумерованный чек-лист подпунктов, каждый в 1–2 коротких предложения. "
+    "Верни ТОЛЬКО валидный JSON вида:\n"
+    "{"
+    "\"items\": [ {\"id\": \"1\", \"ask\": \"…\"}, {\"id\": \"2\", \"ask\": \"…\"}, … ]"
+    "}\n"
+    "Только те подпункты, что явно присутствуют или логически необходимы для ответа. Без воды."
+)
+
+SYS_PART_ANSWER = (
+    "Ты репетитор по ВКР. Отвечай ТОЛЬКО на указанный подпункт, используя исключительно переданный контекст. "
+    "Если сведений не хватает — дай частичный ответ и укажи, чего не хватает. "
+    "Формат: 1–2 предложения вывода + 2–5 коротких буллетов-обоснований."
+)
+
+SYS_MERGE = (
+    "Ты редактор ответа репетитора. Ниже даны подпункты и краткие ответы на каждый. "
+    "Собери итоговый СВОДНЫЙ ответ в формате из системной подсказки для ответа по документу "
+    "(краткий вывод; 3–7 пунктов обоснования; строка про недостающие данные, если нужно). "
+    "Обязательно покрой все подпункты — явно и по порядку. Не добавляй фактов вне контекста."
+)
+
+
 # -------------------- ВСПОМОГАТЕЛЬНЫЕ ХЕЛПЕРЫ --------------------
 
 def _safe_clip(ctx: str, max_chars: int = 16000) -> str:
-    """Обрезаем контекст, чтобы не раздувать токены (страховка)."""
     ctx = ctx or ""
     return ctx if len(ctx) <= max_chars else ctx[:max_chars]
 
@@ -105,7 +200,7 @@ _EXPAND_HINT = re.compile(
 
 # триггеры «объясни по-человечески»
 _EXPLAIN_HINT = re.compile(
-    r"(объясн|понятн|простыми\s+словами|смысл|развернут(ое|ое|ый|ая)|explain|in\s+plain\s+language|human\s+style)"
+    r"(объясн|понятн|простыми\s+словами|смысл|развернут(ое|ый|ая)|explain|in\s+plain\s+language|human\s+style)"
 )
 
 def is_expand_intent(question: str) -> bool:
@@ -121,24 +216,67 @@ def is_explain_intent(question: str) -> bool:
     return bool(_EXPLAIN_HINT.search(qn))
 
 def _strip_code_fences(s: str) -> str:
-    """
-    Убираем обёртки вида ```json ... ``` или ``` ... ```, чтобы json.loads не падал.
-    """
     t = (s or "").strip()
-    # тройные блоки
     if t.startswith("```"):
-        # убираем первую строку ```... и последнюю ```
         t = t.strip("`")
-        # иногда модель добавляет «json\n{...}»
         t = t.replace("json\n", "", 1) if t.startswith("json\n") else t
-    # вычленяем первую { ... } или [ ... ]-структуру
     m = re.search(r"({.*}|\[.*\])", t, flags=re.DOTALL)
     return m.group(1) if m else (s or "")
 
-# -------------------- ВЫЗОВЫ МОДЕЛИ --------------------
+def _smart_cut_point(s: str, limit: int) -> int:
+    if len(s) <= limit:
+        return len(s)
+    cut = s.rfind("\n", 0, limit)
+    if cut == -1:
+        cut = s.rfind(". ", 0, limit)
+    if cut == -1:
+        cut = s.rfind(" ", 0, limit)
+    if cut == -1:
+        cut = limit
+    return max(1, cut)
+
+def _chunk_text(s: str, maxlen: int = 480) -> Iterable[str]:
+    s = s or ""
+    i = 0
+    n = len(s)
+    while i < n:
+        cut = _smart_cut_point(s[i:], maxlen)
+        yield s[i:i + cut]
+        i += cut
+
+async def _as_async_stream(text: str) -> AsyncIterable[str]:
+    for part in _chunk_text(text, 480):
+        yield part
+        await asyncio.sleep(0)
+
+async def _stream_from_model(messages: list[dict], *, temperature: float = 0.2, max_tokens: int = FINAL_MAX_TOKENS) -> AsyncIterable[str]:
+    if chat_with_gpt_stream is not None:
+        try:
+            stream = chat_with_gpt_stream(messages, temperature=temperature, max_tokens=max_tokens)  # type: ignore
+            if hasattr(stream, "__aiter__"):
+                async for chunk in stream:  # type: ignore
+                    if chunk:
+                        yield str(chunk)
+                return
+            else:
+                for chunk in stream:  # type: ignore
+                    if chunk:
+                        yield str(chunk)
+                        await asyncio.sleep(0)
+                return
+        except Exception:
+            pass
+    try:
+        final = chat_with_gpt(messages, temperature=temperature, max_tokens=max_tokens)
+    except Exception:
+        final = "Не удалось получить ответ от модели."
+    async for x in _as_async_stream(final or ""):
+        yield x
+
+
+# -------------------- ВЫЗОВЫ МОДЕЛИ (НЕСТРИМОВЫЕ) --------------------
 
 def expand_text(question: str, ctx: str) -> str:
-    """Разворачиваем ровно тот текст, который пришёл в контексте, без новых фактов."""
     prompt = (
         "Пользователь просит изложить подробнее следующий материал. "
         "Сохрани все факты и ограничения, не добавляй новых сведений.\n\n"
@@ -151,23 +289,21 @@ def expand_text(question: str, ctx: str) -> str:
             {"role": "user", "content": prompt},
         ],
         temperature=0.45,
-        max_tokens=900,
+        max_tokens=EXPAND_MAX_TOKENS,
     )
 
 def explain_answer(question: str, ctx: str) -> str:
-    """Тёплое развёрнутое объяснение на основе контекста (без выдумывания фактов)."""
     return chat_with_gpt(
         [
             {"role": "system", "content": SYS_EXPLAIN},
             {"role": "assistant", "content": f"Контекст:\n{_safe_clip(ctx)}"},
             {"role": "user", "content": question},
         ],
-        temperature=0.7,   # чуть «человечнее»
-        max_tokens=900,
+        temperature=0.7,
+        max_tokens=EXPLAIN_MAX_TOKENS,
     )
 
 def draft_answer(question: str, ctx: str) -> str:
-    """Генерация черновика строго по контексту."""
     return chat_with_gpt(
         [
             {"role": "system", "content": SYS_ANSWER},
@@ -175,11 +311,10 @@ def draft_answer(question: str, ctx: str) -> str:
             {"role": "user", "content": question},
         ],
         temperature=0.2,
-        max_tokens=900,
+        max_tokens=ANSWER_MAX_TOKENS,
     )
 
 def critique_json(draft: str, ctx: str) -> Dict[str, Any]:
-    """Критик → компактный JSON-отчёт (с дефолтами при сбое)."""
     raw = chat_with_gpt(
         [
             {"role": "system", "content": SYS_CRITIC},
@@ -187,20 +322,18 @@ def critique_json(draft: str, ctx: str) -> Dict[str, Any]:
             {"role": "user", "content": f"ЧЕРНОВИК:\n{draft}"},
         ],
         temperature=0.0,
-        max_tokens=360,
+        max_tokens=CRITIC_MAX_TOKENS,
     )
 
     cleaned = _strip_code_fences(raw)
     try:
         rep = json.loads(cleaned)
     except Exception:
-        # попытка вытащить JSON-объект/массив из сырца
         try:
             rep = json.loads(_strip_code_fences(cleaned))
         except Exception:
             rep = {}
 
-    # дефолты и приведение типов
     rep = dict(rep) if isinstance(rep, dict) else {}
     rep.setdefault("grounded", False)
     rep.setdefault("score", 0)
@@ -221,7 +354,6 @@ def critique_json(draft: str, ctx: str) -> Dict[str, Any]:
     return rep  # type: ignore[return-value]
 
 def edit_answer(draft: str, ctx: str, report: Dict[str, Any]) -> str:
-    """Редактируем черновик по замечаниям критика (или формируем частичный ответ)."""
     return chat_with_gpt(
         [
             {"role": "system", "content": SYS_EDITOR},
@@ -230,17 +362,363 @@ def edit_answer(draft: str, ctx: str, report: Dict[str, Any]) -> str:
             {"role": "user", "content": f"ЧЕРНОВИК:\n{draft}"},
         ],
         temperature=0.2,
-        max_tokens=900,
+        max_tokens=EDITOR_MAX_TOKENS,
     )
 
-# -------------------- ПУБЛИЧНЫЕ ФУНКЦИИ --------------------
 
-def ace_once(question: str, ctx: str, pass_score: int = 85) -> str:
+# -------------------- СТРИМОВЫЕ ВАРИАНТЫ --------------------
+
+async def expand_text_stream(question: str, ctx: str) -> AsyncIterable[str]:
+    prompt = (
+        "Пользователь просит изложить подробнее следующий материал. "
+        "Сохрани все факты и ограничения, не добавляй новых сведений.\n\n"
+        f"Запрос: {question}"
+    )
+    messages = [
+        {"role": "system", "content": SYS_EXPAND},
+        {"role": "assistant", "content": f"Контекст:\n{_safe_clip(ctx)}"},
+        {"role": "user", "content": prompt},
+    ]
+    async for ch in _stream_from_model(messages, temperature=0.45, max_tokens=EXPAND_MAX_TOKENS):
+        yield ch
+
+async def explain_answer_stream(question: str, ctx: str) -> AsyncIterable[str]:
+    messages = [
+        {"role": "system", "content": SYS_EXPLAIN},
+        {"role": "assistant", "content": f"Контекст:\n{_safe_clip(ctx)}"},
+        {"role": "user", "content": question},
+    ]
+    async for ch in _stream_from_model(messages, temperature=0.7, max_tokens=EXPLAIN_MAX_TOKENS):
+        yield ch
+
+async def edit_answer_stream(draft: str, ctx: str, report: Dict[str, Any]) -> AsyncIterable[str]:
+    messages = [
+        {"role": "system", "content": SYS_EDITOR},
+        {"role": "assistant", "content": f"КОНТЕКСТ:\n{_safe_clip(ctx)}"},
+        {"role": "assistant", "content": f"ОТЧЁТ КРИТИКА:\n{json.dumps(report, ensure_ascii=False)}"},
+        {"role": "user", "content": f"ЧЕРНОВИК:\n{draft}"},
+    ]
+    async for ch in _stream_from_model(messages, temperature=0.2, max_tokens=EDITOR_MAX_TOKENS):
+        yield ch
+
+
+# -------------------- ПОЛНОЕ ЧТЕНИЕ ДОКУМЕНТА (FULLREAD) --------------------
+
+def ace_fullread_direct_once(question: str, full_text: str) -> str:
+    text = _safe_clip(full_text or "", Cfg.DIRECT_MAX_CHARS)
+    return chat_with_gpt(
+        [
+            {"role": "system", "content": SYS_FULLREAD},
+            {"role": "assistant", "content": f"[Документ — полный текст]\n{text}"},
+            {"role": "user", "content": question},
+        ],
+        temperature=0.2,
+        max_tokens=FINAL_MAX_TOKENS,
+    )
+
+async def ace_fullread_direct_stream(question: str, full_text: str) -> AsyncIterable[str]:
+    text = _safe_clip(full_text or "", Cfg.DIRECT_MAX_CHARS)
+    messages = [
+        {"role": "system", "content": SYS_FULLREAD},
+        {"role": "assistant", "content": f"[Документ — полный текст]\n{text}"},
+        {"role": "user", "content": question},
+    ]
+    async for ch in _stream_from_model(messages, temperature=0.2, max_tokens=FINAL_MAX_TOKENS):
+        yield ch
+
+
+def _group_sections(sections: Iterable[str], *, per_step_chars: int, max_steps: int, max_sections: int) -> List[str]:
+    out: List[str] = []
+    cur: List[str] = []
+    cur_len = 0
+    count = 0
+    for s in sections or []:
+        if count >= max_sections:
+            break
+        t = (s or "").strip()
+        if not t:
+            continue
+        if cur_len + len(t) + 1 > per_step_chars and cur:
+            out.append("\n\n".join(cur))
+            cur, cur_len = [], 0
+            if len(out) >= max_steps:
+                break
+        cur.append(t)
+        cur_len += len(t) + 1
+        count += 1
+    if cur and len(out) < max_steps:
+        out.append("\n\n".join(cur))
+    return out[:max_steps]
+
+
+def _map_digest(question: str, chunk_text: str, *, map_tokens: int) -> str:
+    return chat_with_gpt(
+        [
+            {"role": "system", "content": SYS_FULLREAD_MAP},
+            {"role": "assistant", "content": f"Фрагменты:\n{_safe_clip(chunk_text, Cfg.DIRECT_MAX_CHARS)}"},
+            {"role": "user", "content": f"Вопрос: {question}\nСделай короткую выжимку (буллеты)."},
+        ],
+        temperature=0.1,
+        max_tokens=max(120, int(map_tokens)),
+    )
+
+
+def ace_fullread_iter_once(
+    question: str,
+    sections: Iterable[str],
+    *,
+    per_step_chars: Optional[int] = None,
+    max_steps: Optional[int] = None,
+    max_sections: Optional[int] = None,
+    map_tokens: Optional[int] = None,
+    reduce_tokens: Optional[int] = None,
+) -> str:
+    per_step_chars = per_step_chars or Cfg.FULLREAD_STEP_CHARS
+    max_steps = max_steps or Cfg.FULLREAD_MAX_STEPS
+    max_sections = max_sections or FULLREAD_MAX_SECTIONS
+    map_tokens = map_tokens or FULLREAD_MAP_TOKENS
+    reduce_tokens = reduce_tokens or FULLREAD_REDUCE_TOKENS
+
+    batches = _group_sections(sections, per_step_chars=per_step_chars, max_steps=max_steps, max_sections=max_sections)
+    if not batches:
+        return "Не удалось прочитать документ секциями: нет доступных фрагментов."
+
+    digests: List[str] = []
+    for b in batches:
+        try:
+            digests.append(_map_digest(question, b, map_tokens=map_tokens))
+        except Exception:
+            digests.append(_safe_clip(b, 800))
+
+    joined = "\n\n".join([f"[MAP {i+1}]\n{d}" for i, d in enumerate(digests)])
+    ctx = _safe_clip(joined, Cfg.FULLREAD_CONTEXT_CHARS)
+
+    return chat_with_gpt(
+        [
+            {"role": "system", "content": SYS_FULLREAD_REDUCE},
+            {"role": "assistant", "content": f"Сводные факты из документа:\n{ctx}"},
+            {"role": "user", "content": question},
+        ],
+        temperature=0.2,
+        max_tokens=max(300, int(reduce_tokens)),
+    )
+
+
+async def ace_fullread_iter_stream(
+    question: str,
+    sections: Iterable[str],
+    *,
+    per_step_chars: Optional[int] = None,
+    max_steps: Optional[int] = None,
+    max_sections: Optional[int] = None,
+    map_tokens: Optional[int] = None,
+    reduce_tokens: Optional[int] = None,
+) -> AsyncIterable[str]:
+    per_step_chars = per_step_chars or Cfg.FULLREAD_STEP_CHARS
+    max_steps = max_steps or Cfg.FULLREAD_MAX_STEPS
+    max_sections = max_sections or FULLREAD_MAX_SECTIONS
+    map_tokens = map_tokens or FULLREAD_MAP_TOKENS
+    reduce_tokens = reduce_tokens or FULLREAD_REDUCE_TOKENS
+
+    batches = _group_sections(sections, per_step_chars=per_step_chars, max_steps=max_steps, max_sections=max_sections)
+    if not batches:
+        async def _empty():
+            yield "Не удалось прочитать документ секциями: нет доступных фрагментов."
+        return _empty()
+
+    digests: List[str] = []
+    for b in batches:
+        try:
+            digests.append(_map_digest(question, b, map_tokens=map_tokens))
+        except Exception:
+            digests.append(_safe_clip(b, 800))
+
+    joined = "\n\n".join([f"[MAP {i+1}]\n{d}" for i, d in enumerate(digests)])
+    ctx = _safe_clip(joined, Cfg.FULLREAD_CONTEXT_CHARS)
+
+    messages = [
+        {"role": "system", "content": SYS_FULLREAD_REDUCE},
+        {"role": "assistant", "content": f"Сводные факты из документа:\n{ctx}"},
+        {"role": "user", "content": question},
+    ]
+    return _stream_from_model(messages, temperature=0.2, max_tokens=max(300, int(reduce_tokens)))
+
+
+# Унифицированные обёртки
+
+def ace_fullread_once(
+    question: str,
+    *,
+    full_text: Optional[str] = None,
+    sections: Optional[Iterable[str]] = None,
+    prefer: str = "iter",
+) -> str:
+    prefer = (prefer or "iter").lower()
+    if full_text is not None and prefer == "direct":
+        return ace_fullread_direct_once(question, full_text)
+    if sections is not None:
+        return ace_fullread_iter_once(question, sections)
+    if full_text is not None:
+        return ace_fullread_direct_once(question, full_text)
+    return "Нет данных для полного чтения документа."
+
+async def ace_fullread_stream(
+    question: str,
+    *,
+    full_text: Optional[str] = None,
+    sections: Optional[Iterable[str]] = None,
+    prefer: str = "iter",
+) -> AsyncIterable[str]:
+    prefer = (prefer or "iter").lower()
+    if full_text is not None and prefer == "direct":
+        return ace_fullread_direct_stream(question, full_text)
+    if sections is not None:
+        return ace_fullread_iter_stream(question, sections)
+    if full_text is not None:
+        return ace_fullread_direct_stream(question, full_text)
+    async def _empty():
+        yield "Нет данных для полного чтения документа."
+    return _empty()
+
+
+# -------------------- ДЕКОМПОЗИЦИЯ МНОГОПУНКТНЫХ ВОПРОСОВ --------------------
+
+_ENUM_LINE = re.compile(r"(?m)^\s*(?:\d+[).\)]|[-—•])\s+")
+_ENUM_INLINE = re.compile(r"(?:\s|^)\(?\d{1,2}[)\.]\s+")
+
+def _looks_multipart(q: str) -> bool:
+    q = q or ""
+    lines = _ENUM_LINE.findall(q)
+    if len(lines) >= MULTI_MIN_ITEMS:
+        return True
+    inline = _ENUM_INLINE.findall(q)
+    if len(inline) >= MULTI_MIN_ITEMS:
+        return True
+    if q.count(";") >= 3:
+        return True
+    return False
+
+def _naive_split(q: str) -> List[str]:
+    q = q.strip()
+    items: List[str] = []
+    if _ENUM_LINE.search(q):
+        for line in q.splitlines():
+            if _ENUM_LINE.match(line):
+                items.append(re.sub(r"^\s*(?:\d+[).\)]|[-—•])\s+", "", line).strip())
+    if not items and _ENUM_INLINE.search(q):
+        # простая сборка по «1) … 2) …»
+        parts = _ENUM_INLINE.split(q)
+        buf = []
+        cur = None
+        for token in re.finditer(r"\(?\d{1,2}[)\.]\s+|[^()]+", q):
+            s = token.group(0)
+            if re.fullmatch(r"\(?\d{1,2}[)\.]\s+", s):
+                if cur:
+                    items.append(cur.strip())
+                cur = ""
+            else:
+                cur = (cur or "") + s
+        if cur:
+            items.append(cur.strip())
+    if not items and q.count(";") >= 2:
+        items = [p.strip() for p in q.split(";") if p.strip()]
+    items = [re.sub(r"\s+", " ", it).strip(" .;—-") for it in items if it and len(it.strip()) >= 2]
+    return items[:MULTI_MAX_ITEMS]
+
+def _plan_subtasks(question: str) -> List[Dict[str, str]]:
     """
-    Один проход ACE с режимами:
+    Возвращает план подпунктов: [{"id": "1", "ask": "..."}...]
+    1) пытается получить структурированный JSON у модели;
+    2) если не вышло — делает наивный парсинг (нумерация/маркеры/точки с запятой).
+    """
+    if not MULTI_PLAN_ENABLED:
+        items = _naive_split(question)
+        return [{"id": str(i + 1), "ask": it} for i, it in enumerate(items)]
+
+    raw = chat_with_gpt(
+        [
+            {"role": "system", "content": SYS_PLANNER},
+            {"role": "user", "content": question},
+        ],
+        temperature=0.0,
+        max_tokens=PLANNER_MAX_TOKENS,
+    )
+    plan: List[Dict[str, str]] = []
+    try:
+        obj = json.loads(_strip_code_fences(raw))
+        items = obj.get("items", [])
+        if isinstance(items, list):
+            for i, it in enumerate(items[:MULTI_MAX_ITEMS]):
+                ask = str((it or {}).get("ask", "")).strip()
+                if ask:
+                    plan.append({"id": str((it or {}).get("id") or i + 1), "ask": ask})
+    except Exception:
+        pass
+
+    if not plan:
+        items = _naive_split(question)
+        plan = [{"id": str(i + 1), "ask": it} for i, it in enumerate(items)]
+    return plan
+
+def _answer_subpoint(ask: str, ctx: str, pass_score: int | None = None) -> str:
+    """
+    Отвечает на одиночный подпункт, проверяет критиком и при необходимости редактирует.
+    """
+    pass_score = int(pass_score if pass_score is not None else MULTI_PASS_SCORE)
+
+    draft = chat_with_gpt(
+        [
+            {"role": "system", "content": SYS_PART_ANSWER},
+            {"role": "assistant", "content": f"Контекст:\n{_safe_clip(ctx)}"},
+            {"role": "user", "content": f"Подпункт: {ask}"},
+        ],
+        temperature=0.2,
+        max_tokens=PART_MAX_TOKENS,
+    )
+    rep = critique_json(draft, ctx)
+    if rep.get("grounded") and rep.get("score", 0) >= pass_score:
+        return (draft or "").strip()
+    return edit_answer(draft, ctx, rep).strip()
+
+def _merge_subanswers(original_question: str, plan: List[Dict[str, str]], answers: List[str]) -> str:
+    """
+    Объединяет ответы по подпунктам в один финальный (не добавляя новых фактов).
+    """
+    bundle = []
+    for i, (p, a) in enumerate(zip(plan, answers), start=1):
+        bundle.append(f"[{i}] {p.get('ask','')}\n— Ответ:\n{a.strip()}")
+    material = "\n\n".join(bundle)
+
+    return chat_with_gpt(
+        [
+            {"role": "system", "content": SYS_MERGE},
+            {"role": "assistant", "content": f"Подпункты и ответы:\n{_safe_clip(material, 12000)}"},
+            {"role": "user", "content": f"Итоговый вопрос: {original_question}\nСобери полный ответ."},
+        ],
+        temperature=0.2,
+        max_tokens=MERGE_MAX_TOKENS,
+    )
+
+# Публичные алиасы для bot.py (и обратная совместимость)
+def plan_subtasks(question: str) -> List[Dict[str, str]]:
+    return _plan_subtasks(question)
+
+def answer_subpoint(ask: str, ctx: str, pass_score: int | None = None) -> str:
+    return _answer_subpoint(ask, ctx, pass_score)
+
+def merge_subanswers(original_question: str, plan: List[Dict[str, str]], answers: List[str]) -> str:
+    return _merge_subanswers(original_question, plan, answers)
+
+
+# -------------------- КЛАССИЧЕСКИЙ ACE (RAG/контекст) --------------------
+
+def ace_once(question: str, ctx: str, pass_score: int = MULTI_PASS_SCORE) -> str:
+    """
+    Один проход ACE:
     - EXPLAIN: «объясни / что за смысл / развёрнутое объяснение».
     - EXPAND: «подробнее / распиши / разверни / побольше».
-    - STRICT: обычный строгий режим (черновик → критик → редактор).
+    - MULTI: декомпозиция сложного вопроса на подпункты → ответы по каждому → слияние.
+    - STRICT: обычный режим (черновик → критик → редактор).
     """
     q = (question or "").strip()
     c = _safe_clip(ctx)
@@ -251,18 +729,118 @@ def ace_once(question: str, ctx: str, pass_score: int = 85) -> str:
     if is_expand_intent(q):
         return expand_text(q, c)
 
-    # Строгий режим по контексту
+    # Декомпозиция длинных вопросов
+    if _looks_multipart(q):
+        plan = _plan_subtasks(q)
+        if len(plan) >= MULTI_MIN_ITEMS:
+            subanswers: List[str] = []
+            for item in plan:
+                try:
+                    subanswers.append(_answer_subpoint(item["ask"], c, pass_score))
+                except Exception:
+                    subanswers.append(
+                        chat_with_gpt(
+                            [
+                                {"role": "system", "content": SYS_PART_ANSWER},
+                                {"role": "assistant", "content": f"Контекст:\n{_safe_clip(c)}"},
+                                {"role": "user", "content": f"Подпункт: {item['ask']} (очень кратко)"},
+                            ],
+                            temperature=0.2,
+                            max_tokens=max(220, PART_MAX_TOKENS // 3),
+                        )
+                    )
+            merged = _merge_subanswers(q, plan, subanswers)
+            report = critique_json(merged, c)
+            if report.get("grounded") and report.get("score", 0) >= int(pass_score):
+                return (merged or "").strip()
+            return edit_answer(merged, c, report).strip()
+        # если план не получился — падаем в STRICT
+
+    # STRICT-пайплайн
     draft = draft_answer(q, c)
     report = critique_json(draft, c)
-
-    # Если критик доволен — возвращаем черновик, иначе правим
     if report.get("grounded") and report.get("score", 0) >= int(pass_score):
         return (draft or "").strip()
-
     return edit_answer(draft, c, report).strip()
 
+
+async def ace_stream(question: str, ctx: str, pass_score: int = MULTI_PASS_SCORE) -> AsyncIterable[str]:
+    """
+    Стримовый ACE:
+      - EXPLAIN/EXPAND — стримим единственный вызов модели;
+      - MULTI (декомпозиция): считаем подпункты и их ответы синхронно, затем стримим merge-этап;
+      - STRICT — draft + critic синхронно, затем финальный EDIT стримим;
+                 если черновик прошёл по score — стримим сам черновик (эмуляцией).
+    """
+    q = (question or "").strip()
+    c = _safe_clip(ctx)
+
+    if is_explain_intent(q):
+        async for ch in explain_answer_stream(q, c):
+            yield ch
+        return
+
+    if is_expand_intent(q):
+        async for ch in expand_text_stream(q, c):
+            yield ch
+        return
+
+    # MULTI-режим (стримим только merge)
+    if _looks_multipart(q):
+        plan = _plan_subtasks(q)
+        if len(plan) >= MULTI_MIN_ITEMS:
+            subanswers: List[str] = []
+            for item in plan:
+                try:
+                    subanswers.append(_answer_subpoint(item["ask"], c, pass_score))
+                except Exception:
+                    subanswers.append(
+                        chat_with_gpt(
+                            [
+                                {"role": "system", "content": SYS_PART_ANSWER},
+                                {"role": "assistant", "content": f"Контекст:\n{_safe_clip(c)}"},
+                                {"role": "user", "content": f"Подпункт: {item['ask']} (очень кратко)"},
+                            ],
+                            temperature=0.2,
+                            max_tokens=max(220, PART_MAX_TOKENS // 3),
+                        )
+                    )
+
+            bundle = []
+            for i, (p, a) in enumerate(zip(plan, subanswers), start=1):
+                bundle.append(f"[{i}] {p.get('ask','')}\n— Ответ:\n{a.strip()}")
+            material = "\n\n".join(bundle)
+
+            messages = [
+                {"role": "system", "content": SYS_MERGE},
+                {"role": "assistant", "content": f"Подпункты и ответы:\n{_safe_clip(material, 12000)}"},
+                {"role": "user", "content": f"Итоговый вопрос: {q}\nСобери полный ответ."},
+            ]
+
+            merged_text = ""
+            async for ch in _stream_from_model(messages, temperature=0.2, max_tokens=MERGE_MAX_TOKENS):
+                merged_text += ch
+                yield ch
+
+            report = critique_json(merged_text, c)
+            if not (report.get("grounded") and report.get("score", 0) >= int(pass_score)):
+                fixed = edit_answer(merged_text, c, report)
+                async for ch in _as_async_stream("\n\n" + fixed):
+                    yield ch
+            return
+
+    # STRICT-пайплайн
+    draft = draft_answer(q, c)
+    report = critique_json(draft, c)
+    if report.get("grounded") and report.get("score", 0) >= int(pass_score):
+        async for ch in _as_async_stream(draft or ""):
+            yield ch
+        return
+    async for ch in edit_answer_stream(draft, c, report):
+        yield ch
+
+
 def agent_no_context(question: str) -> str:
-    """Агентный ответ без документа (ограничен доменом ВКР)."""
     q = (question or "").strip()
     return chat_with_gpt(
         [
@@ -270,5 +848,5 @@ def agent_no_context(question: str) -> str:
             {"role": "user", "content": q},
         ],
         temperature=0.3,
-        max_tokens=900,
+        max_tokens=ANSWER_MAX_TOKENS,
     )

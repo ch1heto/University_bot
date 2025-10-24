@@ -4,22 +4,56 @@ import os
 import html
 import json
 import logging
+import asyncio
+import time
+from typing import Iterable, AsyncIterable, Optional, List, Tuple
+
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
-from .answer_builder import generate_answer
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.enums import ChatAction
+
+# ---------- answer builder: пытаемся взять стримовую версию, фолбэк на нестримовую ----------
+try:
+    from .answer_builder import generate_answer, generate_answer_stream  # type: ignore
+except Exception:
+    from .answer_builder import generate_answer  # type: ignore
+    generate_answer_stream = None  # стрима нет — будем фолбэкать
+
 from .config import Cfg
 from .db import (
     ensure_user, get_conn,
     set_document_indexer_version, get_document_indexer_version,
     CURRENT_INDEXER_VERSION,
     update_document_meta, delete_document_chunks,
-    set_user_active_doc, get_user_active_doc,  # ⬅️ добавили персистентное состояние
+    set_user_active_doc, get_user_active_doc,  # ⬅️ персист активного документа
 )
 from .parsing import parse_docx, parse_pdf, parse_doc, save_upload
 from .indexing import index_document
-from .retrieval import retrieve, build_context, invalidate_cache  # лишние утилиты убрали
+from .retrieval import (
+    retrieve, build_context, invalidate_cache,
+    retrieve_coverage, build_context_coverage,
+)
 from .intents import detect_intents
-from .polza_client import probe_embedding_dim, chat_with_gpt  # ⬅️ добавили chat_with_gpt
+
+# ↓ добавили мягкий импорт по-подпунктной генерации из ace
+try:
+    from .ace import plan_subtasks, answer_subpoint, _merge_subanswers as merge_subanswers  # type: ignore
+except Exception:
+    try:
+        # бэкап: если в ace функции экспортированы с подчёркиванием
+        from .ace import _plan_subtasks as plan_subtasks, _answer_subpoint as answer_subpoint, _merge_subanswers as merge_subanswers  # type: ignore
+    except Exception:
+        plan_subtasks = None   # type: ignore
+        answer_subpoint = None # type: ignore
+        merge_subanswers = None # type: ignore
+
+# ---------- polza client: пробуем стрим, фолбэк на обычный чат ----------
+try:
+    from .polza_client import probe_embedding_dim, chat_with_gpt, chat_with_gpt_stream  # type: ignore
+except Exception:
+    from .polza_client import probe_embedding_dim, chat_with_gpt  # type: ignore
+    chat_with_gpt_stream = None
 
 # НОВОЕ: оркестратор приёма/обогащения (OCR таблиц-картинок, нормализация чисел)
 from .ingest_orchestrator import enrich_sections
@@ -42,6 +76,24 @@ dp = Dispatcher()
 setup_paywall(dp, bot)
 
 
+# --------------------- ПАРАМЕТРЫ СТРИМИНГА (с дефолтами) ---------------------
+
+STREAM_ENABLED: bool = getattr(Cfg, "STREAM_ENABLED", True)
+STREAM_EDIT_INTERVAL_MS: int = getattr(Cfg, "STREAM_EDIT_INTERVAL_MS", 900)  # как часто редактировать сообщение
+STREAM_MIN_CHARS: int = getattr(Cfg, "STREAM_MIN_CHARS", 120)               # мин. приращение между апдейтами
+STREAM_MODE: str = getattr(Cfg, "STREAM_MODE", "edit")                       # "edit" | "multi" (multi = просто куски)
+TG_MAX_CHARS: int = getattr(Cfg, "TG_MAX_CHARS", 3900)                       # безопасно < 4096 телеграма
+STREAM_HEAD_START_MS: int = getattr(Cfg, "STREAM_HEAD_START_MS", 250)        # первый апдейт быстрее
+FINAL_MAX_TOKENS: int = getattr(Cfg, "FINAL_MAX_TOKENS", 1600)
+TYPE_INDICATION_EVERY_MS: int = getattr(Cfg, "TYPE_INDICATION_EVERY_MS", 2000)
+
+# ↓ новое: управление многошаговой подачей
+MULTI_STEP_SEND_ENABLED: bool = getattr(Cfg, "MULTI_STEP_SEND_ENABLED", True)
+MULTI_STEP_MIN_ITEMS: int = getattr(Cfg, "MULTI_STEP_MIN_ITEMS", 2)
+MULTI_STEP_MAX_ITEMS: int = getattr(Cfg, "MULTI_STEP_MAX_ITEMS", 8)
+MULTI_STEP_FINAL_MERGE: bool = getattr(Cfg, "MULTI_STEP_FINAL_MERGE", True)
+MULTI_STEP_PAUSE_MS: int = getattr(Cfg, "MULTI_STEP_PAUSE_MS", 120)  # м/у блоками
+MULTI_PASS_SCORE: int = getattr(Cfg, "MULTI_PASS_SCORE", 85)         # порог критика в ace
 
 # --------------------- форматирование и отправка ---------------------
 
@@ -56,9 +108,254 @@ def _to_html(text: str) -> str:
     return text.replace("&lt;b&gt;", "<b>").replace("&lt;/b&gt;", "</b>")
 
 async def _send(m: types.Message, text: str):
-    """Бережно отправляем длинный текст частями в HTML-режиме."""
-    for chunk in split_for_telegram(text or "", 3900):
+    """Бережно отправляем длинный текст частями в HTML-режиме (нестримовый фолбэк)."""
+    for chunk in split_for_telegram(text or "", TG_MAX_CHARS):
         await m.answer(_to_html(chunk), parse_mode="HTML", disable_web_page_preview=True)
+
+# --------------------- STREAM: вспомогалки ---------------------
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+async def _typing_loop(chat_id: int, stop_event: asyncio.Event):
+    """Периодически отправляет индикатор 'typing', пока не остановим."""
+    try:
+        while not stop_event.is_set():
+            await bot.send_chat_action(chat_id, ChatAction.TYPING)
+            await asyncio.wait_for(stop_event.wait(), timeout=TYPE_INDICATION_EVERY_MS / 1000)
+    except asyncio.TimeoutError:
+        pass
+    except Exception:
+        pass
+
+def _ensure_iterable(stream_obj) -> Iterable[str]:
+    """Нормализуем в (a)синхронный итератор строк; поддерживаем случай, когда прилетела корутина."""
+    import inspect
+
+    # Если это корутина — обернём в async-генератор, который сначала её await-ит,
+    # а потом уже итерируется по реальному стриму.
+    if inspect.iscoroutine(stream_obj):
+        async def _await_then_iter():
+            real = await stream_obj
+            if hasattr(real, "__aiter__"):
+                async for chunk in real:
+                    yield chunk
+            else:
+                for chunk in real:
+                    yield chunk
+        return _await_then_iter()
+
+    if hasattr(stream_obj, "__aiter__"):
+        async def _drain_to_queue(q: asyncio.Queue):
+            try:
+                async for chunk in stream_obj:  # type: ignore
+                    await q.put(chunk or "")
+            except Exception:
+                pass
+            finally:
+                await q.put(None)
+
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def _producer():
+            await _drain_to_queue(queue)
+
+        asyncio.create_task(_producer())
+
+        async def _async_iter():
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                yield item
+        return _async_iter()
+
+    return stream_obj
+
+async def _iterate_chunks(stream_obj) -> AsyncIterable[str]:
+    """Единый асинхронный источник чанков (умеет работать и с sync-, и с async-итераторами)."""
+    if hasattr(stream_obj, "__aiter__"):
+        async for ch in stream_obj:
+            if ch:
+                yield str(ch)
+        return
+    for ch in stream_obj:
+        if ch:
+            yield str(ch)
+
+def _smart_cut_point(s: str, limit: int) -> int:
+    """Ищем «красивое» место разреза <= limit (по переносу/точке/пробелу)."""
+    if len(s) <= limit:
+        return len(s)
+    cut = s.rfind("\n", 0, limit)
+    if cut == -1:
+        cut = s.rfind(". ", 0, limit)
+    if cut == -1:
+        cut = s.rfind(" ", 0, limit)
+    if cut == -1:
+        cut = limit
+    return max(1, cut)
+
+async def _stream_to_telegram(m: types.Message, stream, head_text: str = "⌛️ Печатаю ответ…") -> None:
+    """
+    Главный цикл стриминга.
+    """
+    current_text = ""
+    initial = await m.answer(_to_html(head_text), parse_mode="HTML", disable_web_page_preview=True)
+    last_edit_at = _now_ms() - STREAM_HEAD_START_MS
+    stop_typer = asyncio.Event()
+    typer_task = asyncio.create_task(_typing_loop(m.chat.id, stop_event=stop_typer))
+
+    try:
+        async for delta in _iterate_chunks(_ensure_iterable(stream)):
+            current_text += delta
+
+            if len(current_text) >= TG_MAX_CHARS:
+                cut = _smart_cut_point(current_text, TG_MAX_CHARS)
+                final_part = current_text[:cut]
+                try:
+                    await initial.edit_text(
+                        _to_html(final_part),
+                        parse_mode="HTML",
+                        disable_web_page_preview=True
+                    )
+                except TelegramBadRequest:
+                    await m.answer(_to_html(final_part), parse_mode="HTML", disable_web_page_preview=True)
+
+                current_text = current_text[cut:].lstrip()
+                initial = await m.answer(
+                    _to_html(current_text if current_text else "…"),
+                    parse_mode="HTML",
+                    disable_web_page_preview=True
+                )
+                last_edit_at = _now_ms()
+                continue
+
+            now = _now_ms()
+            if (now - last_edit_at) >= STREAM_EDIT_INTERVAL_MS and len(current_text) >= STREAM_MIN_CHARS:
+                try:
+                    await initial.edit_text(
+                        _to_html(current_text),
+                        parse_mode="HTML",
+                        disable_web_page_preview=True
+                    )
+                    last_edit_at = now
+                except TelegramBadRequest:
+                    pass
+
+        if current_text:
+            try:
+                await initial.edit_text(
+                    _to_html(current_text),
+                    parse_mode="HTML",
+                    disable_web_page_preview=True
+                )
+            except TelegramBadRequest:
+                await m.answer(_to_html(current_text), parse_mode="HTML", disable_web_page_preview=True)
+
+    finally:
+        stop_typer.set()
+        try:
+            await typer_task
+        except Exception:
+            pass
+
+
+async def _run_multistep_answer(
+    m: types.Message,
+    uid: int,
+    doc_id: int,
+    q_text: str,
+    *,
+    discovered_items: list[dict] | None = None,
+) -> bool:
+    """
+    Генерируем: план → по каждому подпункту отдельный ответ → (опц.) финальный merge.
+    Возвращает True, если путь обработан и ничего дальше делать не нужно.
+    """
+    if not MULTI_STEP_SEND_ENABLED:
+        return False
+    if not (plan_subtasks and answer_subpoint and merge_subanswers):
+        # нет необходимых функций из ace — выходим
+        return False
+
+    # план из coverage или строим планерoм
+    items = (discovered_items or [])
+    if not items:
+        try:
+            items = plan_subtasks(q_text) or []
+        except Exception:
+            items = []
+    items = [it for it in items if (it.get("ask") or "").strip()]
+    if len(items) < MULTI_STEP_MIN_ITEMS:
+        return False
+
+    # отсечём хвост по лимиту
+    items = items[:MULTI_STEP_MAX_ITEMS]
+
+    # краткий анонс
+    preview = "\n".join([f"{i+1}) {(it['ask'] or '').strip()}" for i, it in enumerate(items)])
+    await _send(m, f"Вопрос многочастный. Отвечаю по подпунктам ({len(items)} шт.):\n\n{preview}")
+
+    subanswers: list[str] = []
+
+    # coverage-aware раздача контекстов: разложим выжимки по подпунктам
+    cov = None
+    try:
+        cov = retrieve_coverage(owner_id=uid, doc_id=doc_id, question=q_text)
+    except Exception:
+        cov = None
+    cov_snips = (cov or {}).get("snippets") or []
+    cov_map = (cov or {}).get("by") or {}  # ожидается {id: [индексы сниппетов]}
+
+    # по очереди: A → send, B → send, ...
+    for i, it in enumerate(items, start=1):
+        ask = (it.get("ask") or "").strip()
+        # контекст для конкретного подпункта
+        ctx_text = ""
+        try:
+            # 1) если есть coverage-карта — соберём «локальный» контекст подпункта
+            idxs = cov_map.get(str(it.get("id") or i)) or []
+            if idxs and cov_snips:
+                sub_snips = [cov_snips[j] for j in idxs if 0 <= j < len(cov_snips)]
+                ctx_text = build_context_coverage(sub_snips, items_count=1)
+        except Exception:
+            ctx_text = ""
+        # 2) фолбэки
+        if not ctx_text:
+            ctx_text = best_context(uid, doc_id, ask, max_chars=6000) or ""
+        if not ctx_text:
+            hits = retrieve(uid, doc_id, ask, top_k=8)
+            if hits:
+                ctx_text = build_context(hits)
+        if not ctx_text:
+            ctx_text = _first_chunks_context(uid, doc_id, n=12, max_chars=6000)
+
+        # генерация по подпункту (кастомная подсказка в ace + критика/правка)
+        try:
+            part = answer_subpoint(ask, ctx_text, MULTI_PASS_SCORE).strip()
+        except Exception as e:
+            logging.exception("answer_subpoint failed: %s", e)
+            part = ""
+
+        # отправка блока
+        header = f"<b>{i}. {html.escape(ask)}</b>\n\n"
+        await _send(m, header + (part or "Не удалось сгенерировать ответ по этому подпункту."))
+        subanswers.append(f"{header}{part}")
+
+        # микропаузa, чтобы не упереться в rate/чаты
+        await asyncio.sleep(MULTI_STEP_PAUSE_MS / 1000)
+
+    # (опционально) финальный сводный блок
+    if MULTI_STEP_FINAL_MERGE:
+        try:
+            merged = merge_subanswers(q_text, items, subanswers).strip()
+            if merged:
+                await _send(m, "<b>Итоговый сводный ответ</b>\n\n" + merged)
+        except Exception as e:
+            logging.exception("merge_subanswers failed: %s", e)
+
+    return True
 
 # summarizer (мягкий импорт)
 try:
@@ -398,7 +695,8 @@ def _count_sources(uid: int, doc_id: int) -> int:
             """,
             (uid, doc_id),
         )
-        for r in cur.fetchall():
+        raw_rows = cur.fetchall()
+        for r in raw_rows:
             sec = (r["section_path"] or "").lower()
             if not any(k in sec for k in ("источник", "литератур", "библиограф", "reference", "bibliograph")):
                 continue
@@ -670,7 +968,6 @@ def _compose_figure_display(attrs_json: str | None, section_path: str, title_tex
             pass
 
     if not num or not num.strip():
-        # пробуем распарсить из текстового заголовка/пути секции
         cand = title_text or section_path or ""
         m = _FIG_TITLE_RE.search(cand)
         if m:
@@ -680,7 +977,6 @@ def _compose_figure_display(attrs_json: str | None, section_path: str, title_tex
 
     if num:
         return f"Рисунок {num}" + (f" — {_shorten(tail, 160)}" if tail else "")
-    # без номера — короткий хвост/название
     base = title_text or _last_segment(section_path or "")
     base = re.sub(r"(?i)^\s*(рис(?:\.|унок)?|figure|fig\.?)\s*", "", base).strip(" —–-")
     return _shorten(base or "Рисунок", 160)
@@ -716,7 +1012,6 @@ def _list_figures_db(uid: int, doc_id: int, limit: int = 25) -> dict:
         disp = _compose_figure_display(attrs_json, section_path, txt)
         items.append(disp)
 
-    # дедуп и отсечка
     seen = set()
     uniq = []
     for it in items:
@@ -782,13 +1077,11 @@ async def _ensure_modalities_indexed(m: types.Message, uid: int, doc_id: int, in
     path = row["path"]
     try:
         sections = _parse_by_ext(path)
-        # НОВОЕ: обогащение — распознаем таблицы на картинках/нормализуем числа
         sections = enrich_sections(sections, doc_kind=os.path.splitext(path)[1].lower().strip("."))
     except Exception as e:
         logging.exception("re-parse/enrich failed: %s", e)
         return
 
-    # Смотрим, появилось ли то, чего не хватало
     new_refs = sum(1 for s in sections if (s.get("element_type") == "reference"))
     new_figs = sum(1 for s in sections if (s.get("element_type") == "figure"))
 
@@ -812,7 +1105,7 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
     """
     Собираем ТОЛЬКО факты из БД/индекса, без генерации текста.
     """
-    facts: dict[str, object] = {"doc_id": doc_id}
+    facts: dict[str, object] = {"doc_id": doc_id, "owner_id": uid}
 
     # ----- Таблицы -----
     if intents["tables"]["want"]:
@@ -823,7 +1116,6 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
         cur = con.cursor()
         items: list[str] = []
         for base in basenames:
-            # attrs из первой строки table_row (в новых индексах они тут)
             cur.execute(
                 """
                 SELECT attrs FROM chunks
@@ -836,7 +1128,6 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
             r = cur.fetchone()
             attrs_json = r["attrs"] if r else None
 
-            # первая/вторая строка — fallback
             cur.execute(
                 """
                 SELECT text FROM chunks
@@ -937,7 +1228,7 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
                     "display": display,
                     "where": {"page": row["page"], "section_path": row["section_path"]},
                     "highlights": highlights,
-                    "stats": stats,  # ⬅️ добавили
+                    "stats": stats,
                 })
             con.close()
 
@@ -953,7 +1244,6 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
             "describe_lines": [],
         }
 
-        # описание по конкретным номерам через vision
         if intents["figures"]["describe"]:
             try:
                 desc_text = vision_describe_figures(uid, doc_id, intents["figures"]["describe"])
@@ -971,7 +1261,6 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
         has_type = _table_has_columns(con, "chunks", ["element_type", "attrs"])
         items: list[str] = []
 
-        # 1) нормальные reference-чанки
         if has_type:
             cur.execute(
                 "SELECT text FROM chunks WHERE owner_id=? AND doc_id=? AND element_type='reference' ORDER BY id ASC",
@@ -979,7 +1268,6 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
             )
             items = [(r["text"] or "").strip() for r in cur.fetchall()]
 
-        # 2) расширенный фолбэк по секции (без обязательной нумерации)
         if not any(items):
             cur.execute(
                 """
@@ -1002,7 +1290,6 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
                 if t:
                     raw.append(t)
 
-            # дедуп и лёгкая нормализация
             seen = set()
             items = []
             for t in raw:
@@ -1031,19 +1318,42 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
             facts["summary_text"] = s
 
     # ----- Общий контекст / цитаты -----
+    # app/bot.py (_gather_facts: общий контекст / цитаты)
     if intents.get("general_question"):
         vb = verbatim_find(uid, doc_id, intents["general_question"], max_hits=3)
-        ctx = best_context(uid, doc_id, intents["general_question"], max_chars=6000)
+
+        # НОВОЕ: coverage-aware выборка под многопунктный вопрос
+        cov = retrieve_coverage(
+            owner_id=uid,
+            doc_id=doc_id,
+            question=intents["general_question"],
+            # per_item_k/prelim_factor/backfill_k — с разумными дефолтами из retrieval.py
+        )
+        ctx = ""
+        if cov and cov.get("snippets"):
+            ctx = build_context_coverage(
+                cov["snippets"],
+                items_count=len(cov.get("items") or []) or None,
+                # base_chars/per_item_bonus/hard_limit — дефолты из retrieval.py
+            )
+
+        # Фолбэк-ступени, если coverage-контекст не набрался
         if not ctx:
-            hits = retrieve(uid, doc_id, intents["general_question"], top_k=8)
+            ctx = best_context(uid, doc_id, intents["general_question"], max_chars=6000)
+        if not ctx:
+            hits = retrieve(uid, doc_id, intents["general_question"], top_k=12)  # было 8 → чуть шире
             if hits:
                 ctx = build_context(hits)
         if not ctx:
-            ctx = _first_chunks_context(uid, doc_id, n=10, max_chars=6000)
+            ctx = _first_chunks_context(uid, doc_id, n=12, max_chars=6000)
+
         if ctx:
             facts["general_ctx"] = ctx
         if vb:
             facts["verbatim_hits"] = vb
+        # (опционально) можно передать план подпунктов в facts — не ломает совместимость:
+        if cov and cov.get("items"):
+            facts["general_subitems"] = cov["items"]
 
     # логируем маленький срез фактов (без огромных текстов)
     log_snapshot = dict(facts)
@@ -1058,10 +1368,7 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
 # ------------------------------ FULLREAD: модель читает весь файл ------------------------------
 
 def _full_document_text(owner_id: int, doc_id: int, *, limit_chars: int | None = None) -> str:
-    """
-    Склеиваем ВЕСЬ текст из таблицы chunks, в исходном порядке (page ASC, id ASC).
-    Если указан limit_chars — обрезаем по лимиту.
-    """
+    """Склеиваем ВЕСЬ текст из chunks (page ASC, id ASC)."""
     con = get_conn()
     cur = con.cursor()
     cur.execute(
@@ -1089,18 +1396,16 @@ def _full_document_text(owner_id: int, doc_id: int, *, limit_chars: int | None =
 
 def _fullread_try_answer(uid: int, doc_id: int, q_text: str) -> str | None:
     """
-    Пытаемся полностью отдать документ модели (режим FULLREAD_MODE=direct).
-    Если документ слишком большой — возвращаем None (перейдём к стандартному RAG-пайплайну).
+    DIRECT: отдаём модели целиком весь текст документа как единый контекст.
+    Если документ слишком большой — возвращаем None (уйдём в иной режим).
     """
     if (Cfg.FULLREAD_MODE or "off") != "direct":
         return None
 
-    # Берём полный текст с верхним лимитом (на всякий случай)
     full_text = _full_document_text(uid, doc_id, limit_chars=Cfg.DIRECT_MAX_CHARS + 1)
     if not full_text.strip():
         return None
 
-    # Если не влезаем в лимит — уходим в обычный пайплайн
     if len(full_text) > Cfg.DIRECT_MAX_CHARS:
         return None
 
@@ -1111,21 +1416,136 @@ def _fullread_try_answer(uid: int, doc_id: int, q_text: str) -> str | None:
         "Цитируй короткими фрагментами при необходимости, без ссылок на страницы."
     )
 
-    # Передадим документ единой «assistant»-репликой (как контекст),
-    # затем вопрос пользователя — это проверенный паттерн и он уже применялся в summarizer.
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "assistant", "content": f"[Документ — полный текст]\n{full_text}"},
         {"role": "user", "content": q_text},
     ]
 
+    if STREAM_ENABLED and chat_with_gpt_stream is not None:
+        return ("__STREAM__", json.dumps(messages, ensure_ascii=False))
+
     try:
-        answer = chat_with_gpt(messages, temperature=0.2, max_tokens=900)
+        answer = chat_with_gpt(messages, temperature=0.2, max_tokens=FINAL_MAX_TOKENS)
         return (answer or "").strip() or None
     except Exception as e:
         logging.exception("fullread direct failed: %s", e)
         return None
 
+def _fullread_collect_sections(uid: int, doc_id: int, *, max_sections: int = 800) -> List[str]:
+    """
+    Секции для итеративного режима: собираем блоки текста по section_path в порядке следования.
+    """
+    con = get_conn()
+    cur = con.cursor()
+    cur.execute(
+        "SELECT section_path, text FROM chunks WHERE owner_id=? AND doc_id=? ORDER BY page ASC, id ASC",
+        (uid, doc_id)
+    )
+    rows = cur.fetchall() or []
+    con.close()
+
+    out: List[str] = []
+    cur_sec = None
+    buf: List[str] = []
+
+    def _flush():
+        if buf:
+            text = "\n".join([t for t in buf if t.strip()])
+            if text.strip():
+                out.append(text.strip())
+        buf.clear()
+
+    for r in rows:
+        sec = r["section_path"] or ""
+        t = (r["text"] or "").strip()
+        if not t:
+            continue
+        if cur_sec is None:
+            cur_sec = sec
+        if sec != cur_sec:
+            _flush()
+            cur_sec = sec
+        buf.append(t)
+        if len(out) >= max_sections:
+            break
+    _flush()
+    return out[:max_sections]
+
+def _group_for_steps(sections: Iterable[str], per_step_chars: int, max_steps: int) -> List[str]:
+    """Группируем секции в батчи по символам (для map-шага)."""
+    batches: List[str] = []
+    cur: List[str] = []
+    cur_len = 0
+    for s in sections:
+        if cur_len + len(s) + 1 > per_step_chars and cur:
+            batches.append("\n\n".join(cur))
+            cur, cur_len = [], 0
+            if len(batches) >= max_steps:
+                break
+        cur.append(s)
+        cur_len += len(s) + 1
+    if cur and len(batches) < max_steps:
+        batches.append("\n\n".join(cur))
+    return batches[:max_steps]
+
+def _map_extract(uid: int, doc_id: int, question: str, chunk_text: str, *, map_tokens: int) -> str:
+    """Один map-вызов: извлекаем только релевантные факты/цитаты из фрагмента."""
+    sys_map = (
+        "Ты ассистент-экстрактор. Тебе дан фрагмент диплома и вопрос. "
+        "Извлеки ТОЛЬКО факты и мини-цитаты, относящиеся к вопросу. "
+        "Формат: краткие буллеты (до 8), без новых данных. Никаких длинных пересказов."
+    )
+    return chat_with_gpt(
+        [
+            {"role": "system", "content": sys_map},
+            {"role": "assistant", "content": f"[Фрагмент документа]\n{chunk_text}"},
+            {"role": "user", "content": f"Вопрос: {question}\nСделай короткую выжимку (буллеты)."},
+        ],
+        temperature=0.1,
+        max_tokens=max(120, int(map_tokens)),
+    )
+
+def _iterative_fullread_build_messages(uid: int, doc_id: int, question: str) -> Tuple[Optional[list], Optional[str]]:
+    """
+    Собираем map-выжимки синхронно, возвращаем reduce-сообщения для стрима
+    ИЛИ итоговый ответ (если что-то пошло не так).
+    """
+    per_step = int(getattr(Cfg, "FULLREAD_STEP_CHARS", 14000))
+    max_steps = int(getattr(Cfg, "FULLREAD_MAX_STEPS", 2))
+    map_tokens = int(getattr(Cfg, "DIGEST_TOKENS_PER_SECTION", 300))
+    reduce_tokens = int(getattr(Cfg, "FINAL_MAX_TOKENS", 900))
+
+    sections = _fullread_collect_sections(uid, doc_id)
+    if not sections:
+        return None, "Не удалось прочитать документ секциями."
+
+    batches = _group_for_steps(sections, per_step_chars=per_step, max_steps=max_steps)
+    if not batches:
+        return None, "Не удалось сформировать шаги чтения документа."
+
+    digests: List[str] = []
+    for b in batches:
+        try:
+            digests.append(_map_extract(uid, doc_id, question, b, map_tokens=map_tokens))
+        except Exception as e:
+            logging.exception("map extract failed: %s", e)
+            digests.append(b[:800])
+
+    joined = "\n\n".join([f"[MAP {i+1}]\n{d}" for i, d in enumerate(digests)])
+    ctx = joined[: int(getattr(Cfg, "FULLREAD_CONTEXT_CHARS", 9000))]
+
+    sys_reduce = (
+        "Ты репетитор по ВКР. Ниже — короткие факты из разных частей документа (map-выжимки). "
+        "Собери из них связный ответ на вопрос. Не выдумывай новых цифр/таблиц. "
+        "Если данных не хватает — отдельной строкой перечисли, чего не хватает."
+    )
+    messages = [
+        {"role": "system", "content": sys_reduce},
+        {"role": "assistant", "content": f"Сводные факты из документа:\n{ctx}"},
+        {"role": "user", "content": question},
+    ]
+    return messages, None
 
 # ------------------------------ загрузка файла ------------------------------
 
@@ -1167,10 +1587,8 @@ async def handle_doc(m: types.Message):
             con.close()
 
             try:
-                # парсим и ОБОГАЩАЕМ перед индексом
                 sections = _parse_by_ext(path)
                 sections = enrich_sections(sections, doc_kind=os.path.splitext(path)[1].lower().strip("."))
-                # проверяем «пустой» уже после enrich
                 if sum(len(s.get("text") or "") for s in sections) < 500 and not any(
                     s.get("element_type") in ("table", "table_row", "figure") for s in sections
                 ):
@@ -1189,7 +1607,7 @@ async def handle_doc(m: types.Message):
                 return
 
             ACTIVE_DOC[uid] = existing_id
-            set_user_active_doc(uid, existing_id)  # ⬅️ персистентно
+            set_user_active_doc(uid, existing_id)
             caption = (m.caption or "").strip()
             await _send(m, f"Документ #{existing_id} переиндексирован. Готов отвечать.")
             if caption:
@@ -1198,7 +1616,7 @@ async def handle_doc(m: types.Message):
 
         con.close()
         ACTIVE_DOC[uid] = existing_id
-        set_user_active_doc(uid, existing_id)  # ⬅️ персистентно
+        set_user_active_doc(uid, existing_id)
         caption = (m.caption or "").strip()
         await _send(m, f"Этот файл уже загружен ранее как документ #{existing_id}. Использую его.")
         if caption:
@@ -1235,7 +1653,7 @@ async def handle_doc(m: types.Message):
     update_document_meta(doc_id, layout_profile=_current_embedding_profile())
 
     ACTIVE_DOC[uid] = doc_id
-    set_user_active_doc(uid, doc_id)  # ⬅️ персистентно
+    set_user_active_doc(uid, doc_id)
 
     caption = (m.caption or "").strip()
     if caption:
@@ -1254,31 +1672,136 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
         await _send(m, "Вопрос пустой. Напишите, что именно вас интересует по ВКР.")
         return
 
-    # Безопасность — всегда
     viol = safety_check(q_text)
     if viol:
         await _send(m, viol + " Задайте корректный вопрос по ВКР.")
         return
 
-    # ГОСТ-проверка по запросу
     if await _maybe_run_gost(m, uid, doc_id, q_text):
         return
 
-    # ====== NEW: режим, где модель читает ВЕСЬ файл (FULLREAD_MODE=direct) ======
+    # ====== FULLREAD: auto ======
+    mode = (Cfg.FULLREAD_MODE or "off")
+    if mode == "auto":
+        # пробуем дать модели ПОЛНЫЙ текст, если влазит
+        full_text = _full_document_text(uid, doc_id, limit_chars=Cfg.DIRECT_MAX_CHARS + 1)
+        if full_text and len(full_text) <= Cfg.DIRECT_MAX_CHARS:
+            system_prompt = (
+                "Ты ассистент по дипломным работам. Тебе дан ПОЛНЫЙ текст ВКР/документа.\n"
+                "Отвечай строго по этому тексту, без внешних фактов. Если данных недостаточно — скажи об этом.\n"
+                "Если вопрос про таблицы/рисунки — используй подписи и текст рядом; не придумывай номера/значения.\n"
+                "Цитируй короткими фрагментами при необходимости, без ссылок на страницы."
+            )
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "assistant", "content": f"[Документ — полный текст]\n{full_text}"},
+                {"role": "user", "content": q_text},
+            ]
+            if STREAM_ENABLED and chat_with_gpt_stream is not None:
+                try:
+                    stream = chat_with_gpt_stream(messages, temperature=0.2, max_tokens=FINAL_MAX_TOKENS)  # type: ignore
+                    await _stream_to_telegram(m, stream)
+                    return
+                except Exception as e:
+                    logging.exception("auto fullread stream failed: %s", e)
+            try:
+                ans = chat_with_gpt(messages, temperature=0.2, max_tokens=FINAL_MAX_TOKENS)
+                if ans:
+                    await _send(m, ans)
+                    return
+            except Exception as e:
+                logging.exception("auto fullread non-stream failed: %s", e)
+        else:
+            # документ большой → итеративное чтение (map→reduce)
+            messages, err = _iterative_fullread_build_messages(uid, doc_id, q_text)
+            if messages:
+                if STREAM_ENABLED and chat_with_gpt_stream is not None:
+                    try:
+                        stream = chat_with_gpt_stream(messages, temperature=0.2, max_tokens=FINAL_MAX_TOKENS)  # type: ignore
+                        await _stream_to_telegram(m, stream)
+                        return
+                    except Exception as e:
+                        logging.exception("auto iterative stream failed: %s", e)
+                try:
+                    ans = chat_with_gpt(messages, temperature=0.2, max_tokens=FINAL_MAX_TOKENS)
+                    if ans:
+                        await _send(m, ans)
+                        return
+                except Exception as e:
+                    logging.exception("auto iterative non-stream failed: %s", e)
+            elif err:
+                await _send(m, err)
+                return
+
+
+    # ====== FULLREAD: direct ======
     if (Cfg.FULLREAD_MODE or "off") == "direct":
-        fr_answer = _fullread_try_answer(uid, doc_id, q_text)
-        if fr_answer:
-            await _send(m, fr_answer)
+        fr = _fullread_try_answer(uid, doc_id, q_text)
+        if isinstance(fr, tuple) and fr and fr[0] == "__STREAM__":
+            messages = json.loads(fr[1])
+            try:
+                stream = chat_with_gpt_stream(messages, temperature=0.2, max_tokens=FINAL_MAX_TOKENS)  # type: ignore
+                await _stream_to_telegram(m, stream)
+                return
+            except Exception as e:
+                logging.exception("direct fullread stream failed: %s", e)
+                # тихо падаем в обычный пайплайн
+        elif isinstance(fr, str) and fr:
+            await _send(m, fr)
             return
-        # иначе тихо падаем в стандартный RAG/lexsearch
+        # иначе — RAG ниже
 
-    # Единый мульти-интент пайплайн (стандартный режим)
+    # ====== FULLREAD: iterative/digest ======
+    if (Cfg.FULLREAD_MODE or "off") in {"iterative", "digest"}:
+        messages, err = _iterative_fullread_build_messages(uid, doc_id, q_text)
+        if messages:
+            if STREAM_ENABLED and chat_with_gpt_stream is not None:
+                try:
+                    stream = chat_with_gpt_stream(messages, temperature=0.2, max_tokens=FINAL_MAX_TOKENS)  # type: ignore
+                    await _stream_to_telegram(m, stream)
+                    return
+                except Exception as e:
+                    logging.exception("iterative fullread stream failed: %s", e)
+            try:
+                ans = chat_with_gpt(messages, temperature=0.2, max_tokens=FINAL_MAX_TOKENS)
+                if ans:
+                    await _send(m, ans)
+                    return
+            except Exception as e:
+                logging.exception("iterative fullread non-stream failed: %s", e)
+        else:
+            if err:
+                await _send(m, err)
+                return
+        # если что-то не вышло — проваливаемся в стандартный режим ниже
+
+    # ====== Стандартный мульти-интент пайплайн (RAG) ======
     intents = detect_intents(q_text)
-
-    # >>> Самоисцеление индекса под запрос (если старый документ без figures/reference)
     await _ensure_modalities_indexed(m, uid, doc_id, intents)
-
     facts = _gather_facts(uid, doc_id, intents)
+
+    # ↓ НОВОЕ: если есть план подпунктов — включаем многошаговую подачу
+    discovered_items = facts.get("general_subitems") if isinstance(facts, dict) else None
+    try:
+        handled = await _run_multistep_answer(
+            m, uid, doc_id, q_text, discovered_items=discovered_items  # отправит A→B→… и вернёт True
+        )
+        if handled:
+            return
+    except Exception as e:
+        logging.exception("multistep pipeline failed, fallback to normal: %s", e)
+
+    # обычный путь
+    # app/bot.py
+    if STREAM_ENABLED and generate_answer_stream is not None:
+        try:
+            stream = generate_answer_stream(q_text, facts, language=intents.get("language", "ru"))
+            await _stream_to_telegram(m, stream)
+            return
+
+        except Exception as e:
+            logging.exception("stream answer failed, fallback to non-stream: %s", e)
+
     reply = generate_answer(q_text, facts, language=intents.get("language", "ru"))
     await _send(m, reply)
 

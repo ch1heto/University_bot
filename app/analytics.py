@@ -233,7 +233,7 @@ def _detect_header_and_make_matrix(rows_texts: List[str]) -> Tuple[List[str], Li
     if not raw_rows:
         return ([], [])
 
-    # Грубая эвристика: первая строка — заголовок, если она содержит <=10% числовых ячеек,
+    # Грубая эвристика: первая строка — заголовок, если она содержит <=25% числовых ячеек,
     # а следующая строка явно содержит числа.
     def frac_numeric(cells: List[str]) -> float:
         if not cells:
@@ -409,7 +409,10 @@ def analyze_table_by_num(uid: int,
                          doc_id: int,
                          number: str,
                          top_k: int = 5,
-                         lang: str = "ru") -> Dict[str, Any]:
+                         lang: str = "ru",
+                         *,
+                         rows_limit: Optional[int] = 10,
+                         include_all_values: bool = False) -> Dict[str, Any]:
     """
     Главная функция аналитики таблицы по номеру.
     Возвращает словарь:
@@ -420,7 +423,10 @@ def analyze_table_by_num(uid: int,
       "display": "Таблица 2.1 — ...",
       "where": {"page": int|None, "section_path": str|None},
       "headers": [str,...],
-      "rows_preview": [ [cell,...], ... ],   # до 10 строк
+      "rows_preview": [ [cell,...], ... ],   # по умолчанию до 10 строк (rows_limit)
+      "rows_all": [ [cell,...], ... ]        # (опц.) при include_all_values=True — вся таблица без усечения
+      "rows_count": int,                     # общее кол-во строк данных
+      "columns_count": int,                  # число колонок
       "numeric_summary": [
           { "col": "Название", "is_percent": bool, "count": int, "min": float|None, "max": float|None,
             "mean": float|None, "sum": float|None, "top": [ {"row": str, "value": float}, ... ] }
@@ -481,8 +487,79 @@ def analyze_table_by_num(uid: int,
             "top": top_rows,
         })
 
-    # Превью до 10 строк
-    preview = [row[:len(headers)] for row in matrix[:10]]
+    # Превью с лимитом строк (по умолчанию 10)
+    # Важно: это влияет только на превью, не на расчёты.
+    preview_limit = None if rows_limit is None or rows_limit < 0 else int(rows_limit)
+    rows_preview = matrix if preview_limit is None else matrix[:preview_limit]
+    rows_preview = [row[:len(headers)] for row in rows_preview]
+
+    result: Dict[str, Any] = {
+        "ok": True,
+        "error": None,
+        "num": num,
+        "display": display,
+        "where": {"page": page, "section_path": base},
+        "headers": headers,
+        "rows_preview": rows_preview,
+        "rows_count": len(matrix),
+        "columns_count": len(headers),
+        "numeric_summary": numeric_summary,
+        "text": text,
+    }
+
+    # При необходимости отдаём всю таблицу без усечения
+    if include_all_values:
+        result["rows_all"] = [row[:len(headers)] for row in matrix]
+
+    return result
+
+
+def extract_table_matrix_by_num(uid: int,
+                                doc_id: int,
+                                number: str) -> Dict[str, Any]:
+    """
+    Утилита для извлечения всей матрицы таблицы (без аналитики).
+    Возвращает:
+    {
+      "ok": bool,
+      "error": str|None,
+      "num": "2.1",
+      "display": "Таблица 2.1 — ...",
+      "where": {"page": int|None, "section_path": str|None},
+      "headers": [str,...],
+      "rows": [ [cell,...], ... ],
+      "rows_count": int,
+      "columns_count": int
+    }
+    """
+    num = _normalize_num(number)
+    if not num:
+        return {"ok": False, "error": "Не указан номер таблицы.", "num": number}
+
+    anchor = _find_table_anchor(uid, doc_id, num)
+    if not anchor:
+        return {"ok": False, "error": f"Таблица {number} не найдена.", "num": number}
+
+    page = anchor.get("page")
+    sec = anchor.get("section_path") or ""
+    base = _base_from_section(sec)
+
+    row_objs = _fetch_table_rows(uid, doc_id, base)
+    rows_texts = [r["text"] for r in row_objs]
+
+    # Для display можно попытаться собрать хвост из первой строки
+    first_row_text = None
+    if row_objs:
+        first_line = (row_objs[0]["text"] or "").split("\n")[0]
+        if first_line:
+            first_row_text = " — ".join([c.strip() for c in _split_cells(first_line) if c.strip()])
+
+    attrs_json = anchor.get("attrs")
+    if isinstance(attrs_json, dict):
+        attrs_json = json.dumps(attrs_json, ensure_ascii=False)
+    display = _compose_display_from_attrs(attrs_json, base, first_row_text)
+
+    headers, matrix = _detect_header_and_make_matrix(rows_texts)
 
     return {
         "ok": True,
@@ -491,7 +568,7 @@ def analyze_table_by_num(uid: int,
         "display": display,
         "where": {"page": page, "section_path": base},
         "headers": headers,
-        "rows_preview": preview,
-        "numeric_summary": numeric_summary,
-        "text": text,
+        "rows": [row[:len(headers)] for row in matrix],
+        "rows_count": len(matrix),
+        "columns_count": len(headers),
     }

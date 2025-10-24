@@ -167,7 +167,7 @@ def _query_signals(q: str) -> Dict[str, bool]:
     }
 
 # ---------------------------
-# Основной RAG-поиск
+# Базовые эмбеддинги
 # ---------------------------
 
 def _embed_query(query: str) -> Optional[np.ndarray]:
@@ -180,12 +180,64 @@ def _embed_query(query: str) -> Optional[np.ndarray]:
     except Exception:
         return None
 
-def retrieve(owner_id: int, doc_id: int, query: str, top_k: int = 8) -> List[Dict]:
+# ---------------------------
+# Внутренний скорер/ранжирование (переиспользуется)
+# ---------------------------
+
+def _mk_table_pattern(q: str) -> Optional[str]:
     """
-    Возвращает top-k чанков по косинусному сходству с вопросом (с лёгким переранжированием).
-    Каждый элемент: {id, page, section_path, text, score}.
+    Пытаемся вытащить номер таблицы из вопроса.
+    Поддерживаем формы:
+      - 'таблица 3.1', 'табл. 3,1'
+      - 'table 2.4'
+      - допускаем '№'
+      - допускаем буквенный префикс 'А.1' / 'П1.2'
+    Возвращаем паттерн regex или None.
     """
-    pack = _load_doc(owner_id, doc_id)
+    ql = (q or "")
+    m = re.search(r"(табл(?:ица)?|table)\s*(?:№\s*)?([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)", ql, re.IGNORECASE)
+    if not m:
+        return None
+    raw = m.group(2).strip()
+    raw = re.sub(r"\s+", " ", raw).replace(" ", "")
+    # Буквенный префикс?
+    if re.match(r"^[A-Za-zА-Яа-я]\d", raw):
+        letter = raw[0]
+        rest = raw[1:]
+        # экранируем, а затем превращаем '\.' в '[.,]'
+        rest_esc = re.escape(rest)
+        rest_pat = re.sub(r"\\\.", "[.,]", rest_esc)
+        pat_num = rf"{re.escape(letter)}\.?\s*{rest_pat}"
+    else:
+        pat_num = re.sub(r"\\\.", "[.,]", re.escape(raw))
+    return rf"(?:табл(?:ица)?|table)\s*\.?\s*(?:№\s*)?{pat_num}"
+
+def _mk_figure_pattern(q: str) -> Optional[str]:
+    """
+    Поиск 'рисунок 2.4' / 'рис. 2,4' / 'figure 3' / 'fig. 1' / 'рис. А.1'.
+    Возвращаем паттерн regex или None.
+    """
+    ql = (q or "")
+    m = re.search(r"(рис(?:унок)?|fig(?:ure)?\.?)\s*(?:№\s*)?([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)", ql, re.IGNORECASE)
+    if not m:
+        return None
+    raw = m.group(2).strip()
+    raw = re.sub(r"\s+", " ", raw).replace(" ", "")
+    if re.match(r"^[A-Za-zА-Яа-я]\d", raw):
+        letter = raw[0]
+        rest = raw[1:]
+        rest_esc = re.escape(rest)
+        rest_pat = re.sub(r"\\\.", "[.,]", rest_esc)
+        pat_num = rf"{re.escape(letter)}\.?\s*{rest_pat}"
+    else:
+        pat_num = re.sub(r"\\\.", "[.,]", re.escape(raw))
+    return rf"(?:рис(?:унок)?|fig(?:ure)?\.?)\s*\.?\s*(?:№\s*)?{pat_num}"
+
+def _score_and_rank(pack: dict, query: str, *, prelim_k: int = 48) -> List[Tuple[int, float]]:
+    """
+    Возвращает список индексов чанков и их скорингов, отсортированный по убыванию.
+    Используем в retrieve() и coverage-вариантах.
+    """
     if pack["mat"].shape[0] == 0:
         return []
 
@@ -198,17 +250,10 @@ def retrieve(owner_id: int, doc_id: int, query: str, top_k: int = 8) -> List[Dic
     if N == 0:
         return []
 
-    # Возьмём побольше кандидатов для переранжа
-    prelim_k = max(top_k * 3, top_k, 16)
-    prelim_k = min(prelim_k, N)
-    if prelim_k <= 0:
-        return []
-
-    # Быстрый выбор top-prelim_k без полного сортирования
+    prelim_k = max(min(prelim_k, N), 1)
     part_idx = np.argpartition(sims, -prelim_k)[-prelim_k:]
     idx = part_idx[np.argsort(-sims[part_idx])]
 
-    # Переранж: тип чанка/совпадения номеров/чисел
     sig = _query_signals(query)
     q_nums = _extract_numbers(query)
     tab_pat = _mk_table_pattern(query)
@@ -233,7 +278,6 @@ def retrieve(owner_id: int, doc_id: int, query: str, top_k: int = 8) -> List[Dic
             score += 0.06
         if sig["ask_sources"] and ctype == "reference":
             score += 0.35
-        # если источники не просили — пусть уходят вниз, но не исчезают полностью
         if (not sig["ask_sources"]) and ctype == "reference":
             score -= 0.12
 
@@ -260,9 +304,25 @@ def retrieve(owner_id: int, doc_id: int, query: str, top_k: int = 8) -> List[Dic
 
         rescored.append((int(i), score))
 
-    # Финальная сортировка по новым скорингам
     rescored.sort(key=lambda x: -x[1])
+    return rescored
 
+# ---------------------------
+# Основной RAG-поиск (backward-compatible)
+# ---------------------------
+
+def retrieve(owner_id: int, doc_id: int, query: str, top_k: int = 8) -> List[Dict]:
+    """
+    Возвращает top-k чанков по косинусному сходству с вопросом (с лёгким переранжированием).
+    Каждый элемент: {id, page, section_path, text, score}.
+    """
+    pack = _load_doc(owner_id, doc_id)
+    rescored = _score_and_rank(pack, query, prelim_k=max(top_k * 3, 16))
+    if not rescored:
+        return []
+
+    # Фильтр источников если их явно не просили
+    sig = _query_signals(query)
     filtered: List[Tuple[int, float]] = []
     for i, sc in rescored:
         if len(filtered) >= top_k:
@@ -270,7 +330,6 @@ def retrieve(owner_id: int, doc_id: int, query: str, top_k: int = 8) -> List[Dic
         if (not sig["ask_sources"]) and _chunk_type(pack["meta"][i]) == "reference":
             continue
         filtered.append((i, sc))
-
     best = (filtered or rescored)[:top_k]
 
     out: List[Dict] = []
@@ -319,57 +378,6 @@ def invalidate_cache(owner_id: int, doc_id: int):
 # ---------------------------
 # Keyword-fallback (опционально)
 # ---------------------------
-
-def _mk_table_pattern(q: str) -> Optional[str]:
-    """
-    Пытаемся вытащить номер таблицы из вопроса.
-    Поддерживаем формы:
-      - 'таблица 3.1', 'табл. 3,1'
-      - 'table 2.4'
-      - допускаем '№'
-      - допускаем буквенный префикс 'А.1' / 'П1.2'
-    Возвращаем паттерн regex или None.
-    """
-    ql = (q or "")
-    m = re.search(r"(табл(?:ица)?|table)\s*(?:№\s*)?([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)", ql, re.IGNORECASE)
-    if not m:
-        return None
-    raw = m.group(2).strip()
-    raw = re.sub(r"\s+", " ", raw).replace(" ", "")
-    # Буквенный префикс?
-    if re.match(r"^[A-Za-zА-Яа-я]\d", raw):
-        letter = raw[0]
-        rest = raw[1:]
-        # экранируем, а затем превращаем '\.' в '[.,]'
-        rest_esc = re.escape(rest)
-        rest_pat = re.sub(r"\\\.", "[.,]", rest_esc)
-        pat_num = rf"{re.escape(letter)}\.?\s*{rest_pat}"
-    else:
-        pat_num = re.sub(r"\\\.", "[.,]", re.escape(raw))
-    return rf"(?:табл(?:ица)?|table)\s*\.?\s*(?:№\s*)?{pat_num}"
-
-
-def _mk_figure_pattern(q: str) -> Optional[str]:
-    """
-    Поиск 'рисунок 2.4' / 'рис. 2,4' / 'figure 3' / 'fig. 1' / 'рис. А.1'.
-    Возвращаем паттерн regex или None.
-    """
-    ql = (q or "")
-    m = re.search(r"(рис(?:унок)?|fig(?:ure)?\.?)\s*(?:№\s*)?([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)", ql, re.IGNORECASE)
-    if not m:
-        return None
-    raw = m.group(2).strip()
-    raw = re.sub(r"\s+", " ", raw).replace(" ", "")
-    if re.match(r"^[A-Za-zА-Яа-я]\d", raw):
-        letter = raw[0]
-        rest = raw[1:]
-        rest_esc = re.escape(rest)
-        rest_pat = re.sub(r"\\\.", "[.,]", rest_esc)
-        pat_num = rf"{re.escape(letter)}\.?\s*{rest_pat}"
-    else:
-        pat_num = re.sub(r"\\\.", "[.,]", re.escape(raw))
-    return rf"(?:рис(?:унок)?|fig(?:ure)?\.?)\s*\.?\s*(?:№\s*)?{pat_num}"
-
 
 def keyword_find(owner_id: int, doc_id: int, pattern: str, max_hits: int = 3) -> List[Dict]:
     """
@@ -636,7 +644,7 @@ def describe_figures_by_numbers(
         highlights: List[str] = []
         for rr in rows:
             t = (rr["text"] or "").strip()
-            # чистим возможный префикс "[Рисунок] ..."
+            # чистим возможный префикс "[Рисунок] ..."`
             t = re.sub(r"^\[\s*Рисунок\s*\]\s*", "", t, flags=re.IGNORECASE)
             if t:
                 highlights.append(_shorten(t, 200))
@@ -676,3 +684,464 @@ def describe_figures_by_numbers(
 
     con.close()
     return cards
+
+# =======================================================================
+#        НОВОЕ: Таблицы — поиск/раскрытие и «все значения»
+# =======================================================================
+
+# «Таблица 2.1 — ...», «Table A.1 — ...»
+_TABLE_TITLE_RE = re.compile(
+    r"(?i)\b(?:табл(?:ица)?|table)\s+([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)\b(?:\s*[—\-–:]\s*(.+))?"
+)
+_ROW_TAG_RE = re.compile(r"\[\s*row\s+(\d+)\s*\]", re.IGNORECASE)
+
+def _num_norm(s: str | None) -> str:
+    s = (s or "").strip()
+    s = s.replace(" ", "").replace(",", ".")
+    return s
+
+def _table_base_from_section(section_path: str) -> str:
+    """Убираем хвост ' [row k]' если присутствует."""
+    if not section_path:
+        return ""
+    pos = section_path.lower().find(" [row ")
+    return section_path if pos < 0 else section_path[:pos]
+
+def _parse_table_title(text: str) -> Tuple[Optional[str], Optional[str]]:
+    t = (text or "").strip()
+    m = _TABLE_TITLE_RE.search(t)
+    if not m:
+        return (None, None)
+    num = _num_norm(m.group(1))
+    title = (m.group(2) or "").strip() or None
+    return (num or None, title)
+
+def _extract_table_numbers_from_query(q: str) -> List[str]:
+    out: List[str] = []
+    for m in re.finditer(r"(?:табл(?:ица)?|table)\s*(?:№\s*)?([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)", q or "", re.IGNORECASE):
+        out.append(_num_norm(m.group(1)))
+    return [x for x in out if x]
+
+def _extract_figure_numbers_from_query(q: str) -> List[str]:
+    out: List[str] = []
+    for m in re.finditer(r"(?:рис(?:унок)?|fig(?:ure)?\.?)\s*(?:№\s*)?([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)", q or "", re.IGNORECASE):
+        out.append(_num_norm(m.group(1)))
+    return [x for x in out if x]
+
+_ALL_VALUES_HINT = re.compile(
+    r"(все|всю|полные|полный|целиком|полностью)\s+(значени|строк|столбц|данн|таблиц)|all\s+values|entire\s+table|full\s+table",
+    re.IGNORECASE
+)
+
+def _wants_all_values(ask: str) -> bool:
+    return bool(_ALL_VALUES_HINT.search(ask or ""))
+
+def _find_table_bases_by_number(pack: dict, num: str) -> List[str]:
+    """
+    Ищем секции таблиц по номеру:
+      - по attrs.caption_num/label,
+      - по вхождению 'Таблица N' в section_path/text.
+    Возвращаем список базовых section_path (без [row k]).
+    """
+    bases: List[str] = []
+    needle = _num_norm(num)
+    for m in pack["meta"]:
+        et = _chunk_type(m)
+        if et not in {"table", "table_row"}:
+            continue
+        attrs = m.get("attrs") or {}
+        cand = _num_norm(str(attrs.get("caption_num") or attrs.get("label") or ""))
+        if cand and cand == needle:
+            base = _table_base_from_section(m.get("section_path") or "")
+            if base and base not in bases:
+                bases.append(base)
+            continue
+        # fallback по тексту/пути
+        sp = (m.get("section_path") or "")
+        tx = (m.get("text") or "")
+        if re.search(rf"(?i)\bтаблица\s+{re.escape(needle)}\b", sp) or re.search(rf"(?i)\bтаблица\s+{re.escape(needle)}\b", tx):
+            base = _table_base_from_section(sp)
+            if base and base not in bases:
+                bases.append(base)
+    return bases
+
+def _row_index(section_path: str) -> int:
+    m = _ROW_TAG_RE.search(section_path or "")
+    try:
+        return int(m.group(1)) if m else 10**9
+    except Exception:
+        return 10**9
+
+def _gather_table_chunks_for_base(pack: dict, base: str, *, include_header: bool = True, row_limit: Optional[int] = None) -> List[Dict]:
+    """
+    Собираем чанк заголовка таблицы (если есть) и все её строки (table_row) по base.
+    Возвращаем элементы в формате retrieve(): {id, page, section_path, text, score}
+    """
+    rows: List[Dict] = []
+    header: Optional[Dict] = None
+
+    for m in pack["meta"]:
+        sp = (m.get("section_path") or "")
+        if not sp:
+            continue
+        if _table_base_from_section(sp) != base:
+            continue
+        et = _chunk_type(m)
+        item = {
+            "id": m["id"],
+            "page": m["page"],
+            "section_path": sp,
+            "text": (m.get("text") or "").strip(),
+            "score": 0.9 if et == "table" else 0.85
+        }
+        if et == "table":
+            if include_header and not header:
+                header = item
+        elif et == "table_row" or "[row " in sp.lower():
+            rows.append(item)
+
+    rows.sort(key=lambda x: _row_index(x.get("section_path") or ""))
+
+    if row_limit is not None and row_limit >= 0:
+        rows = rows[:row_limit]
+
+    out: List[Dict] = []
+    if include_header and header:
+        out.append(header)
+    out.extend(rows)
+    return out
+
+def _inject_special_sources_for_item(pack: dict, ask: str, used_ids: set[int]) -> List[Dict]:
+    """
+    Если подпункт явно ссылается на «Таблица N» / «Рисунок N», добавляем соответствующие
+    источники (включая все строки таблицы при «дай все значения»).
+    """
+    added: List[Dict] = []
+
+    # Таблицы
+    table_nums = _extract_table_numbers_from_query(ask)
+    want_all = _wants_all_values(ask)
+    for num in table_nums:
+        bases = _find_table_bases_by_number(pack, num)
+        for base in bases:
+            chunks = _gather_table_chunks_for_base(pack, base, include_header=True, row_limit=(None if want_all else 8))
+            for ch in chunks:
+                if ch["id"] in used_ids:
+                    continue
+                ch["for_item"] = None  # будет выставлено выше по месту использования
+                added.append(ch)
+                used_ids.add(ch["id"])
+
+    # Рисунки: берём все чанки этой секции (обычно один-три), чтобы было описание + подпись
+    fig_nums = _extract_figure_numbers_from_query(ask)
+    if fig_nums:
+        for num in fig_nums:
+            for m in pack["meta"]:
+                if _chunk_type(m) != "figure":
+                    continue
+                sp = m.get("section_path") or ""
+                tx = m.get("text") or ""
+                # распознаём номер из tail'а
+                tail = _last_segment(sp)
+                n_p, _ = _parse_figure_title(tail)
+                if _num_norm(n_p) != _num_norm(num) and not re.search(rf"(?i)\bрисунок\s+{re.escape(_num_norm(num))}\b", tx):
+                    continue
+                # добавляем все чанки этой секции (на случай, если текст разбит)
+                sec = sp
+                for mm in pack["meta"]:
+                    if (mm.get("section_path") or "") == sec:
+                        ch = {
+                            "id": mm["id"],
+                            "page": mm["page"],
+                            "section_path": mm["section_path"],
+                            "text": (mm.get("text") or "").strip(),
+                            "score": 0.88
+                        }
+                        if ch["id"] in used_ids:
+                            continue
+                        ch["for_item"] = None
+                        added.append(ch)
+                        used_ids.add(ch["id"])
+    return added
+
+# =======================================================================
+#        НОВОЕ: Coverage-aware извлечение под многопунктные вопросы
+#               с интеграцией таблиц/рисунков
+# =======================================================================
+
+# Эвристики распознавания подпунктов (совпадают с ace-планировщиком по смыслу)
+_ENUM_LINE = re.compile(r"(?m)^\s*(?:\d+[).\)]|[-—•])\s+")
+_ENUM_INLINE = re.compile(r"(?:\s|^)\(?\d{1,2}[)\.]\s+")
+
+def plan_subitems(question: str, *, min_items: int = 2, max_items: int = 12) -> List[str]:
+    """
+    Пытаемся вытащить подпункты из длинного вопроса:
+      - маркеры в начале строк (1. … / • …);
+      - inline-формат «1) 2) 3) …»;
+      - разделение по ';' как крайний случай.
+    Возвращаем список коротких формулировок.
+    """
+    q = (question or "").strip()
+    items: List[str] = []
+
+    # 1) построчно с маркерами
+    if _ENUM_LINE.search(q):
+        for line in q.splitlines():
+            if _ENUM_LINE.match(line):
+                items.append(re.sub(r"^\s*(?:\d+[).\)]|[-—•])\s+", "", line).strip())
+
+    # 2) inline «1) 2) 3)»
+    if not items and _ENUM_INLINE.search(q):
+        buf, cur = [], None
+        for token in re.finditer(r"\(?\d{1,2}[)\.]\s+|[^()]+", q):
+            s = token.group(0)
+            if re.fullmatch(r"\(?\d{1,2}[)\.]\s+", s):
+                if cur:
+                    items.append(cur.strip())
+                cur = ""
+            else:
+                cur = (cur or "") + s
+        if cur:
+            items.append(cur.strip())
+
+    # 3) по ';'
+    if not items and q.count(";") >= 2:
+        items = [p.strip() for p in q.split(";") if p.strip()]
+
+    # чистка
+    items = [re.sub(r"\s+", " ", it).strip(" .;—-") for it in items if it and len(it.strip()) >= 2]
+    if len(items) < min_items:
+        return []
+    return items[:max_items]
+
+def retrieve_for_items(
+    owner_id: int,
+    doc_id: int,
+    items: List[str],
+    *,
+    per_item_k: int = 2,
+    prelim_factor: int = 4,
+    avoid_refs_when_not_asked: bool = True,
+    overall_backfill_from_query: Optional[str] = None,
+    backfill_k: int = 4,
+) -> Dict[str, List[Dict]]:
+    """
+    Для каждого подпункта возвращаем до per_item_k релевантных чанков.
+    Опционально добираем несколько общих чанков для «связности».
+    Возвращает словарь id->список чанков (каждый чанк как в retrieve()).
+    """
+    if not items:
+        return {}
+
+    pack = _load_doc(owner_id, doc_id)
+    by_id: Dict[str, List[Dict]] = {}
+    used_ids: set[int] = set()
+
+    for idx, ask in enumerate(items, start=1):
+        # 0) Сначала — специальные источники: таблицы/рисунки, если явно упомянуты
+        special = _inject_special_sources_for_item(pack, ask, used_ids)
+        for sp in special:
+            sp["for_item"] = str(idx)
+        picked: List[Dict] = list(special)
+
+        # 1) Затем обычный семантический поиск
+        rescored = _score_and_rank(pack, ask, prelim_k=max(per_item_k * prelim_factor, 16))
+        for i, sc in rescored:
+            m = pack["meta"][int(i)]
+            if m["id"] in used_ids:
+                continue
+            if avoid_refs_when_not_asked and _chunk_type(m) == "reference":
+                # пропускаем источники, если подпункт явно не про них
+                if not re.search(r"\b(источник|литератур|reference|bibliograph)\w*\b", ask.lower()):
+                    continue
+            picked.append(
+                {
+                    "id": m["id"],
+                    "page": m["page"],
+                    "section_path": m["section_path"],
+                    "text": (m["text"] or "").strip(),
+                    "score": float(sc),
+                    "for_item": str(idx),
+                }
+            )
+            used_ids.add(m["id"])
+            # ВНИМАНИЕ: не обрезаем по per_item_k здесь — пусть bucket содержит всё полезное.
+            # Итоговое сечение пойдёт на этапе merge в retrieve_coverage.
+
+        by_id[str(idx)] = picked
+
+    # Дополнительная «склейка» общим контекстом из исходного вопроса — backfill
+    if overall_backfill_from_query:
+        rescored_q = _score_and_rank(pack, overall_backfill_from_query, prelim_k=max(backfill_k * 3, 16))
+        extra = []
+        for i, sc in rescored_q:
+            m = pack["meta"][int(i)]
+            if m["id"] in used_ids:
+                continue
+            # мягко избегаем reference
+            if _chunk_type(m) == "reference":
+                continue
+            extra.append(
+                {
+                    "id": m["id"],
+                    "page": m["page"],
+                    "section_path": m["section_path"],
+                    "text": (m["text"] or "").strip(),
+                    "score": float(sc),
+                    "for_item": None,
+                }
+            )
+            used_ids.add(m["id"])
+            if len(extra) >= backfill_k:
+                break
+        if extra:
+            by_id["_backfill"] = extra
+
+    return by_id
+
+def retrieve_coverage(
+    owner_id: int,
+    doc_id: int,
+    question: str,
+    subitems: Optional[List[str]] = None,
+    *,
+    per_item_k: int = 2,
+    prelim_factor: int = 4,
+    backfill_k: int = 4,
+) -> Dict[str, Any]:
+    """
+    Coverage-aware выборка под многопунктный вопрос.
+    Если subitems не переданы — попытаемся извлечь их из вопроса.
+    Возвращает:
+      {
+        "items": ["…", "…", ...],                 # подпункты (может быть пусто)
+        "by_item": {"1":[...], "2":[...], ...},   # чанки по подпунктам (как в retrieve), поле for_item у чанка
+        "snippets": [...],                        # все чанки в одном списке, упорядоченные round-robin (+добавки для «все значения»)
+      }
+    """
+    items = list(subitems or plan_subitems(question)) if (subitems or question) else []
+    by_item = {}
+    if items:
+        by_item = retrieve_for_items(
+            owner_id,
+            doc_id,
+            items,
+            per_item_k=per_item_k,
+            prelim_factor=prelim_factor,
+            overall_backfill_from_query=question,
+            backfill_k=backfill_k,
+        )
+        # round-robin порядок: 1-й из каждого подпункта, затем 2-й
+        buckets = [by_item.get(str(i + 1), []) for i in range(len(items))]
+        merged: List[Dict] = []
+        for r in range(per_item_k):
+            for b in buckets:
+                if r < len(b):
+                    merged.append(b[r])
+
+        # Для подпунктов вида «дай все значения» — добавляем ОСТАЛЬНЫЕ строчки их bucket
+        for i, ask in enumerate(items, start=1):
+            if _wants_all_values(ask):
+                bucket = by_item.get(str(i), [])
+                # уже добавлены первые per_item_k, доклеим остаток
+                if len(bucket) > per_item_k:
+                    merged.extend(bucket[per_item_k:])
+
+        # добавим backfill в конце
+        if by_item.get("_backfill"):
+            merged.extend(by_item["_backfill"])
+        return {"items": items, "by_item": by_item, "snippets": merged}
+
+    # Если подпункты не распознаны — обычный retrieve с небольшим расширением k
+    base = retrieve(owner_id, doc_id, question, top_k=max(10, backfill_k * 2))
+    return {"items": [], "by_item": {"_single": base}, "snippets": base}
+
+def build_context_coverage(
+    snippets: List[Dict],
+    * ,
+    items_count: Optional[int] = None,
+    base_chars: int = 6000,
+    per_item_bonus: int = 900,
+    hard_limit: int = 18000,
+) -> str:
+    """
+    Адаптивная сборка контекста под многопунктные вопросы:
+      - итоговый лимит = base_chars + per_item_bonus*(items_count-1), но не больше hard_limit;
+      - тексты склеиваются в round-robin порядке по подпунктам (если есть for_item),
+        чтобы каждый подпункт появился в начале контекста хотя бы раз.
+      - удаляются дубликаты (по id/section_path/тексту).
+    """
+    if not snippets:
+        return ""
+
+    # Считаем количество подпунктов из меток for_item, если явно не задано
+    if items_count is None:
+        items_count = len({s.get("for_item") for s in snippets if s.get("for_item")}) or 1
+
+    max_chars = min(hard_limit, int(base_chars + max(0, items_count - 1) * per_item_bonus))
+
+    # Группировка по подпунктам
+    groups: Dict[str, List[Dict]] = {}
+    extras: List[Dict] = []
+    for s in snippets:
+        fid = s.get("for_item")
+        if fid:
+            groups.setdefault(str(fid), []).append(s)
+        else:
+            extras.append(s)
+
+    # round-robin
+    ordered: List[Dict] = []
+    if groups:
+        # выровняем порядок ключей групп по возрастанию
+        keys = sorted(groups.keys(), key=lambda x: (len(x), x))
+        round_idx = 0
+        more = True
+        while more:
+            more = False
+            for k in keys:
+                bucket = groups.get(k, [])
+                if round_idx < len(bucket):
+                    ordered.append(bucket[round_idx])
+                    more = True
+            round_idx += 1
+        # extras в конце
+        ordered.extend(extras)
+    else:
+        ordered = snippets[:]
+
+    # дедуп по id/section_path/тексту
+    seen_ids: set[int] = set()
+    seen_keys: set[str] = set()
+    parts: List[str] = []
+    total = 0
+    for s in ordered:
+        sid = s.get("id")
+        spath = (s.get("section_path") or "").strip()
+        raw = (s.get("text") or "")
+        block = _clean_for_ctx(raw)
+        if not block:
+            continue
+
+        k = f"{sid or 0}|{spath}|{hash(block)}"
+        if sid and sid in seen_ids:
+            continue
+        if k in seen_keys:
+            continue
+
+        if total + len(block) > max_chars:
+            remaining = max_chars - total
+            if remaining <= 0:
+                break
+            block = block[:remaining]
+
+        parts.append(block)
+        total += len(block)
+        if sid:
+            seen_ids.add(sid)
+        seen_keys.add(k)
+
+        if total >= max_chars:
+            break
+
+    return "\n\n".join(parts)
