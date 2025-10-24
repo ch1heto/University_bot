@@ -60,8 +60,13 @@ def _load_doc(owner_id: int, doc_id: int) -> dict:
 
     meta, vecs = [], []
     for r in rows:
-        if has_ext:
-            et = (r["element_type"] or "").lower() if "element_type" in r.keys() else ""
+        emb = r["embedding"]
+        if emb is None:
+            # Пропускаем пустые эмбеддинги, чтобы не ломать размер матрицы
+            continue
+
+        if "element_type" in r.keys():
+            et = (r["element_type"] or "").lower()
             attrs_raw = r["attrs"] if "attrs" in r.keys() else None
             try:
                 attrs = json.loads(attrs_raw) if attrs_raw else {}
@@ -77,8 +82,6 @@ def _load_doc(owner_id: int, doc_id: int) -> dict:
                     "attrs": attrs,
                 }
             )
-            emb = r["embedding"]
-            vecs.append(np.frombuffer(emb, dtype=np.float32))
         else:
             meta.append(
                 {
@@ -86,13 +89,16 @@ def _load_doc(owner_id: int, doc_id: int) -> dict:
                     "page": r["page"],
                     "section_path": r["section_path"],
                     "text": r["text"],
-                    # полей нет в схеме — оставим пустыми
                     "element_type": "",
                     "attrs": {},
                 }
             )
-            emb = r["embedding"]
-            vecs.append(np.frombuffer(emb, dtype=np.float32))
+        vecs.append(np.frombuffer(emb, dtype=np.float32))
+
+    if not vecs:
+        pack = {"mat": np.zeros((0, 1), np.float32), "meta": []}
+        _DOC_CACHE[key] = pack
+        return pack
 
     # Сшиваем и нормируем L2
     mat = np.vstack(vecs).astype(np.float32, copy=False)  # [N, D]
@@ -195,7 +201,7 @@ def _mk_table_pattern(q: str) -> Optional[str]:
     Возвращаем паттерн regex или None.
     """
     ql = (q or "")
-    m = re.search(r"(табл(?:ица)?|table)\s*(?:№\s*)?([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)", ql, re.IGNORECASE)
+    m = re.search(r"(табл(?:ица)?|table)\s*(?:№\s*|no\.?\s*|номер\s*)?([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)", ql, re.IGNORECASE)
     if not m:
         return None
     raw = m.group(2).strip()
@@ -210,7 +216,7 @@ def _mk_table_pattern(q: str) -> Optional[str]:
         pat_num = rf"{re.escape(letter)}\.?\s*{rest_pat}"
     else:
         pat_num = re.sub(r"\\\.", "[.,]", re.escape(raw))
-    return rf"(?:табл(?:ица)?|table)\s*\.?\s*(?:№\s*)?{pat_num}"
+    return rf"(?:табл(?:ица)?|table)\s*\.?\s*(?:№\s*|no\.?\s*|номер\s*)?{pat_num}"
 
 def _mk_figure_pattern(q: str) -> Optional[str]:
     """
@@ -218,7 +224,7 @@ def _mk_figure_pattern(q: str) -> Optional[str]:
     Возвращаем паттерн regex или None.
     """
     ql = (q or "")
-    m = re.search(r"(рис(?:унок)?|fig(?:ure)?\.?)\s*(?:№\s*)?([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)", ql, re.IGNORECASE)
+    m = re.search(r"(рис(?:унок)?|fig(?:ure)?\.?)\s*(?:№\s*|no\.?\s*|номер\s*)?([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)", ql, re.IGNORECASE)
     if not m:
         return None
     raw = m.group(2).strip()
@@ -231,7 +237,7 @@ def _mk_figure_pattern(q: str) -> Optional[str]:
         pat_num = rf"{re.escape(letter)}\.?\s*{rest_pat}"
     else:
         pat_num = re.sub(r"\\\.", "[.,]", re.escape(raw))
-    return rf"(?:рис(?:унок)?|fig(?:ure)?\.?)\s*\.?\s*(?:№\s*)?{pat_num}"
+    return rf"(?:рис(?:унок)?|fig(?:ure)?\.?)\s*\.?\s*(?:№\s*|no\.?\s*|номер\s*)?{pat_num}"
 
 def _score_and_rank(pack: dict, query: str, *, prelim_k: int = 48) -> List[Tuple[int, float]]:
     """
@@ -474,11 +480,12 @@ def _distinct_figure_basenames(uid: int, doc_id: int) -> List[str]:
             """
             SELECT DISTINCT section_path
             FROM chunks
-            WHERE owner_id=? AND doc_id=? AND text LIKE '[Рисунок]%%'
+            WHERE owner_id=? AND doc_id=? AND (text LIKE '[Рисунок]%%' OR text LIKE '[Figure]%%')
             ORDER BY section_path ASC
             """,
             (uid, doc_id),
         )
+
     rows = cur.fetchall()
     con.close()
     return [r["section_path"] for r in rows if r["section_path"]]
@@ -495,7 +502,6 @@ def list_figures(uid: int, doc_id: int, limit: int = 25) -> Dict[str, object]:
     bases = _distinct_figure_basenames(uid, doc_id)
     items: List[str] = []
     for base in bases:
-        # пробуем извлечь номер/хвост из хвоста section_path
         tail = _last_segment(base)
         num, title = _parse_figure_title(tail)
         if num and title:
@@ -549,23 +555,9 @@ def describe_figures_by_numbers(
     lang: str = "ru",
     vision_first_image_only: bool = True,
 ) -> List[Dict[str, Any]]:
-    """
-    Возвращает карточки по явным номерам «рисунков».
-
-    Формат одной карточки:
-      {
-        "num": "2.3",
-        "display": "Рисунок 2.3 — Название",
-        "where": {"page": 7, "section_path": ".../Рисунок 2.3 — Название"},
-        "images": ["/uploads/.."],
-        "highlights": ["краткая строка контекста", ...],
-        "vision": {"description": "...", "tags": [...] }  # если use_vision и есть изображение
-      }
-    """
     if not numbers:
         return []
 
-    # нормализуем N,M → N.M
     want = sorted({str(n).replace(",", ".").strip() for n in numbers if n and str(n).strip()})
     con = get_conn()
     cur = con.cursor()
@@ -574,38 +566,59 @@ def describe_figures_by_numbers(
     has_ext = _table_has_columns(con, "chunks", ["element_type", "attrs"])
 
     for num in want:
-        # 1) ищем по element_type='figure' и секции с нужным номером
         found = None
+
+        # 1) точное совпадение номера в attrs (caption_num/label)
         if has_ext:
+            like1 = f'%\"caption_num\": \"{num}\"%'
+            like2 = f'%\"label\": \"{num}\"%'
+            cur.execute(
+                """
+                SELECT page, section_path, text, attrs
+                FROM chunks
+                WHERE owner_id=? AND doc_id=? AND element_type='figure'
+                  AND (attrs LIKE ? OR attrs LIKE ?)
+                ORDER BY id ASC LIMIT 1
+                """,
+                (uid, doc_id, like1, like2),
+            )
+            found = cur.fetchone()
+
+        # 2) fallback: по подписям/пути (RU/EN)
+        if not found and has_ext:
             cur.execute(
                 """
                 SELECT page, section_path, text, attrs
                 FROM chunks
                 WHERE owner_id=? AND doc_id=? AND element_type='figure'
                   AND (section_path LIKE ? COLLATE NOCASE
+                       OR text LIKE ? COLLATE NOCASE
+                       OR section_path LIKE ? COLLATE NOCASE
                        OR text LIKE ? COLLATE NOCASE)
                 ORDER BY id ASC LIMIT 1
                 """,
-                (uid, doc_id, f"%Рисунок {num}%", f"%Рисунок {num}%"),
+                (uid, doc_id, f"%Рисунок {num}%", f"%Рисунок {num}%", f"%Figure {num}%", f"%Figure {num}%"),
             )
             found = cur.fetchone()
-        # 2) fallback для старых индексов — по тексту
+
+        # 3) самый старый fallback для индексов без element_type='figure'
         if not found:
             sel = "SELECT page, section_path, text" + (", attrs" if has_ext else "")
             cur.execute(
                 f"""
                 {sel}
                 FROM chunks
-                WHERE owner_id=? AND doc_id=? AND (text LIKE '[Рисунок]%%' OR section_path LIKE '%%Рисунок %%')
-                  AND (section_path LIKE ? COLLATE NOCASE OR text LIKE ? COLLATE NOCASE)
+                WHERE owner_id=? AND doc_id=? AND (text LIKE '[Рисунок]%%' OR text LIKE '[Figure]%%'
+                                                   OR section_path LIKE '%%Рисунок %%' OR section_path LIKE '%%Figure %%')
+                  AND (section_path LIKE ? COLLATE NOCASE OR text LIKE ? COLLATE NOCASE
+                       OR section_path LIKE ? COLLATE NOCASE OR text LIKE ? COLLATE NOCASE)
                 ORDER BY id ASC LIMIT 1
                 """,
-                (uid, doc_id, f"%Рисунок {num}%", f"%Рисунок {num}%"),
+                (uid, doc_id, f"%Рисунок {num}%", f"%Рисунок {num}%", f"%Figure {num}%", f"%Figure {num}%"),
             )
             found = cur.fetchone()
 
         if not found:
-            # не нашли — пропускаем номер
             continue
 
         page = found["page"]
@@ -614,7 +627,7 @@ def describe_figures_by_numbers(
         n_p, title_p = _parse_figure_title(tail)
         display = f"Рисунок {n_p or num}" + (f" — {title_p}" if title_p else "")
 
-        # 2a) извлекаем images из attrs найденного чанка + по всей секции
+        # 2a) изображения из attrs + добор по секции
         images: List[str] = []
         if has_ext and "attrs" in found.keys() and found["attrs"]:
             try:
@@ -625,13 +638,11 @@ def describe_figures_by_numbers(
                         images.append(p)
             except Exception:
                 pass
-        # добираем изображения из других чанков этой же секции (если есть)
-        images_extra = _collect_images_for_section(cur, uid, doc_id, sec)
-        for p in images_extra:
+        for p in _collect_images_for_section(cur, uid, doc_id, sec):
             if p not in images:
                 images.append(p)
 
-        # 3) собираем 1–2 ближайших текстовых кусочка как «highlights»
+        # 3) 1–2 ближайших текстовых кусочка
         cur.execute(
             """
             SELECT text FROM chunks
@@ -644,11 +655,9 @@ def describe_figures_by_numbers(
         highlights: List[str] = []
         for rr in rows:
             t = (rr["text"] or "").strip()
-            # чистим возможный префикс "[Рисунок] ..."`
             t = re.sub(r"^\[\s*Рисунок\s*\]\s*", "", t, flags=re.IGNORECASE)
             if t:
                 highlights.append(_shorten(t, 200))
-        # дополнительно, если пусто — берём любой соседний чанк из той же страницы
         if not highlights:
             cur.execute(
                 """
@@ -677,7 +686,6 @@ def describe_figures_by_numbers(
                 vision = vision_describe(img_for_vision, lang=lang)
                 card["vision"] = vision
             except Exception:
-                # мягкая деградация
                 card["vision"] = {"description": "описание изображения недоступно.", "tags": []}
 
         cards.append(card)
@@ -718,13 +726,13 @@ def _parse_table_title(text: str) -> Tuple[Optional[str], Optional[str]]:
 
 def _extract_table_numbers_from_query(q: str) -> List[str]:
     out: List[str] = []
-    for m in re.finditer(r"(?:табл(?:ица)?|table)\s*(?:№\s*)?([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)", q or "", re.IGNORECASE):
+    for m in re.finditer(r"(?:табл(?:ица)?|table)\s*(?:№\s*|no\.?\s*|номер\s*)?([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)", q or "", re.IGNORECASE):
         out.append(_num_norm(m.group(1)))
     return [x for x in out if x]
 
 def _extract_figure_numbers_from_query(q: str) -> List[str]:
     out: List[str] = []
-    for m in re.finditer(r"(?:рис(?:унок)?|fig(?:ure)?\.?)\s*(?:№\s*)?([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)", q or "", re.IGNORECASE):
+    for m in re.finditer(r"(?:рис(?:унок)?|fig(?:ure)?\.?)\s*(?:№\s*|no\.?\s*|номер\s*)?([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)", q or "", re.IGNORECASE):
         out.append(_num_norm(m.group(1)))
     return [x for x in out if x]
 
@@ -740,7 +748,7 @@ def _find_table_bases_by_number(pack: dict, num: str) -> List[str]:
     """
     Ищем секции таблиц по номеру:
       - по attrs.caption_num/label,
-      - по вхождению 'Таблица N' в section_path/text.
+      - по вхождению 'Таблица N' / 'Table N' в section_path/text.
     Возвращаем список базовых section_path (без [row k]).
     """
     bases: List[str] = []
@@ -756,10 +764,13 @@ def _find_table_bases_by_number(pack: dict, num: str) -> List[str]:
             if base and base not in bases:
                 bases.append(base)
             continue
-        # fallback по тексту/пути
+        # fallback по тексту/пути (RU/EN)
         sp = (m.get("section_path") or "")
         tx = (m.get("text") or "")
-        if re.search(rf"(?i)\bтаблица\s+{re.escape(needle)}\b", sp) or re.search(rf"(?i)\bтаблица\s+{re.escape(needle)}\b", tx):
+        if (re.search(rf"(?i)\bтаблица\s+{re.escape(needle)}\b", sp) or
+            re.search(rf"(?i)\bтаблица\s+{re.escape(needle)}\b", tx) or
+            re.search(rf"(?i)\btable\s+{re.escape(needle)}\b", sp) or
+            re.search(rf"(?i)\btable\s+{re.escape(needle)}\b", tx)):
             base = _table_base_from_section(sp)
             if base and base not in bases:
                 bases.append(base)
@@ -841,12 +852,14 @@ def _inject_special_sources_for_item(pack: dict, ask: str, used_ids: set[int]) -
                     continue
                 sp = m.get("section_path") or ""
                 tx = m.get("text") or ""
-                # распознаём номер из tail'а
                 tail = _last_segment(sp)
                 n_p, _ = _parse_figure_title(tail)
-                if _num_norm(n_p) != _num_norm(num) and not re.search(rf"(?i)\bрисунок\s+{re.escape(_num_norm(num))}\b", tx):
+                if _num_norm(n_p) != _num_norm(num) and not (
+                    re.search(rf"(?i)\bрисунок\s+{re.escape(_num_norm(num))}\b", tx) or
+                    re.search(rf"(?i)\bfigure\s+{re.escape(_num_norm(num))}\b", tx)
+                ):
                     continue
-                # добавляем все чанки этой секции (на случай, если текст разбит)
+
                 sec = sp
                 for mm in pack["meta"]:
                     if (mm.get("section_path") or "") == sec:
@@ -869,17 +882,13 @@ def _inject_special_sources_for_item(pack: dict, ask: str, used_ids: set[int]) -
 #               с интеграцией таблиц/рисунков
 # =======================================================================
 
-# Эвристики распознавания подпунктов (совпадают с ace-планировщиком по смыслу)
+# Эвристики распознавания подпунктов
 _ENUM_LINE = re.compile(r"(?m)^\s*(?:\d+[).\)]|[-—•])\s+")
 _ENUM_INLINE = re.compile(r"(?:\s|^)\(?\d{1,2}[)\.]\s+")
 
 def plan_subitems(question: str, *, min_items: int = 2, max_items: int = 12) -> List[str]:
     """
-    Пытаемся вытащить подпункты из длинного вопроса:
-      - маркеры в начале строк (1. … / • …);
-      - inline-формат «1) 2) 3) …»;
-      - разделение по ';' как крайний случай.
-    Возвращаем список коротких формулировок.
+    Пытаемся вытащить подпункты из длинного вопроса.
     """
     q = (question or "").strip()
     items: List[str] = []
@@ -908,7 +917,6 @@ def plan_subitems(question: str, *, min_items: int = 2, max_items: int = 12) -> 
     if not items and q.count(";") >= 2:
         items = [p.strip() for p in q.split(";") if p.strip()]
 
-    # чистка
     items = [re.sub(r"\s+", " ", it).strip(" .;—-") for it in items if it and len(it.strip()) >= 2]
     if len(items) < min_items:
         return []
@@ -951,7 +959,6 @@ def retrieve_for_items(
             if m["id"] in used_ids:
                 continue
             if avoid_refs_when_not_asked and _chunk_type(m) == "reference":
-                # пропускаем источники, если подпункт явно не про них
                 if not re.search(r"\b(источник|литератур|reference|bibliograph)\w*\b", ask.lower()):
                     continue
             picked.append(
@@ -965,8 +972,6 @@ def retrieve_for_items(
                 }
             )
             used_ids.add(m["id"])
-            # ВНИМАНИЕ: не обрезаем по per_item_k здесь — пусть bucket содержит всё полезное.
-            # Итоговое сечение пойдёт на этапе merge в retrieve_coverage.
 
         by_id[str(idx)] = picked
 
@@ -978,7 +983,6 @@ def retrieve_for_items(
             m = pack["meta"][int(i)]
             if m["id"] in used_ids:
                 continue
-            # мягко избегаем reference
             if _chunk_type(m) == "reference":
                 continue
             extra.append(
@@ -1011,28 +1015,32 @@ def retrieve_coverage(
 ) -> Dict[str, Any]:
     """
     Coverage-aware выборка под многопунктный вопрос.
-    Если subitems не переданы — попытаемся извлечь их из вопроса.
+
     Возвращает:
       {
-        "items": ["…", "…", ...],                 # подпункты (может быть пусто)
-        "by_item": {"1":[...], "2":[...], ...},   # чанки по подпунктам (как в retrieve), поле for_item у чанка
-        "snippets": [...],                        # все чанки в одном списке, упорядоченные round-robin (+добавки для «все значения»)
+        "items": [{"id": 1, "ask": "..."}, ...],
+        "by_item": {"1":[...], "2":[...], ...},
+        "by": {"1":[idx, ...], ...},          # карта: подпункт -> индексы в snippets (для bot.py)
+        "snippets": [...],
       }
     """
-    items = list(subitems or plan_subitems(question)) if (subitems or question) else []
-    by_item = {}
-    if items:
+    items_list = list(subitems or plan_subitems(question)) if (subitems or question) else []
+    # Нормализуем к нужному для bot.py формату: [{id, ask}]
+    items_norm = [{"id": i + 1, "ask": it} for i, it in enumerate(items_list)]
+
+    if items_list:
         by_item = retrieve_for_items(
             owner_id,
             doc_id,
-            items,
+            items_list,
             per_item_k=per_item_k,
             prelim_factor=prelim_factor,
             overall_backfill_from_query=question,
             backfill_k=backfill_k,
         )
-        # round-robin порядок: 1-й из каждого подпункта, затем 2-й
-        buckets = [by_item.get(str(i + 1), []) for i in range(len(items))]
+
+        # round-robin порядок: 1-й из каждого подпункта, затем 2-й и т.д.
+        buckets = [by_item.get(str(i + 1), []) for i in range(len(items_list))]
         merged: List[Dict] = []
         for r in range(per_item_k):
             for b in buckets:
@@ -1040,21 +1048,30 @@ def retrieve_coverage(
                     merged.append(b[r])
 
         # Для подпунктов вида «дай все значения» — добавляем ОСТАЛЬНЫЕ строчки их bucket
-        for i, ask in enumerate(items, start=1):
+        for i, ask in enumerate(items_list, start=1):
             if _wants_all_values(ask):
                 bucket = by_item.get(str(i), [])
-                # уже добавлены первые per_item_k, доклеим остаток
                 if len(bucket) > per_item_k:
                     merged.extend(bucket[per_item_k:])
 
         # добавим backfill в конце
         if by_item.get("_backfill"):
             merged.extend(by_item["_backfill"])
-        return {"items": items, "by_item": by_item, "snippets": merged}
+
+        # Построим карту индексов для bot.py: { "1": [indices in merged], ... }
+        by_indices: Dict[str, List[int]] = {}
+        for idx, sn in enumerate(merged):
+            fid = sn.get("for_item")
+            if fid:
+                by_indices.setdefault(str(fid), []).append(idx)
+
+        return {"items": items_norm, "by_item": by_item, "by": by_indices, "snippets": merged}
 
     # Если подпункты не распознаны — обычный retrieve с небольшим расширением k
     base = retrieve(owner_id, doc_id, question, top_k=max(10, backfill_k * 2))
-    return {"items": [], "by_item": {"_single": base}, "snippets": base}
+    # Единый «by» для удобства: вся выдача принадлежит "_single"
+    by_indices = {"_single": list(range(len(base)))}
+    return {"items": [], "by_item": {"_single": base}, "by": by_indices, "snippets": base}
 
 def build_context_coverage(
     snippets: List[Dict],
@@ -1093,7 +1110,6 @@ def build_context_coverage(
     # round-robin
     ordered: List[Dict] = []
     if groups:
-        # выровняем порядок ключей групп по возрастанию
         keys = sorted(groups.keys(), key=lambda x: (len(x), x))
         round_idx = 0
         more = True
@@ -1105,7 +1121,6 @@ def build_context_coverage(
                     ordered.append(bucket[round_idx])
                     more = True
             round_idx += 1
-        # extras в конце
         ordered.extend(extras)
     else:
         ordered = snippets[:]

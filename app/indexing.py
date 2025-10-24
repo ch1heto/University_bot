@@ -1,6 +1,7 @@
 # app/indexing.py
 import re
 import json
+import hashlib
 import numpy as np
 from typing import List, Dict, Any, Iterable
 
@@ -13,6 +14,15 @@ from .chunking import split_into_chunks
 
 def _norm(s: str | None) -> str:
     return (s or "").strip()
+
+def _make_anchor_id(section_path: str, page: int | None, title: str | None) -> str:
+    """
+    Стабильный якорь для ссылки на место в тексте.
+    Основан на section_path + page + title (безопасно для старых индексов: хранится только в attrs).
+    """
+    base = f"{_norm(section_path)}|p={page or ''}|t={_norm(title)}"
+    h = hashlib.sha1(base.encode("utf-8")).hexdigest()  # короткий и достаточно стабильный
+    return f"anch-{h[:16]}"
 
 def _prefix(section: Dict[str, Any]) -> str:
     """
@@ -46,6 +56,18 @@ def _prefix(section: Dict[str, Any]) -> str:
     pfx_parts.append(title)
     return " ".join(pfx_parts)
 
+def _attach_anchors(attrs: dict, *, section_path: str, page: int | None, title: str | None) -> dict:
+    """
+    Ненавязчиво обогащаем attrs служебными полями для прозрачных ссылок.
+    Не ломает старые пайплайны (всё внутри JSON attrs).
+    """
+    out = dict(attrs or {})
+    out.setdefault("section_title", _norm(title))
+    out.setdefault("section_path_norm", _norm(section_path))
+    out.setdefault("loc", {"page": page, "section_path": _norm(section_path)})
+    out.setdefault("anchor_id", _make_anchor_id(section_path, page, title))
+    return out
+
 def _yield_chunks_for_section(
     section: Dict[str, Any],
     *,
@@ -68,6 +90,9 @@ def _yield_chunks_for_section(
     page = section.get("page")
     base_attrs = dict(section.get("attrs") or {})
     text = section.get("text") or ""
+
+    # Добавим прозрачные якоря (безопасно: всё уходит в attrs JSON)
+    base_attrs = _attach_anchors(base_attrs, section_path=section_path, page=page, title=title)
 
     # Заголовок — отдельный небольшой чанк с префиксом
     if et == "heading":
@@ -109,16 +134,19 @@ def _yield_chunks_for_section(
         for i, row in enumerate(lines[:max_table_rows], 1):
             attrs = dict(base_attrs)
             attrs["row_index"] = i
+            # Добавим более точный секционный путь для строки
+            row_section_path = f"{section_path} [row {i}]"
+            attrs = _attach_anchors(attrs, section_path=row_section_path, page=page, title=title)
             yield (
                 row,  # только содержимое строки
-                {"page": page, "section_path": f"{section_path} [row {i}]"},
+                {"page": page, "section_path": row_section_path},
                 "table_row",
                 attrs,
             )
         return
 
     # Фигуры / страницы / обычные абзацы — делим на чанки, добавляем префикс как контекст
-    # Для figure при пустом текстe синтезируем строку из подписи.
+    # Для figure при пустом текстe синтезируем строку из подписи (важно для поиска «Рисунок N …»).
     base = text if isinstance(text, str) else str(text)
     if et == "figure" and not base.strip():
         cap_num = base_attrs.get("caption_num") or base_attrs.get("label")

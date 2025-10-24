@@ -46,8 +46,10 @@ class Cfg:
     FIG_NEIGHBOR_WINDOW: int = _env_int("FIG_NEIGHBOR_WINDOW", 4)
     PDF_EXTRACT_IMAGES: bool = _env_bool("PDF_EXTRACT_IMAGES", True)
 
-    # --- FULLREAD режим (по умолчанию — iterativе) ---
-    _FULLREAD_MODE_RAW: str = _env_str("FULLREAD_MODE", "iterative").lower()
+    # --- FULLREAD режим ---
+    # По умолчанию включаем "auto": если документ влазит — даём модели целиком,
+    # иначе читаем итеративно (map → reduce).
+    _FULLREAD_MODE_RAW: str = _env_str("FULLREAD_MODE", "auto").lower()
     _FULLREAD_ALIASES = {
         "iter": "iterative",
         "iterative": "iterative",
@@ -56,37 +58,41 @@ class Cfg:
         "digest": "digest",
         "off": "off",
     }
-    FULLREAD_MODE: str = _FULLREAD_ALIASES.get(_FULLREAD_MODE_RAW, "iterative")
+    FULLREAD_MODE: str = _FULLREAD_ALIASES.get(_FULLREAD_MODE_RAW, "auto")
 
-    FULLREAD_MAX_STEPS: int = _env_int("FULLREAD_MAX_STEPS", 4)
-    FULLREAD_STEP_CHARS: int = _env_int("FULLREAD_STEP_CHARS", 18_000)
+    # Лимиты/бюджеты для FULLREAD
+    FULLREAD_MAX_STEPS: int = _env_int("FULLREAD_MAX_STEPS", 3)
+    FULLREAD_STEP_CHARS: int = _env_int("FULLREAD_STEP_CHARS", 14_000)
     FULLREAD_CHUNK_CHARS: int = _env_int("FULLREAD_CHUNK_CHARS", FULLREAD_STEP_CHARS)
     FULLREAD_MAX_SECTIONS: int = _env_int("FULLREAD_MAX_SECTIONS", 120)
-    FULLREAD_CONTEXT_CHARS: int = _env_int("FULLREAD_CONTEXT_CHARS", 20_000)
-    DIRECT_MAX_CHARS: int = _env_int("DIRECT_MAX_CHARS", 180_000)
+    FULLREAD_CONTEXT_CHARS: int = _env_int("FULLREAD_CONTEXT_CHARS", 9_000)
+    DIRECT_MAX_CHARS: int = _env_int("DIRECT_MAX_CHARS", 150_000)
 
     # Токен-бюджеты для map/reduce
     FULLREAD_MAP_TOKENS: int = _env_int("FULLREAD_MAP_TOKENS", 600)
-    FULLREAD_REDUCE_TOKENS: int = _env_int("FULLREAD_REDUCE_TOKENS", 2400)
-    DIGEST_TOKENS_PER_SECTION: int = _env_int("DIGEST_TOKENS_PER_SECTION", FULLREAD_MAP_TOKENS)
+    FULLREAD_REDUCE_TOKENS: int = _env_int("FULLREAD_REDUCE_TOKENS", 2_400)
+    DIGEST_TOKENS_PER_SECTION: int = _env_int(
+        "DIGEST_TOKENS_PER_SECTION", FULLREAD_MAP_TOKENS
+    )
 
     FULLREAD_ENABLE_VISION: bool = _env_bool("FULLREAD_ENABLE_VISION", True)
 
-    # --- Бюджеты генерации (увеличены) ---
-    ANSWER_MAX_TOKENS: int = _env_int("ANSWER_MAX_TOKENS", 2400)
-    EDITOR_MAX_TOKENS: int = _env_int("EDITOR_MAX_TOKENS", 1800)
+    # --- Бюджеты генерации ---
+    ANSWER_MAX_TOKENS: int = _env_int("ANSWER_MAX_TOKENS", 2_400)
+    EDITOR_MAX_TOKENS: int = _env_int("EDITOR_MAX_TOKENS", 1_800)
     CRITIC_MAX_TOKENS: int = _env_int("CRITIC_MAX_TOKENS", 600)
-    EXPLAIN_MAX_TOKENS: int = _env_int("EXPLAIN_MAX_TOKENS", 2400)
-    EXPAND_MAX_TOKENS: int = _env_int("EXPAND_MAX_TOKENS", 2400)
+    EXPLAIN_MAX_TOKENS: int = _env_int("EXPLAIN_MAX_TOKENS", 2_400)
+    EXPAND_MAX_TOKENS: int = _env_int("EXPAND_MAX_TOKENS", 2_400)
     PLANNER_MAX_TOKENS: int = _env_int("PLANNER_MAX_TOKENS", 500)
     PART_MAX_TOKENS: int = _env_int("PART_MAX_TOKENS", 900)
-    MERGE_MAX_TOKENS: int = _env_int("MERGE_MAX_TOKENS", 2400)
-    FINAL_MAX_TOKENS: int = _env_int("FINAL_MAX_TOKENS", 2400)
+    MERGE_MAX_TOKENS: int = _env_int("MERGE_MAX_TOKENS", 2_400)
+    FINAL_MAX_TOKENS: int = _env_int("FINAL_MAX_TOKENS", 1_600)
 
-    # --- Полные выгрузки таблиц (для TablesRaw) ---
-    FULL_TABLE_MAX_ROWS: int = _env_int("FULL_TABLE_MAX_ROWS", 2000)
-    FULL_TABLE_MAX_COLS: int = _env_int("FULL_TABLE_MAX_COLS", 60)
-    FULL_TABLE_MAX_CHARS: int = _env_int("FULL_TABLE_MAX_CHARS", 60_000)
+    # --- Полные выгрузки таблиц (TablesRaw) ---
+    FULL_TABLE_MAX_ROWS: int = _env_int("FULL_TABLE_MAX_ROWS", 500)
+    FULL_TABLE_MAX_COLS: int = _env_int("FULL_TABLE_MAX_COLS", 40)
+    FULL_TABLE_MAX_CHARS: int = _env_int("FULL_TABLE_MAX_CHARS", 20_000)
+    SECTION_TABLES_MAX: int = _env_int("SECTION_TABLES_MAX", 3)
 
     # --- Декомпозиция многопунктных вопросов ---
     MULTI_PLAN_ENABLED: bool = _env_bool("MULTI_PLAN_ENABLED", True)
@@ -94,14 +100,21 @@ class Cfg:
     MULTI_MAX_ITEMS: int = _env_int("MULTI_MAX_ITEMS", 12)
     MULTI_PASS_SCORE: int = _env_int("MULTI_PASS_SCORE", 85)
 
-    # --- Стриминг в Telegram (много сообщений, а не правки) ---
+    # Настройки подачи подпунктов (используются в bot.py)
+    MULTI_STEP_SEND_ENABLED: bool = _env_bool("MULTI_STEP_SEND_ENABLED", True)
+    MULTI_STEP_MIN_ITEMS: int = _env_int("MULTI_STEP_MIN_ITEMS", 2)
+    MULTI_STEP_MAX_ITEMS: int = _env_int("MULTI_STEP_MAX_ITEMS", 8)
+    MULTI_STEP_FINAL_MERGE: bool = _env_bool("MULTI_STEP_FINAL_MERGE", True)
+    MULTI_STEP_PAUSE_MS: int = _env_int("MULTI_STEP_PAUSE_MS", 120)
+
+    # --- Стриминг в Telegram ---
     STREAM_ENABLED: bool = _env_bool("STREAM_ENABLED", True)
-    STREAM_EDIT_INTERVAL_MS: int = _env_int("STREAM_EDIT_INTERVAL_MS", 1200)
+    STREAM_EDIT_INTERVAL_MS: int = _env_int("STREAM_EDIT_INTERVAL_MS", 1_200)
     STREAM_MIN_CHARS: int = _env_int("STREAM_MIN_CHARS", 700)
     STREAM_MODE: str = _env_str("STREAM_MODE", "multi")  # "edit" | "multi"
-    TG_MAX_CHARS: int = _env_int("TG_MAX_CHARS", 3900)
+    TG_MAX_CHARS: int = _env_int("TG_MAX_CHARS", 3_900)
     STREAM_HEAD_START_MS: int = _env_int("STREAM_HEAD_START_MS", 250)
-    TYPE_INDICATION_EVERY_MS: int = _env_int("TYPE_INDICATION_EVERY_MS", 2000)
+    TYPE_INDICATION_EVERY_MS: int = _env_int("TYPE_INDICATION_EVERY_MS", 2_000)
 
     # --- PostgreSQL (резерв) ---
     PG_HOST: str = os.getenv("PG_HOST", "localhost")
@@ -140,6 +153,9 @@ class Cfg:
                 f"FULLREAD_MODE='{cls.FULLREAD_MODE}' не поддерживается. "
                 f"Допустимые значения: {', '.join(sorted(allowed))}."
             )
+
+        if cls.STREAM_MODE not in {"edit", "multi"}:
+            raise RuntimeError("STREAM_MODE должен быть 'edit' или 'multi'.")
 
     @classmethod
     def fullread_enabled(cls) -> bool:

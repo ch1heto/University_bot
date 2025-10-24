@@ -128,13 +128,20 @@ def _md_list(arr: List[str], max_show: int, more: Optional[int], *, norm_numbers
 # ----------------------------- Правила для модели -----------------------------
 
 _DEFAULT_RULES = (
-    "1) Ответь, закрыв все подпункты вопроса. Если пунктов много — отвечай последовательно на каждый.\n"
-    "2) Заголовки таблиц: если есть номер → «Таблица N — Название»; если номера нет — только название.\n"
-    "3) Не выводи служебные метки и размеры (никаких [Таблица], «ряд 1», «(6×7)»).\n"
-    "4) В списках покажи не более 25 строк, затем «… и ещё M», если есть.\n"
-    "5) Не придумывай факты вне блока Facts; если данных нет — скажи честно.\n"
-    "6) Если пользователь просит точные значения «как в документе/без нормализации» — сохраняй исходный вид чисел (разделители тысяч, запятая/точка, дефисы).\n"
+    "1) Если в секции [Items] перечислены подпункты — отвечай по ним по порядку, сохраняя нумерацию 1), 2), 3). "
+    "Если подпункты не перечислены — закрой все смысловые пункты вопроса последовательно.\n"
+    "2) Не используй Markdown-заголовки (#, ##, ###). Для подзаголовков используй жирный текст и двоеточие: **Пункт 2.3:** ...\n"
+    "3) Заголовки таблиц: если есть номер → «Таблица N — Название»; если номера нет — только название.\n"
+    "4) Не выводи служебные метки и размеры (никаких [Таблица], «ряд 1», «(6×7)»).\n"
+    "5) В списках покажи не более 25 строк, затем «… и ещё M», если есть.\n"
+    "6) Не придумывай факты вне блока Facts; если данных нет — скажи честно.\n"
+    "7) Если пользователь просит точные значения «как в документе/без нормализации» — сохраняй исходный вид чисел (разделители тысяч, запятая/точка, дефисы).\n"
 )
+
+# конвертируем строки-заголовки в **жирный**
+_HEAD_TO_BOLD_RE = re.compile(r"(?m)^\s*#{1,6}\s*(.+?)\s*$")
+def _headings_to_bold(text: str) -> str:
+    return _HEAD_TO_BOLD_RE.sub(lambda m: f"**{m.group(1).strip()}**", text or "")
 
 # ----------------------------- Вспомогалки для табличных данных -----------------------------
 
@@ -431,20 +438,32 @@ def _tables_raw_by_bases(uid: int, doc_id: int, bases: List[str], rows_limit_eff
                 first_line = " — ".join([c.strip() for c in _split_cells(txt0) if c.strip()])
 
             # попробуем достать attrs из первой подходящей записи table/table_row
+                        # попробуем достать attrs из первой подходящей записи table/table_row (если колонка есть)
             con = get_conn()
             cur = con.cursor()
-            cur.execute(
-                """
-                SELECT attrs, page FROM chunks
-                WHERE owner_id=? AND doc_id=? AND (section_path=? OR section_path LIKE ? || ' [row %')
-                ORDER BY id ASC LIMIT 1
-                """,
-                (uid, doc_id, base, base),
-            )
+            has_attrs = _table_has_columns(con, "chunks", ["attrs"])
+            if has_attrs:
+                cur.execute(
+                    """
+                    SELECT attrs, page FROM chunks
+                    WHERE owner_id=? AND doc_id=? AND (section_path=? OR section_path LIKE ? || ' [row %')
+                    ORDER BY id ASC LIMIT 1
+                    """,
+                    (uid, doc_id, base, base),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT page FROM chunks
+                    WHERE owner_id=? AND doc_id=? AND (section_path=? OR section_path LIKE ? || ' [row %')
+                    ORDER BY id ASC LIMIT 1
+                    """,
+                    (uid, doc_id, base, base),
+                )
             r = cur.fetchone()
             con.close()
 
-            attrs_json = r["attrs"] if (r and "attrs" in r.keys()) else None
+            attrs_json = (r["attrs"] if (has_attrs and r and "attrs" in r.keys()) else None)
             page = r["page"] if r else None
             if isinstance(attrs_json, dict):
                 attrs_json = json.dumps(attrs_json, ensure_ascii=False)
@@ -663,6 +682,30 @@ def facts_to_prompt(
     """
     parts: List[str] = []
 
+    # ----- Подпункты (Items) -----
+    # Поддерживаем два варианта: facts['coverage']['items'] (как возвращает retrieve_coverage)
+    # и плоский facts['items'] (если заполняется напрямую слоем-оркестратором).
+    items_src = (
+        ((facts or {}).get("coverage") or {}).get("items")
+        or (facts or {}).get("items")
+        or []
+    )
+    if items_src:
+        lines: List[str] = []
+        for it in items_src[:25]:
+            if isinstance(it, dict):
+                idx = it.get("id") or it.get("index")
+                text = it.get("ask") or it.get("text") or ""
+                if idx is not None:
+                    lines.append(f"{idx}) {(_normalize_numbers(text) if norm_numbers else text)}")
+                else:
+                    lines.append(f"- {(_normalize_numbers(text) if norm_numbers else text)}")
+            else:
+                s = str(it)
+                lines.append(f"- {(_normalize_numbers(s) if norm_numbers else s)}")
+        # Отдельная секция, чтобы модель явно понимала структуру ответа
+        parts.append("- Items:\n  " + "\n  ".join(lines))
+
     # ----- Таблицы -----
     tables = (facts or {}).get("tables") or {}
     if tables:
@@ -683,14 +726,25 @@ def facts_to_prompt(
         parts.append("- Tables:\n  " + "\n  ".join(block))
 
     # ----- Рисунки -----
+        # ----- Рисунки -----
     figures = (facts or {}).get("figures") or {}
     if figures:
         block = [f"count: {int(figures.get('count') or 0)}"]
         if figures.get("list"):
             block.append("list:\n" + _md_list(figures["list"], 25, figures.get("more", 0), norm_numbers=norm_numbers))
+
+        # 3.1) Линейные описания (как было)
         desc_lines = [str(x).strip() for x in (figures.get("describe_lines") or []) if str(x).strip()]
         if desc_lines:
             block.append("describe:\n" + "\n".join([f"- {(_normalize_numbers(x) if norm_numbers else x)}" for x in desc_lines[:25]]))
+
+        # 3.2) Новое: карточки с полями (num, display, where, images, highlights, vision)
+        if figures.get("describe_cards"):
+            try:
+                block.append("describe_cards:\n" + json.dumps(figures["describe_cards"], ensure_ascii=False, indent=2))
+            except Exception:
+                pass
+
         parts.append("- Figures:\n  " + "\n  ".join(block))
 
     # ----- Источники -----
@@ -882,7 +936,8 @@ def generate_answer(
     )
     try:
         reply = ace_once(q, ctx, pass_score=pass_score)
-        return (reply or "").strip()
+        return _headings_to_bold((reply or "").strip())
+
     except Exception:
         fallback = [
             "Не удалось сгенерировать ответ строгим агентом. Ниже — краткий конспект найденных фактов.",
@@ -935,8 +990,12 @@ async def generate_answer_stream(
     # 1) Предпочтительный путь — строгий агент со стримом (если доступен)
     if ace_stream is not None:
         try:
-            stream_obj = ace_stream(q, ctx, pass_score=pass_score)  # type: ignore
-            return _aiter_any(stream_obj)
+            stream_obj = ace_stream(q, ctx, pass_score=pass_score)
+            async def _fmt():
+                async for chunk in _aiter_any(stream_obj):
+                    yield _headings_to_bold(chunk)
+            return _fmt()
+
         except Exception:
             pass
 
@@ -991,6 +1050,6 @@ def debug_digest(facts: Dict[str, Any]) -> str:
         parts.append("Есть общий контекст (general_ctx).")
 
     if facts.get("verbatim_hits"):
-        parts.append(f"Есть точные совпадения (verbatim_hits): {len(facts.get('verbatim_hits') or [])})")
+        parts.append(f"Есть точные совпадения (verbatim_hits): {len(facts.get('verbatim_hits') or [])}")
 
     return "\n".join(parts)

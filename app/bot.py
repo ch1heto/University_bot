@@ -28,7 +28,7 @@ from .db import (
     update_document_meta, delete_document_chunks,
     set_user_active_doc, get_user_active_doc,  # ⬅️ персист активного документа
 )
-from .parsing import parse_docx, parse_pdf, parse_doc, save_upload
+from .parsing import parse_docx, parse_doc, save_upload
 from .indexing import index_document
 from .retrieval import (
     retrieve, build_context, invalidate_cache,
@@ -81,8 +81,15 @@ setup_paywall(dp, bot)
 STREAM_ENABLED: bool = getattr(Cfg, "STREAM_ENABLED", True)
 STREAM_EDIT_INTERVAL_MS: int = getattr(Cfg, "STREAM_EDIT_INTERVAL_MS", 900)  # как часто редактировать сообщение
 STREAM_MIN_CHARS: int = getattr(Cfg, "STREAM_MIN_CHARS", 120)               # мин. приращение между апдейтами
-STREAM_MODE: str = getattr(Cfg, "STREAM_MODE", "edit")                       # "edit" | "multi" (multi = просто куски)
-TG_MAX_CHARS: int = getattr(Cfg, "TG_MAX_CHARS", 3900)                       # безопасно < 4096 телеграма
+STREAM_MODE: str = getattr(Cfg, "STREAM_MODE", "edit")                       # "edit" | "multi"
+TG_MAX_CHARS: int = getattr(Cfg, "TG_MAX_CHARS", 3900)
+
+# ↓ Новое: управляем «много сообщений» даже когда не упираемся в 4096
+TG_SPLIT_TARGET: int = getattr(Cfg, "TG_SPLIT_TARGET", 1600)   # целевой размер части
+TG_SPLIT_MAX_PARTS: int = getattr(Cfg, "TG_SPLIT_MAX_PARTS", 3)  # не больше 3 сообщений
+_SPLIT_ANCHOR_RE = re.compile(
+    r"(?m)^(?:### .+|## .+|\*\*[^\n]+?\*\*|\d+[).] .+|- .+)$"
+)  # предпочитаемые границы (заголовки/списки)
 STREAM_HEAD_START_MS: int = getattr(Cfg, "STREAM_HEAD_START_MS", 250)        # первый апдейт быстрее
 FINAL_MAX_TOKENS: int = getattr(Cfg, "FINAL_MAX_TOKENS", 1600)
 TYPE_INDICATION_EVERY_MS: int = getattr(Cfg, "TYPE_INDICATION_EVERY_MS", 2000)
@@ -97,19 +104,84 @@ MULTI_PASS_SCORE: int = getattr(Cfg, "MULTI_PASS_SCORE", 85)         # поро�
 
 # --------------------- форматирование и отправка ---------------------
 
-_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
+# Markdown → HTML (минимально-необходимое: **bold**, __bold__, *italic*, _italic_, `code`)
+# --------------------- форматирование и отправка ---------------------
+
+# Markdown → HTML (минимально-необходимое: заголовки, **bold**, *italic*, `code`)
+_MD_H_RE       = re.compile(r"(?m)^\s{0,3}#{1,6}\s+(.+?)\s*$")
+_MD_BOLD_RE    = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
+_MD_BOLD2_RE   = re.compile(r"__(.+?)__", re.DOTALL)
+_MD_ITALIC_RE  = re.compile(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", re.DOTALL)
+_MD_ITALIC2_RE = re.compile(r"(?<!_)_(?!_)(.+?)(?<!_)_(?!_)", re.DOTALL)
+_MD_CODE_RE    = re.compile(r"`([^`]+)`")
 
 def _to_html(text: str) -> str:
-    """Конвертируем **bold** в <b>...</b> и экранируем HTML."""
+    """Безопасно экранируем HTML и конвертируем самый частый Markdown в тг-HTML."""
     if not text:
         return ""
-    text = _BOLD_RE.sub(r"<b>\1</b>", text)
-    text = html.escape(text)
-    return text.replace("&lt;b&gt;", "<b>").replace("&lt;/b&gt;", "</b>")
+    # 1) экранируем всё
+    txt = html.escape(text)
+
+    # 2) кодовые спаны первыми
+    txt = _MD_CODE_RE.sub(r"<code>\1</code>", txt)
+
+    # 3) заголовки вида '# ...' → <b>...</b>
+    txt = _MD_H_RE.sub(r"<b>\1</b>", txt)
+
+    # 4) жирный и курсив
+    txt = _MD_BOLD_RE.sub(r"<b>\1</b>", txt)
+    txt = _MD_BOLD2_RE.sub(r"<b>\1</b>", txt)
+    txt = _MD_ITALIC_RE.sub(r"<i>\1</i>", txt)
+    txt = _MD_ITALIC2_RE.sub(r"<i>\1</i>", txt)
+
+    # 5) зачистка «висячих» **
+    txt = re.sub(r"(?<!\*)\*\*(?!\*)", "", txt)
+    return txt
+
+
+def _split_multipart(text: str,
+                     *,
+                     target: int = TG_SPLIT_TARGET,
+                     max_parts: int = TG_SPLIT_MAX_PARTS,
+                     hard: int = TG_MAX_CHARS) -> list[str]:
+    """
+    Дробим ответ на 2–3 логических сообщения:
+    - стремимся к target символов на часть;
+    - режем по якорям (###/списки/нумерация), если есть;
+    - никогда не превышаем hard (лимит Telegram).
+    """
+    s = text or ""
+    if not s:
+        return []
+    if len(s) <= target:
+        return [s]
+
+    parts: list[str] = []
+    rest = s
+
+    for _ in range(max_parts - 1):
+        if len(rest) <= target:
+            break
+        # ищем последнюю «красивую» границу до target
+        cut = -1
+        for m in _SPLIT_ANCHOR_RE.finditer(rest[: min(len(rest), hard)]):
+            if m.start() < target:
+                cut = m.start()
+        if cut <= 0:
+            cut = _smart_cut_point(rest, min(hard, target))
+        parts.append(rest[:cut].rstrip())
+        rest = rest[cut:].lstrip()
+
+    # остаток и, если нужно, сверхжёсткое разбиение по hard
+    while rest:
+        parts.append(rest[:hard])
+        rest = rest[hard:]
+
+    return parts
 
 async def _send(m: types.Message, text: str):
     """Бережно отправляем длинный текст частями в HTML-режиме (нестримовый фолбэк)."""
-    for chunk in split_for_telegram(text or "", TG_MAX_CHARS):
+    for chunk in _split_multipart(text or ""):
         await m.answer(_to_html(chunk), parse_mode="HTML", disable_web_page_preview=True)
 
 # --------------------- STREAM: вспомогалки ---------------------
@@ -197,10 +269,8 @@ def _smart_cut_point(s: str, limit: int) -> int:
     return max(1, cut)
 
 async def _stream_to_telegram(m: types.Message, stream, head_text: str = "⌛️ Печатаю ответ…") -> None:
-    """
-    Главный цикл стриминга.
-    """
     current_text = ""
+    sent_parts = 0  # ← сколько частей уже отправлено в multi-режиме
     initial = await m.answer(_to_html(head_text), parse_mode="HTML", disable_web_page_preview=True)
     last_edit_at = _now_ms() - STREAM_HEAD_START_MS
     stop_typer = asyncio.Event()
@@ -210,46 +280,63 @@ async def _stream_to_telegram(m: types.Message, stream, head_text: str = "⌛️
         async for delta in _iterate_chunks(_ensure_iterable(stream)):
             current_text += delta
 
+            # 3.a) мульти-режим: как только накопили «солидный» кусок — сбрасываем как отдельное сообщение
+            if STREAM_MODE == "multi" and sent_parts < TG_SPLIT_MAX_PARTS - 1 and len(current_text) >= TG_SPLIT_TARGET:
+                # ищем красивую границу в буфере
+                cut = -1
+                for mm in _SPLIT_ANCHOR_RE.finditer(current_text[: min(len(current_text), TG_MAX_CHARS)]):
+                    if mm.start() < TG_SPLIT_TARGET:
+                        cut = mm.start()
+                if cut <= 0:
+                    cut = _smart_cut_point(current_text, min(TG_MAX_CHARS, TG_SPLIT_TARGET))
+
+                part = current_text[:cut].rstrip()
+                # первый кусок — редактируем заглушку; остальные — отправляем новыми сообщениями
+                try:
+                    if sent_parts == 0:
+                        await initial.edit_text(_to_html(part), parse_mode="HTML", disable_web_page_preview=True)
+                    else:
+                        await m.answer(_to_html(part), parse_mode="HTML", disable_web_page_preview=True)
+                except TelegramBadRequest:
+                    await m.answer(_to_html(part), parse_mode="HTML", disable_web_page_preview=True)
+
+                sent_parts += 1
+                current_text = current_text[cut:].lstrip()
+                last_edit_at = _now_ms()
+                continue
+
+            # 3.b) защита от жёсткого лимита Telegram (в любом режиме)
             if len(current_text) >= TG_MAX_CHARS:
                 cut = _smart_cut_point(current_text, TG_MAX_CHARS)
                 final_part = current_text[:cut]
                 try:
-                    await initial.edit_text(
-                        _to_html(final_part),
-                        parse_mode="HTML",
-                        disable_web_page_preview=True
-                    )
+                    await initial.edit_text(_to_html(final_part), parse_mode="HTML", disable_web_page_preview=True)
                 except TelegramBadRequest:
                     await m.answer(_to_html(final_part), parse_mode="HTML", disable_web_page_preview=True)
 
                 current_text = current_text[cut:].lstrip()
-                initial = await m.answer(
-                    _to_html(current_text if current_text else "…"),
-                    parse_mode="HTML",
-                    disable_web_page_preview=True
-                )
+                # новый плейсхолдер для следующей порции
+                initial = await m.answer(_to_html("…"), parse_mode="HTML", disable_web_page_preview=True)
                 last_edit_at = _now_ms()
                 continue
 
+            # 3.c) обычные периодические правки (режим "edit")
             now = _now_ms()
             if (now - last_edit_at) >= STREAM_EDIT_INTERVAL_MS and len(current_text) >= STREAM_MIN_CHARS:
                 try:
-                    await initial.edit_text(
-                        _to_html(current_text),
-                        parse_mode="HTML",
-                        disable_web_page_preview=True
-                    )
+                    await initial.edit_text(_to_html(current_text), parse_mode="HTML", disable_web_page_preview=True)
                     last_edit_at = now
                 except TelegramBadRequest:
                     pass
 
+        # финальный «хвост»
         if current_text:
             try:
-                await initial.edit_text(
-                    _to_html(current_text),
-                    parse_mode="HTML",
-                    disable_web_page_preview=True
-                )
+                # если уже были части и мы в multi — последнюю часть шлём отдельным сообщением
+                if STREAM_MODE == "multi" and sent_parts > 0:
+                    await m.answer(_to_html(current_text), parse_mode="HTML", disable_web_page_preview=True)
+                else:
+                    await initial.edit_text(_to_html(current_text), parse_mode="HTML", disable_web_page_preview=True)
             except TelegramBadRequest:
                 await m.answer(_to_html(current_text), parse_mode="HTML", disable_web_page_preview=True)
 
@@ -280,13 +367,23 @@ async def _run_multistep_answer(
         return False
 
     # план из coverage или строим планерoм
-    items = (discovered_items or [])
+        items = (discovered_items or [])
     if not items:
         try:
             items = plan_subtasks(q_text) or []
         except Exception:
             items = []
-    items = [it for it in items if (it.get("ask") or "").strip()]
+
+    # нормализация: поддерживаем и dict, и str
+    norm_items: list[dict] = []
+    for idx, it in enumerate(items, start=1):
+        if isinstance(it, str):
+            norm_items.append({"id": idx, "ask": it.strip()})
+        elif isinstance(it, dict):
+            ask = (it.get("ask") or it.get("text") or it.get("q") or "").strip()
+            if ask:
+                norm_items.append({"id": it.get("id") or idx, "ask": ask})
+    items = [it for it in norm_items if (it.get("ask") or "").strip()]
     if len(items) < MULTI_STEP_MIN_ITEMS:
         return False
 
@@ -306,19 +403,19 @@ async def _run_multistep_answer(
     except Exception:
         cov = None
     cov_snips = (cov or {}).get("snippets") or []
-    cov_map = (cov or {}).get("by") or {}  # ожидается {id: [индексы сниппетов]}
+    cov_map = (cov or {}).get("by_item") or {}  # { "1": [чанки], "2": [чанки], ... }
 
     # по очереди: A → send, B → send, ...
     for i, it in enumerate(items, start=1):
         ask = (it.get("ask") or "").strip()
         # контекст для конкретного подпункта
+                # контекст для конкретного подпункта
         ctx_text = ""
         try:
-            # 1) если есть coverage-карта — соберём «локальный» контекст подпункта
-            idxs = cov_map.get(str(it.get("id") or i)) or []
-            if idxs and cov_snips:
-                sub_snips = [cov_snips[j] for j in idxs if 0 <= j < len(cov_snips)]
-                ctx_text = build_context_coverage(sub_snips, items_count=1)
+            # если есть coverage-бакет — собираем контекст прямо из чанков подпункта
+            bucket = cov_map.get(str(it.get("id") or i)) or []
+            if bucket:
+                ctx_text = build_context_coverage(bucket, items_count=1)
         except Exception:
             ctx_text = ""
         # 2) фолбэки
@@ -776,9 +873,7 @@ def _parse_by_ext(path: str) -> list[dict]:
         return parse_docx(path)
     if fname.endswith(".doc"):
         return parse_doc(path)
-    if fname.endswith(".pdf"):
-        return parse_pdf(path)
-    raise RuntimeError("Поддерживаю .doc, .docx и .pdf.")
+    raise RuntimeError("Поддерживаю только .doc и .docx.")
 
 def _first_chunks_context(owner_id: int, doc_id: int, n: int = 10, max_chars: int = 6000) -> str:
     con = get_conn()
@@ -881,7 +976,7 @@ async def cmd_diag(m: types.Message):
     uid = ensure_user(str(m.from_user.id))
     doc_id = ACTIVE_DOC.get(uid) or get_user_active_doc(uid)
     if not doc_id:
-        await _send(m, "Активного документа нет. Пришлите файл (.doc/.docx/.pdf) сначала.")
+        await _send(m, "Активного документа нет. Пришлите файл (.doc/.docx) сначала.")
         return
 
     # базовые метрики из БД
@@ -1106,6 +1201,8 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
     Собираем ТОЛЬКО факты из БД/индекса, без генерации текста.
     """
     facts: dict[str, object] = {"doc_id": doc_id, "owner_id": uid}
+    # флаг «точные числа как в документе»
+    facts["exact_numbers"] = bool(intents.get("exact_numbers"))
 
     # ----- Таблицы -----
     if intents["tables"]["want"]:
@@ -1351,9 +1448,14 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
             facts["general_ctx"] = ctx
         if vb:
             facts["verbatim_hits"] = vb
-        # (опционально) можно передать план подпунктов в facts — не ломает совместимость:
+        # передаём подпункты и в coverage.items (для [Items]), и в general_subitems (для многошаговой подачи)
         if cov and cov.get("items"):
-            facts["general_subitems"] = cov["items"]
+            facts["coverage"] = {"items": cov["items"]}
+            # нормализуем general_subitems под многошаговый режим (id+ask)
+            facts["general_subitems"] = [
+                {"id": i + 1, "ask": s} if isinstance(s, str) else s
+                for i, s in enumerate(cov["items"])
+            ]
 
     # логируем маленький срез фактов (без огромных текстов)
     log_snapshot = dict(facts)
@@ -1781,7 +1883,10 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
     facts = _gather_facts(uid, doc_id, intents)
 
     # ↓ НОВОЕ: если есть план подпунктов — включаем многошаговую подачу
-    discovered_items = facts.get("general_subitems") if isinstance(facts, dict) else None
+    discovered_items = None
+    if isinstance(facts, dict):
+        discovered_items = (facts.get("coverage", {}).get("items")
+                            or facts.get("general_subitems"))
     try:
         handled = await _run_multistep_answer(
             m, uid, doc_id, q_text, discovered_items=discovered_items  # отправит A→B→… и вернёт True
@@ -1861,7 +1966,7 @@ async def qa(m: types.Message):
 
     # Строгий режим: без активного документа не отвечаем по содержанию
     if not doc_id:
-        await _send(m, "Сначала пришлите файл (.doc/.docx/.pdf). Без него я не отвечаю по содержанию.")
+        await _send(m, "Сначала пришлите файл (.doc/.docx). Без него я не отвечаю по содержанию.")
         return
 
     await respond_with_answer(m, uid, doc_id, text)

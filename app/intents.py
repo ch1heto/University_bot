@@ -20,9 +20,9 @@ TABLE_ANY_RE = re.compile(
     re.IGNORECASE
 )
 
-# Номер таблицы (RU/EN, с поддержкой №/no., и префикс-буквы: A.1, П1.2, А.1)
+# Номер таблицы (RU/EN, с поддержкой №/no./номер, и префикс-буквы: A.1, П1.2, А.1)
 TABLE_NUM_RE = re.compile(
-    r"(?i)\b(?:табл(?:ица)?|table)\s*(?:№|no\.?)?\s*"
+    r"(?i)\b(?:табл(?:ица)?|таблиц\w*|table)\s*(?:№|no\.?|номер\s*)?\s*"
     r"([A-Za-zА-Яа-я]\.?[\s-]?\d+(?:[.,]\d+)*|\d+(?:[.,]\d+)*)\b"
 )
 
@@ -32,17 +32,30 @@ FIG_ANY_RE = re.compile(
     re.IGNORECASE
 )
 FIG_NUM_RE = re.compile(
-    r"(?i)\b(?:рис(?:\.|унок)?|figure|fig\.?|картин\w*)\s*(?:№\s*|no\.?\s*)?(\d+(?:[.,]\d+)*)\b"
+    r"(?i)\b(?:рис(?:\.|унок)?|figure|fig\.?|картин\w*)\s*(?:№\s*|no\.?\s*|номер\s*)?(\d+(?:[.,]\d+)*)\b"
 )
 
-# Секции/главы — подсказки, где искать таблицу («глава 2.2», «раздел 3», «§ 1.4», «section 4.1»)
+# Секции/главы — подсказки, где искать («глава 2.2», «раздел 3», «§ 1.4», «section 4.1», «appendix A.1»)
 SECTION_HINT_RE = re.compile(
-    r"(?i)\b(глава|раздел|пункт|подраздел|§|section|chapter|clause)\s*([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)"
+    r"(?i)\b(глава|раздел|пункт|подраздел|§|section|subsection|chapter|clause|appendix)\s*([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)"
 )
 
-# «В главе есть таблица» — мягкие формулировки наличия
+# «в главе есть таблица» (ранее)
 SECTION_HAS_TABLE_RE = re.compile(
-    r"(?i)\b(в|на)\s+(?:этой\s+)?(главе|разделе|пункте|подразделе|section|chapter)\b.*?\b(есть|имеется|присутствует|contains?|has)\b.*?\b(таблиц\w*|table)\b"
+    r"(?i)\b(в|на)\s+(?:этой\s+)?(главе|разделе|пункте|подразделе|section|chapter|subsection)\b.*?\b(есть|имеется|присутствует|contains?|has)\b.*?\b(таблиц\w*|table)\b"
+)
+
+# «в главе есть рисунок/рисунки» (ранее)
+SECTION_HAS_FIG_RE = re.compile(
+    r"(?i)\b(в|на)\s+(?:этой\s+)?(главе|разделе|пункте|подразделе|section|chapter|subsection)\b.*?\b(есть|имеется|присутствует|contains?|has)\b.*?\b(рисун\w*|figure|fig\.?|диаграмм\w*|график\w*|схем\w*|image|diagram|graph|plot)\b"
+)
+
+# НОВОЕ: явные конструкции «рисунок(и)/таблица(ы) в/из/к главе/разделе X» — даже без слова «есть»
+FIG_IN_SECTION_RE = re.compile(
+    r"(?i)\b(рисун\w*|figure|fig\.?|диаграмм\w*|график\w*|схем\w*|image|diagram|graph|plot)\b.*?\b(в|из|к)\s+(главе|разделе|пункте|подразделе|section|chapter|subsection)\s+[A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*"
+)
+TABLE_IN_SECTION_RE = re.compile(
+    r"(?i)\b(таблиц\w*|табл\.|table)\b.*?\b(в|из|к)\s+(главе|разделе|пункте|подразделе|section|chapter|subsection)\s+[A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*"
 )
 
 SOURCES_HINT_RE = re.compile(
@@ -88,6 +101,24 @@ EXACT_NUMBERS_RE = re.compile(
     r"(as-is)"
 )
 
+# НОВОЕ: запрос «прозрачности ссылок/якорей» — показать место в тексте/страницу/раздел
+LINKS_HINT_RE = re.compile(
+    r"(?i)\b(покаж\w*\s+где\s+(это|сказано|написано)|"
+    r"укаж\w*\s+(страниц\w*|раздел|главу|место)|"
+    r"на\s+какой\s+страниц\w+|"
+    r"с\s+ссылк\w+\s+(на|в)\s+текст\w*|"
+    r"дай\s+ссылк\w*\s+на\s+место|"
+    r"(show|give|provide)\s+(page|section)\s+(number|path)|"
+    r"(where)\s+in\s+(the\s+)?(text|document))\b"
+)
+
+# Буллеты/нумерация для многочастных запросов
+BULLET_SPLIT_RE = re.compile(
+    r"(?m)^\s*(?:\d{1,2}[.)]\s+|\(\d{1,2}\)\s+|[-–—•●▪︎►»]\s+)"
+)
+# Разделители в одну строку ";", " ; ", " | " и множественные "?".
+INLINE_SPLIT_RE = re.compile(r"(?:\s*;\s*|\s*\|\s*|\?\s+)(?!\d)")
+
 
 # --------------------------- Вспомогалки ---------------------------
 
@@ -126,6 +157,14 @@ def _sort_key_for_dotted(num: str):
         else:
             key.append((1, p))
     return key
+
+def _clean_piece(s: str) -> str:
+    s = (s or "").strip()
+    # убираем хвостовые лишние разделители
+    s = s.strip(" ;|—–-•●▪︎►»")
+    # одиночный финальный вопрос/точка оставим, но множественные — подрежем
+    s = re.sub(r"([?.!])\1+$", r"\1", s)
+    return s
 
 
 # --------------------------- Публичные парсеры ---------------------------
@@ -186,6 +225,102 @@ def _extract_rows_limit_and_full(text: str) -> Tuple[Optional[int], bool]:
     return (None, False)
 
 
+# --------------------------- Многочастные запросы ---------------------------
+
+def _split_into_subitems(text: str) -> List[str]:
+    """
+    Делит запрос на подпункты:
+      1) По явным буллетам/нумерации в начале строк.
+      2) По ; / | / '? ' как безопасным разделителям.
+    Не делим по одиночной 'и', чтобы не ломать нормальные фразы.
+    """
+    t = (text or "").strip()
+    if not t:
+        return []
+
+    # 1) Буллеты/нумерация — если минимум два подпункта
+    bullets = BULLET_SPLIT_RE.findall(t)
+    if len(bullets) >= 2:
+        parts = BULLET_SPLIT_RE.split(t)
+        # split возвращает чередование "шум/пункты": фильтруем пустое и мусор
+        cand = [p for p in (p.strip() for p in parts) if p]
+        # Защита от ложных срабатываний: если весь текст короткий — не делим
+        if len(" ".join(cand)) >= 20 and len(cand) >= 2:
+            return [_clean_piece(p) for p in cand]
+
+    # 2) В одну строку — ';', '|', '? ' (несколько вопросов подряд)
+    inline = [p for p in INLINE_SPLIT_RE.split(t) if p and not re.fullmatch(r"(;|\||\?)", p)]
+    if len(inline) >= 2:
+        # склеим короткие хвосты обратно (например, аббревиатуры)
+        items: List[str] = []
+        buf = ""
+        for seg in inline:
+            seg = _clean_piece(seg)
+            if not seg:
+                continue
+            if len(seg) < 4 and items:
+                items[-1] = (items[-1] + " " + seg).strip()
+            else:
+                items.append(seg)
+        if len(items) >= 2:
+            return items
+
+    # 3) По нескольким '?'
+    q_splits = [s for s in re.split(r"\?\s*", t) if s]
+    if len(q_splits) >= 2:
+        items = [_clean_piece(s + "?") for s in q_splits[:-1]]
+        tail = _clean_piece(q_splits[-1])
+        if tail:
+            items.append(tail)
+        return [i for i in items if i]
+
+    return []
+
+
+def _classify_item(text: str) -> Dict[str, any]:
+    """
+    Лёгкая классификация подпункта по модальностям (без рекурсии detect_intents).
+    Возвращаем подсказки, с которыми потом сможет работать пайплайн.
+    """
+    item = (text or "").strip()
+    tables_want = bool(TABLE_ANY_RE.search(item))
+    figures_want = bool(FIG_ANY_RE.search(item))
+    sources_want = bool(SOURCES_HINT_RE.search(item))
+
+    table_nums = extract_table_numbers(item) if tables_want else []
+    figure_nums = extract_figure_numbers(item) if figures_want else []
+    sect_hints = extract_section_hints(item)
+
+    rows_limit, include_all = _extract_rows_limit_and_full(item)
+
+    return {
+        "ask": item,
+        "tables": {
+            "want": tables_want,
+            "describe": table_nums,
+            "section_hints": sect_hints if tables_want else [],
+            "from_section": (tables_want and not table_nums and (bool(sect_hints) and (bool(SECTION_HAS_TABLE_RE.search(item)) or bool(TABLE_IN_SECTION_RE.search(item))))),
+            "include_all_values": bool(include_all) if tables_want else False,
+            "rows_limit": rows_limit if tables_want else None,
+        },
+        "figures": {
+            "want": figures_want,
+            "describe": figure_nums,
+            "section_hints": sect_hints if figures_want else [],
+            "from_section": (figures_want and not figure_nums and (bool(sect_hints) and (bool(SECTION_HAS_FIG_RE.search(item)) or bool(FIG_IN_SECTION_RE.search(item))))),
+            "want_vision": bool(FIG_VISION_HINT_RE.search(item)) if figures_want else False,
+        },
+        "sources": {
+            "want": sources_want,
+        },
+        "summary": is_summary_intent(item),
+        "practical": bool(PRACTICAL_RE.search(item)),
+        "gost": bool(GOST_RE.search(item)),
+        "exact_numbers": bool(EXACT_NUMBERS_RE.search(item)),
+        "want_links": bool(LINKS_HINT_RE.search(item)),  # new
+    }
+
+
 # --------------------------- Главный распознаватель ---------------------------
 
 def detect_intents(text: str, *, list_limit: int = 25) -> Dict:
@@ -198,18 +333,22 @@ def detect_intents(text: str, *, list_limit: int = 25) -> Dict:
          "describe": [str], "limit": int,
          "include_all_values": bool, "rows_limit": int|None,
          "section_hints": [str],
-         "from_section": bool              # НОВОЕ — «в главе есть таблица» → искать по разделу и тянуть целиком
+         "from_section": bool
       },
       "figures": {
          "want": bool, "count": bool, "list": bool,
-         "describe": [str], "limit": int, "want_vision": bool
+         "describe": [str], "limit": int, "want_vision": bool,
+         "section_hints": [str], "from_section": bool
       },
       "sources": {"want": bool, "count": bool, "list": bool, "limit": int},
       "summary": bool,
       "practical": bool,
       "gost": bool,
       "exact_numbers": bool,
-      "general_question": str
+      "want_links": bool,
+      "general_question": str,
+      "subitems": [{"id": int, "ask": str, ... модальные подсказки ...}],
+      "multi_want": bool
     }
     """
     q = (text or "").strip()
@@ -226,7 +365,7 @@ def detect_intents(text: str, *, list_limit: int = 25) -> Dict:
             "include_all_values": False,
             "rows_limit": None,
             "section_hints": [],
-            "from_section": False,   # НОВОЕ
+            "from_section": False,
         },
         "figures": {
             "want": False,
@@ -234,17 +373,32 @@ def detect_intents(text: str, *, list_limit: int = 25) -> Dict:
             "list": False,
             "describe": [],
             "limit": int(list_limit),
-            "want_vision": False
+            "want_vision": False,
+            "section_hints": [],
+            "from_section": False,
         },
         "sources": {"want": False, "count": False, "list": False, "limit": int(list_limit)},
         "summary": is_summary_intent(q),
         "practical": bool(PRACTICAL_RE.search(q)),
         "gost": bool(GOST_RE.search(q)),
         "exact_numbers": bool(EXACT_NUMBERS_RE.search(q)),
+        "want_links": bool(LINKS_HINT_RE.search(q)),
         "general_question": q,
+        "subitems": [],
+        "multi_want": False,
     }
 
-    # --- Таблицы
+    # ---- Многочастные запросы (план подпунктов — на будущее для пайплайна)
+    subparts = _split_into_subitems(q)
+    if len(subparts) >= 2:
+        intents["multi_want"] = True
+        intents["subitems"] = []
+        for i, sp in enumerate(subparts, start=1):
+            cls = _classify_item(sp)
+            cls["id"] = i
+            intents["subitems"].append(cls)
+
+    # --- Таблицы (общий слой)
     if TABLE_ANY_RE.search(q):
         intents["tables"]["want"] = True
 
@@ -267,12 +421,10 @@ def detect_intents(text: str, *, list_limit: int = 25) -> Dict:
         if sects:
             intents["tables"]["section_hints"] = sects
 
-        # НОВОЕ: «в главе есть таблица» (без номера) — тянем таблицу целиком по разделу
-        if (not nums) and sects and (SECTION_HAS_TABLE_RE.search(q) or True):
-            # Если есть явные секции и нет номера — считаем, что хотят таблицу(ы) из секции целиком
+        # «В (этой) главе есть таблица …» ИЛИ «таблица в главе …» — без конкретного номера
+        if (not nums) and sects and (SECTION_HAS_TABLE_RE.search(q) or TABLE_IN_SECTION_RE.search(q)):
             intents["tables"]["from_section"] = True
-            # если пользователь явно не просил только первые N строк — включаем выгрузку целиком
-            if rows_limit is None:
+            if rows_limit is None and not intents["tables"]["list"] and not intents["tables"]["count"]:
                 intents["tables"]["include_all_values"] = True
 
     # --- Источники
@@ -297,6 +449,15 @@ def detect_intents(text: str, *, list_limit: int = 25) -> Dict:
         if FIG_VISION_HINT_RE.search(q):
             intents["figures"]["want_vision"] = True
 
+        # Секционные подсказки
+        sects_f = extract_section_hints(q)
+        if sects_f:
+            intents["figures"]["section_hints"] = sects_f
+
+        # «В (этой) главе есть рисунки …» ИЛИ «рисунок(и) в главе …» — без номера
+        if (not nums_f) and sects_f and (SECTION_HAS_FIG_RE.search(q) or FIG_IN_SECTION_RE.search(q)):
+            intents["figures"]["from_section"] = True
+
     logging.debug("INTENTS: %s", json.dumps(intents, ensure_ascii=False))
     return intents
 
@@ -312,5 +473,5 @@ __all__ = [
     "SECTION_HINT_RE", "SECTION_HAS_TABLE_RE",
     "SOURCES_HINT_RE", "PRACTICAL_RE", "GOST_RE",
     "TABLE_ALL_VALUES_RE", "TABLE_ROWS_LIMIT_RE",
-    "EXACT_NUMBERS_RE",
+    "EXACT_NUMBERS_RE", "LINKS_HINT_RE",
 ]

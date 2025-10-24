@@ -653,6 +653,10 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                 if imgs:
                     attrs_here_fig["images"] = imgs
 
+                # добавляем привязку к текущему разделу и стабильный якорь
+                attrs_here_fig["section_scope"] = _hpath_str(heading_stack)
+                attrs_here_fig["anchor"] = f"fig-{(num or figure_counter)}"
+
                 sections.append({
                     "title": fig_title,
                     "level": max(1, level + 1),
@@ -662,6 +666,7 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                     "element_type": "figure",
                     "attrs": attrs_here_fig
                 })
+
                 # сброс «табличного» состояния
                 pending_tbl_num = None
                 pending_tbl_tail = None
@@ -740,6 +745,9 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
             attrs_tbl["label"] = num_final
             attrs_tbl["title"] = tail_final
             attrs_tbl["caption_source"] = caption_source
+            # привязка к разделу + стабильный якорь
+            attrs_tbl["section_scope"] = _hpath_str(heading_stack)
+            attrs_tbl["anchor"] = f"tbl-{(num_final or table_counter)}"
 
             sections.append({
                 "title": t_title or f"Таблица {table_counter}",
@@ -750,6 +758,7 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                 "element_type": "table",
                 "attrs": attrs_tbl
             })
+
 
             # сброс состояния
             pending_tbl_num = None
