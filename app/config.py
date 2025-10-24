@@ -47,7 +47,7 @@ class Cfg:
     PDF_EXTRACT_IMAGES: bool = _env_bool("PDF_EXTRACT_IMAGES", True)
 
     # --- FULLREAD режим ---
-    # По умолчанию включаем "auto": если документ влазит — даём модели целиком,
+    # По умолчанию "auto": если документ влазит — даём модели целиком,
     # иначе читаем итеративно (map → reduce).
     _FULLREAD_MODE_RAW: str = _env_str("FULLREAD_MODE", "auto").lower()
     _FULLREAD_ALIASES = {
@@ -61,18 +61,20 @@ class Cfg:
     FULLREAD_MODE: str = _FULLREAD_ALIASES.get(_FULLREAD_MODE_RAW, "auto")
 
     # Лимиты/бюджеты для FULLREAD
-    FULLREAD_MAX_STEPS: int = _env_int("FULLREAD_MAX_STEPS", 3)
-    FULLREAD_STEP_CHARS: int = _env_int("FULLREAD_STEP_CHARS", 14_000)
+    # Чуть расширены, чтобы реже видеть "Недостающая информация".
+    FULLREAD_MAX_STEPS: int = _env_int("FULLREAD_MAX_STEPS", 6)
+    FULLREAD_STEP_CHARS: int = _env_int("FULLREAD_STEP_CHARS", 20_000)
     FULLREAD_CHUNK_CHARS: int = _env_int("FULLREAD_CHUNK_CHARS", FULLREAD_STEP_CHARS)
     FULLREAD_MAX_SECTIONS: int = _env_int("FULLREAD_MAX_SECTIONS", 120)
-    FULLREAD_CONTEXT_CHARS: int = _env_int("FULLREAD_CONTEXT_CHARS", 9_000)
-    DIRECT_MAX_CHARS: int = _env_int("DIRECT_MAX_CHARS", 150_000)
+    FULLREAD_CONTEXT_CHARS: int = _env_int("FULLREAD_CONTEXT_CHARS", 30_000)
+    # Сколько символов позволяем "скормить" напрямую (если влезает):
+    DIRECT_MAX_CHARS: int = _env_int("DIRECT_MAX_CHARS", 300_000)
 
     # Токен-бюджеты для map/reduce
     FULLREAD_MAP_TOKENS: int = _env_int("FULLREAD_MAP_TOKENS", 600)
     FULLREAD_REDUCE_TOKENS: int = _env_int("FULLREAD_REDUCE_TOKENS", 2_400)
     DIGEST_TOKENS_PER_SECTION: int = _env_int(
-        "DIGEST_TOKENS_PER_SECTION", FULLREAD_MAP_TOKENS
+        "DIGEST_TOKENS_PER_SECTION", 900  # чуть больше, чтобы map-выжимки были полнее
     )
 
     FULLREAD_ENABLE_VISION: bool = _env_bool("FULLREAD_ENABLE_VISION", True)
@@ -86,7 +88,8 @@ class Cfg:
     PLANNER_MAX_TOKENS: int = _env_int("PLANNER_MAX_TOKENS", 500)
     PART_MAX_TOKENS: int = _env_int("PART_MAX_TOKENS", 900)
     MERGE_MAX_TOKENS: int = _env_int("MERGE_MAX_TOKENS", 2_400)
-    FINAL_MAX_TOKENS: int = _env_int("FINAL_MAX_TOKENS", 1_600)
+    # Используется в нескольких местах (stream/non-stream). Подняли до 2400.
+    FINAL_MAX_TOKENS: int = _env_int("FINAL_MAX_TOKENS", 2_400)
 
     # --- Полные выгрузки таблиц (TablesRaw) ---
     FULL_TABLE_MAX_ROWS: int = _env_int("FULL_TABLE_MAX_ROWS", 500)

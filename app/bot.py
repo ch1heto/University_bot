@@ -139,6 +139,19 @@ def _to_html(text: str) -> str:
     return txt
 
 
+# -------- Приветствие --------
+_GREET_RE = re.compile(
+    r"(?i)\b(привет|здравств|добрый\s*(день|вечер|утро)|hello|hi|hey|хай|салют|ку)\b"
+)
+
+def _is_greeting(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    # короткие приветствия или фразы, где встречается ключевое слово
+    return bool(_GREET_RE.search(t))
+
+
 def _split_multipart(text: str,
                      *,
                      target: int = TG_SPLIT_TARGET,
@@ -270,19 +283,21 @@ def _smart_cut_point(s: str, limit: int) -> int:
 
 async def _stream_to_telegram(m: types.Message, stream, head_text: str = "⌛️ Печатаю ответ…") -> None:
     current_text = ""
-    sent_parts = 0  # ← сколько частей уже отправлено в multi-режиме
+    sent_parts = 0
     initial = await m.answer(_to_html(head_text), parse_mode="HTML", disable_web_page_preview=True)
     last_edit_at = _now_ms() - STREAM_HEAD_START_MS
     stop_typer = asyncio.Event()
     typer_task = asyncio.create_task(_typing_loop(m.chat.id, stop_event=stop_typer))
 
+    # 🔧 новое: после первой части в multi больше не редактируем initial
+    freeze_initial = False
+
     try:
         async for delta in _iterate_chunks(_ensure_iterable(stream)):
             current_text += delta
 
-            # 3.a) мульти-режим: как только накопили «солидный» кусок — сбрасываем как отдельное сообщение
+            # 3.a) мульти-режим: сбрасываем порциями
             if STREAM_MODE == "multi" and sent_parts < TG_SPLIT_MAX_PARTS - 1 and len(current_text) >= TG_SPLIT_TARGET:
-                # ищем красивую границу в буфере
                 cut = -1
                 for mm in _SPLIT_ANCHOR_RE.finditer(current_text[: min(len(current_text), TG_MAX_CHARS)]):
                     if mm.start() < TG_SPLIT_TARGET:
@@ -291,10 +306,10 @@ async def _stream_to_telegram(m: types.Message, stream, head_text: str = "⌛️
                     cut = _smart_cut_point(current_text, min(TG_MAX_CHARS, TG_SPLIT_TARGET))
 
                 part = current_text[:cut].rstrip()
-                # первый кусок — редактируем заглушку; остальные — отправляем новыми сообщениями
                 try:
                     if sent_parts == 0:
                         await initial.edit_text(_to_html(part), parse_mode="HTML", disable_web_page_preview=True)
+                        freeze_initial = True  # <- больше не трогаем initial
                     else:
                         await m.answer(_to_html(part), parse_mode="HTML", disable_web_page_preview=True)
                 except TelegramBadRequest:
@@ -305,34 +320,39 @@ async def _stream_to_telegram(m: types.Message, stream, head_text: str = "⌛️
                 last_edit_at = _now_ms()
                 continue
 
-            # 3.b) защита от жёсткого лимита Telegram (в любом режиме)
+            # 3.b) защита от лимита
             if len(current_text) >= TG_MAX_CHARS:
                 cut = _smart_cut_point(current_text, TG_MAX_CHARS)
                 final_part = current_text[:cut]
-                try:
-                    await initial.edit_text(_to_html(final_part), parse_mode="HTML", disable_web_page_preview=True)
-                except TelegramBadRequest:
+
+                if STREAM_MODE == "multi" and (freeze_initial or sent_parts > 0):
+                    # 🔧 в multi не редактируем initial после 1-й части
                     await m.answer(_to_html(final_part), parse_mode="HTML", disable_web_page_preview=True)
+                else:
+                    try:
+                        await initial.edit_text(_to_html(final_part), parse_mode="HTML", disable_web_page_preview=True)
+                    except TelegramBadRequest:
+                        await m.answer(_to_html(final_part), parse_mode="HTML", disable_web_page_preview=True)
 
                 current_text = current_text[cut:].lstrip()
-                # новый плейсхолдер для следующей порции
-                initial = await m.answer(_to_html("…"), parse_mode="HTML", disable_web_page_preview=True)
+                # 🔧 новый плейсхолдер нужен только в edit-режиме
+                if STREAM_MODE == "edit":
+                    initial = await m.answer(_to_html("…"), parse_mode="HTML", disable_web_page_preview=True)
                 last_edit_at = _now_ms()
                 continue
 
-            # 3.c) обычные периодические правки (режим "edit")
+            # 3.c) периодические правки — 🔧 ТОЛЬКО в режиме edit
             now = _now_ms()
-            if (now - last_edit_at) >= STREAM_EDIT_INTERVAL_MS and len(current_text) >= STREAM_MIN_CHARS:
+            if STREAM_MODE == "edit" and (now - last_edit_at) >= STREAM_EDIT_INTERVAL_MS and len(current_text) >= STREAM_MIN_CHARS:
                 try:
                     await initial.edit_text(_to_html(current_text), parse_mode="HTML", disable_web_page_preview=True)
                     last_edit_at = now
                 except TelegramBadRequest:
                     pass
 
-        # финальный «хвост»
+        # финальный хвост
         if current_text:
             try:
-                # если уже были части и мы в multi — последнюю часть шлём отдельным сообщением
                 if STREAM_MODE == "multi" and sent_parts > 0:
                     await m.answer(_to_html(current_text), parse_mode="HTML", disable_web_page_preview=True)
                 else:
@@ -367,6 +387,7 @@ async def _run_multistep_answer(
         return False
 
     # план из coverage или строим планерoм
+            # план из coverage или строим планером
         items = (discovered_items or [])
     if not items:
         try:
@@ -1255,6 +1276,62 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
             "describe": [],
         }
 
+        # Авто-описание для общего запроса про таблицы
+        desc_cards = []
+        if not intents["tables"].get("describe"):
+            # возьмём первые 3–5 таблиц из списка
+            bases = _distinct_table_basenames(uid, doc_id)[:min(5, intents["tables"]["limit"])]
+            con = get_conn()
+            cur = con.cursor()
+            for base in bases:
+                # attrs + первые 1–2 строки
+                cur.execute("""
+                    SELECT page, section_path, attrs FROM chunks
+                    WHERE owner_id=? AND doc_id=? AND element_type IN ('table','table_row')
+                    AND (section_path=? OR section_path LIKE ? || ' [row %')
+                    ORDER BY id ASC LIMIT 1
+                """, (uid, doc_id, base, base))
+                row = cur.fetchone()
+                if not row:
+                    continue
+
+                cur.execute("""
+                    SELECT text FROM chunks
+                    WHERE owner_id=? AND doc_id=? AND element_type='table_row'
+                    AND (section_path=? OR section_path LIKE ? || ' [row %')
+                    ORDER BY id ASC LIMIT 2
+                """, (uid, doc_id, row["section_path"], row["section_path"]))
+                rows = cur.fetchall() or []
+                highlights = []
+                for r in rows:
+                    first = (r["text"] or "").split("\n")[0]
+                    if first:
+                        highlights.append(" — ".join([c.strip() for c in first.split(" | ") if c.strip()]))
+
+                attrs_json = row["attrs"] if row else None
+                display = _compose_display_from_attrs(attrs_json, row["section_path"], highlights[0] if highlights else None)
+                display = _strip_table_prefix(display)
+
+                # попробуем вытащить номер для stats
+                num, _ = _parse_table_title(display)
+                stats = None
+                if num:
+                    try:
+                        stats = analyze_table_by_num(uid, doc_id, num, max_series=6)
+                    except Exception:
+                        stats = None
+
+                desc_cards.append({
+                    "num": num,
+                    "display": display,
+                    "where": {"page": row["page"], "section_path": row["section_path"]},
+                    "highlights": highlights,
+                    "stats": stats,
+                })
+            con.close()
+
+        # запишем даже если список пустой — генератор ответа это учтёт
+        facts["tables"]["describe"] = desc_cards
         # describe по конкретным номерам + точные расчеты
         desc_cards = []
         if intents["tables"]["describe"]:
@@ -1596,7 +1673,8 @@ def _map_extract(uid: int, doc_id: int, question: str, chunk_text: str, *, map_t
     sys_map = (
         "Ты ассистент-экстрактор. Тебе дан фрагмент диплома и вопрос. "
         "Извлеки ТОЛЬКО факты и мини-цитаты, относящиеся к вопросу. "
-        "Формат: краткие буллеты (до 8), без новых данных. Никаких длинных пересказов."
+        "Если встречаются таблицы — включай их названия и 1–2 ключевые строки с числами "
+        "(сохраняй порядок и значения). Формат: буллеты."
     )
     return chat_with_gpt(
         [
@@ -1966,7 +2044,10 @@ async def qa(m: types.Message):
 
     # Строгий режим: без активного документа не отвечаем по содержанию
     if not doc_id:
-        await _send(m, "Сначала пришлите файл (.doc/.docx). Без него я не отвечаю по содержанию.")
+        if _is_greeting(text):
+            await start(m)
+        else:
+            await _send(m, "Сначала пришлите файл (.doc/.docx). Без него я не отвечаю по содержанию.")
         return
 
     await respond_with_answer(m, uid, doc_id, text)
