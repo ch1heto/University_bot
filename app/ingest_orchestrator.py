@@ -1,8 +1,28 @@
+# app/ingest_orchestrator.py
 from __future__ import annotations
 
+import os
 import re
-from typing import List, Dict, Any, Optional, Tuple
+import io
+import uuid
+import json
+import time
+import hashlib
+from typing import List, Dict, Any, Optional, Tuple, Callable
 from copy import deepcopy
+from pathlib import Path
+
+from .config import Cfg, ProcessingState
+from .db import (
+    find_existing_document,
+    insert_document,
+    update_document_meta,
+    set_document_indexer_version,
+    start_indexing,
+    finish_indexing_success,
+    finish_indexing_error,
+    CURRENT_INDEXER_VERSION,
+)
 
 # Необязательные зависимости — если их нет, просто деградируем без ошибок
 try:
@@ -20,6 +40,12 @@ except Exception:  # pragma: no cover
     def is_table_image_section(sec: Dict[str, Any]) -> bool:
         return False
 
+# --- Мягкие зависимости для парсинга / OCR ---
+try:
+    from .parsing import parse_docx, parse_pdf, parse_doc
+except Exception:
+    parse_docx = parse_pdf = parse_doc = None  # будем валить осмысленной ошибкой
+
 # ----------------------------- КОНСТАНТЫ / РЕГЕКСЫ -----------------------------
 
 # Подписи к таблицам: «Таблица 2.3 — Название», допускаем буквы «А.1», «П1.2»
@@ -36,7 +62,37 @@ _FIG_CAP_RE = re.compile(
 _REF_LINE_RE = re.compile(r"^\s*(?:\[(\d+)\]|(\d{1,3})[.)])\s+(.+)$")
 
 
-# ----------------------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ -----------------------------
+# ----------------------------- УТИЛИТЫ ОРКЕСТРАЦИИ -----------------------------
+
+class IngestError(Exception):
+    """Обёртка ошибок на этапе индексации (для единообразного репортинга в FSM)."""
+
+
+def _file_sha256(path: str, chunk: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def _detect_kind(path: str, fallback: str = "doc") -> str:
+    ext = (os.path.splitext(path)[1] or "").lower()
+    if ext in {".docx"}:
+        return "docx"
+    if ext in {".pdf"}:
+        return "pdf"
+    if ext in {".txt", ".md"}:
+        return "txt"
+    if ext in {".doc"}:
+        return "doc"
+    return fallback
+
+
+# ----------------------------- ОБОГАЩЕНИЕ (оставляем из вашего файла) -----------------------------
 
 def _norm_num(s: Optional[str]) -> Optional[str]:
     if not s:
@@ -79,8 +135,6 @@ def _parse_figure_caption_from(path_or_text: str) -> Tuple[Optional[str], Option
     return _norm_num(m.group(1)), (m.group(2) or "").strip() or None
 
 
-# ----------------------------- ОБОГАЩЕНИЕ ТАБЛИЦ -----------------------------
-
 def _enrich_tables(sections: List[Dict[str, Any]]) -> None:
     """
     Проставляет для таблиц/table_row единые attrs:
@@ -89,7 +143,6 @@ def _enrich_tables(sections: List[Dict[str, Any]]) -> None:
       - header_preview (по первой строке таблицы, если она есть)
     Ничего не удаляет и не переименовывает.
     """
-    # Сгруппируем по базовому имени секции таблицы
     groups: Dict[str, List[int]] = {}
     for i, sec in enumerate(sections):
         et = (sec.get("element_type") or "").lower()
@@ -102,17 +155,14 @@ def _enrich_tables(sections: List[Dict[str, Any]]) -> None:
         groups.setdefault(base, []).append(i)
 
     for base, idxs in groups.items():
-        # 1) Извлекаем номер/название из хвоста базового имени или из текста
         tail = _last_segment(base)
         num, title = _parse_table_caption_from(tail)
         if not num or not title:
-            # fallback: ищем по первому из группы
             first = sections[idxs[0]]
             n2, t2 = _parse_table_caption_from(first.get("text") or "")
             num = num or n2
             title = title or t2
 
-        # 2) Берём превью по первой строке (ищем первую секцию row)
         preview = None
         for i in idxs:
             sp_i = sections[i].get("section_path") or ""
@@ -125,7 +175,6 @@ def _enrich_tables(sections: List[Dict[str, Any]]) -> None:
                 preview = header_preview_from_row(first_line)
                 break
 
-        # 3) Проставляем attrs для всех секций группы
         for i in idxs:
             attrs = _ensure_attrs(sections[i])
             if num and not attrs.get("caption_num"):
@@ -136,15 +185,11 @@ def _enrich_tables(sections: List[Dict[str, Any]]) -> None:
                 attrs["header_preview"] = preview
 
 
-# ----------------------------- ОБОГАЩЕНИЕ РИСУНКОВ -----------------------------
-
 def _enrich_figures(sections: List[Dict[str, Any]]) -> None:
     """
     Проставляет для фигуры attrs:
       - caption_num
       - caption_tail
-    Изображения не трогаем (предполагается, что парсер положил их в attrs.images;
-    если нет — оставляем как есть, чтобы не ломать пайплайн).
     """
     for sec in sections:
         et = (sec.get("element_type") or "").lower()
@@ -160,14 +205,11 @@ def _enrich_figures(sections: List[Dict[str, Any]]) -> None:
         if tail and not attrs.get("caption_tail"):
             attrs["caption_tail"] = tail
 
-        # Если это явно картинка таблицы (скан), помечаем флаг — downstream-логика может включить OCR
         if is_table_image_section(sec):
             attrs.setdefault("flags", [])
             if "table_like_image" not in attrs["flags"]:
                 attrs["flags"].append("table_like_image")
 
-
-# ----------------------------- ОБОГАЩЕНИЕ ИСТОЧНИКОВ -----------------------------
 
 def _split_references_block(sections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
@@ -176,7 +218,6 @@ def _split_references_block(sections: List[Dict[str, Any]]) -> List[Dict[str, An
     Если в документе уже есть отдельные reference – ничего не делаем.
     Возвращаем НОВЫЙ список секций (оригинал не мутируем).
     """
-    # Если уже есть элементы reference — выходим
     if any((sec.get("element_type") or "").lower() == "reference" for sec in sections):
         return sections
 
@@ -186,13 +227,10 @@ def _split_references_block(sections: List[Dict[str, Any]]) -> List[Dict[str, An
     for sec in sections:
         sp = sec.get("section_path") or ""
         txt = (sec.get("text") or "").strip()
-
-        # не подходит — просто переносим
         if not txt or not _is_reference_section_name(sp):
             out.append(sec)
             continue
 
-        # пробуем построчно распарсить
         lines = [ln for ln in txt.splitlines() if ln.strip()]
         found_any = False
 
@@ -216,43 +254,241 @@ def _split_references_block(sections: List[Dict[str, Any]]) -> List[Dict[str, An
         if found_any:
             changed = True
         else:
-            # строковая разметка не найдена — переносим как есть
             out.append(sec)
 
     return out if changed else sections
 
 
-# ----------------------------- ПУБЛИЧНОЕ API -----------------------------
-
 def enrich_sections(
     sections: List[Dict[str, Any]],
     *,
-    doc_kind: Optional[str] = None,          # тип документа (docx/pdf/pdf_scan и т.п.)
-    enable_ocr: bool = True,                 # флаги на будущее; не ломают старую логику
+    doc_kind: Optional[str] = None,
+    enable_ocr: bool = True,
     enable_table_ocr: bool = True,
     normalise_numbers: bool = True,
     detect_figures: bool = True,
-    **kwargs,                                # чтобы не падать от «неожиданных» аргументов
+    **kwargs,
 ) -> List[Dict[str, Any]]:
     """
-    Главная точка входа для «ингеста». Принимает список секций (как возвращают parse_docx/pdf/doc)
-    и возвращает обновлённый список секций.
-    Параметры doc_kind/флаги опциональны и безопасно игнорируются, если не используются.
+    Главная точка входа для «ингеста». Принимает список секций и возвращает обновлённый список.
     """
     if not sections:
         return sections
 
-    # лёгкая настройка по типу документа: для скан-PDF усиливаем эвристику таблиц
     dk = (doc_kind or "").lower()
     if dk in {"scan", "pdf_scan", "image_pdf"}:
         enable_ocr = True
         enable_table_ocr = True
 
-    # обогащение таблиц/рисунков как и раньше (флаги пока информативные)
     _enrich_tables(sections)
     if detect_figures:
         _enrich_figures(sections)
-
-    # разбиение «Списка литературы» на элементы reference
     sections = _split_references_block(sections)
     return sections
+
+
+# ----------------------------- НОВОЕ: кеш и OCR -----------------------------
+
+def _cache_dir() -> Path:
+    base = Path(Cfg.UPLOAD_DIR or "./uploads")
+    d = base / "_index_cache"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+def _cache_path_for_sha(sha256: str) -> Path:
+    return _cache_dir() / f"{sha256}.json"
+
+def _load_cached_sections(sha256: str) -> Optional[List[Dict[str, Any]]]:
+    p = _cache_path_for_sha(sha256)
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+def _save_cached_sections(sha256: str, sections: List[Dict[str, Any]]) -> str:
+    p = _cache_path_for_sha(sha256)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(sections, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(p)
+    return str(p)
+
+
+# ----------------------------- ПУБЛИЧНАЯ ОРКЕСТРАЦИЯ -----------------------------
+
+IndexFn = Callable[[int, str, str], Dict[str, Any]]
+# сигнатура: indexer_fn(doc_id, file_path, kind) -> {"sections_count": int, "chunks_count": int, ...}
+
+def _build_structured_sections(file_path: str, kind: str) -> List[Dict[str, Any]]:
+    """
+    Общая точка входа для структурированного парсинга.
+    """
+    k = (kind or "").lower()
+    if k == "docx":
+        if not parse_docx:
+            raise IngestError("parse_docx недоступен (не импортирован parsing.py).")
+        sections = parse_docx(file_path)
+    elif k == "pdf":
+        if not parse_pdf:
+            raise IngestError("parse_pdf недоступен (не импортирован parsing.py).")
+        sections = parse_pdf(file_path)
+    elif k == "doc":
+        if not parse_doc:
+            raise IngestError("parse_doc недоступен (не импортирован parsing.py).")
+        sections = parse_doc(file_path)
+    elif k == "txt":
+        # Простейший одно-секционный парсинг
+        body = Path(file_path).read_text(encoding="utf-8", errors="ignore")
+        sections = [{
+            "title": "Документ",
+            "level": 1,
+            "text": body,
+            "page": None,
+            "section_path": "Документ",
+            "element_type": "paragraph",
+            "attrs": {}
+        }]
+    else:
+        # fallback как txt
+        body = Path(file_path).read_text(encoding="utf-8", errors="ignore")
+        sections = [{
+            "title": "Документ",
+            "level": 1,
+            "text": body,
+            "page": None,
+            "section_path": "Документ",
+            "element_type": "paragraph",
+            "attrs": {}
+        }]
+
+    # Дополнительное обогащение (таблицы/рисунки/референсы)
+    sections = enrich_sections(sections, doc_kind=k)
+    return sections
+
+
+def ingest_document(
+    user_id: int,
+    file_path: str,
+    *,
+    kind: Optional[str] = None,
+    file_uid: Optional[str] = None,
+    content_sha256: Optional[str] = None,
+    layout_profile: Optional[str] = None,
+    force_reindex: bool = False,
+    indexer_fn: Optional[IndexFn] = None,
+) -> Dict[str, Any]:
+    """
+    Атомарный оркестратор «файл → индексация → READY».
+
+    - Идемпотентно переиспользует документ по SHA256/UID (если разрешено).
+    - Переводит FSM-состояния: INDEXING → (READY|IDLE при ошибке).
+    - Строит структурированный индекс, делает мягкий OCR изображений и кеширует по SHA.
+    - Вызывает ваш индексатор (indexer_fn), который обязан записать чанки/эмбеддинги.
+    - На успехе выставляет индексатор-версию документа.
+
+    Возвращает словарь с полями:
+        {
+          "doc_id": int,
+          "reused": bool,
+          "kind": str,
+          "sha256": str,
+          "file_uid": str|None,
+          "indexer_version": int|None,
+          "index_result": dict|None
+        }
+    """
+    if not os.path.isfile(file_path):
+        raise IngestError(f"Файл не найден: {file_path}")
+
+    # 1) Определяем тип и SHA
+    resolved_kind = kind or _detect_kind(file_path)
+    sha256 = content_sha256 or _file_sha256(file_path)
+
+    # 2) Идемпотентность: если документ уже есть и актуален — не индексируем заново
+    reused_doc_id: Optional[int] = None
+    if Cfg.INGEST_IDEMPOTENCY_BY_HASH and not force_reindex:
+        reused_doc_id = find_existing_document(owner_id=user_id, content_sha256=sha256, file_uid=file_uid)
+
+    if reused_doc_id and not force_reindex:
+        # обновим метаданные (пути/sha/uid/профиль)
+        update_document_meta(
+            reused_doc_id,
+            path=file_path,
+            content_sha256=sha256,
+            file_uid=file_uid,
+            layout_profile=layout_profile,
+        )
+        # сразу помечаем как READY — документ уже есть; реиндексация не требуется
+        finish_indexing_success(user_id, doc_id=reused_doc_id)
+        return {
+            "doc_id": reused_doc_id,
+            "reused": True,
+            "kind": resolved_kind,
+            "sha256": sha256,
+            "file_uid": file_uid,
+            "indexer_version": None,   # не меняли
+            "index_result": {
+                "note": "document reused by hash",
+                "prepared_sections_cache": str(_cache_path_for_sha(sha256)),
+            },
+        }
+
+    # 3) Создаём запись документа и переходим в INDEXING
+    doc_id = insert_document(
+        owner_id=user_id,
+        kind=resolved_kind,
+        path=file_path,
+        content_sha256=sha256,
+        file_uid=file_uid,
+    )
+    ingest_job_id = str(uuid.uuid4())
+    start_indexing(user_id, doc_id=doc_id, ingest_job_id=ingest_job_id)
+
+    # 4) Структурированный парсинг + OCR + кеш по хэшу
+    try:
+        cache_used = False
+        sections: Optional[List[Dict[str, Any]]] = None
+        cache_path = _cache_path_for_sha(sha256)
+
+        if not force_reindex:
+            sections = _load_cached_sections(sha256)
+            cache_used = sections is not None
+
+        if not sections:
+            # строим с нуля
+            sections = _build_structured_sections(file_path, resolved_kind)
+            _save_cached_sections(sha256, sections)
+
+        # 5) Запускаем индексатор пользователя (опционально)
+        index_result: Dict[str, Any] = {
+            "sections_count": len(sections or []),
+            "chunks_count": None,
+            "prepared_sections_cache": str(cache_path),
+            "cache_used": cache_used,
+        }
+
+        if indexer_fn:
+            # индексатор обязан сам записать чанки/эмбеддинги в БД (может прочитать sections из кеша по sha)
+            user_idx_res = indexer_fn(doc_id, file_path, resolved_kind) or {}
+            # негрубо смёржим мета
+            index_result.update({k: v for k, v in user_idx_res.items() if k not in index_result or v is not None})
+
+        # 6) Фиксируем версию индексатора и помечаем READY
+        set_document_indexer_version(doc_id)
+        finish_indexing_success(user_id, doc_id=doc_id)
+
+        return {
+            "doc_id": doc_id,
+            "reused": False,
+            "kind": resolved_kind,
+            "sha256": sha256,
+            "file_uid": file_uid,
+            "indexer_version": int(CURRENT_INDEXER_VERSION),
+            "index_result": index_result,
+        }
+
+    except Exception as e:
+        # Ошибка индексации — переводим в IDLE и пробрасываем исключение вверх (по желанию)
+        finish_indexing_error(user_id, error_message=str(e))
+        raise IngestError(f"Ошибка индексации: {e}") from e

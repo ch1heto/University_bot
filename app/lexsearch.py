@@ -12,6 +12,32 @@ _WHITESPACE_RE = re.compile(r"\s+")
 _NUM_RE = re.compile(r"\b\d+(?:[.,]\d+)?%?\b")
 _TOKEN_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁё_+-]+", re.UNICODE)
 
+# NEW: детерминированный парсер области "глава/раздел/пункт 2.2", "chapter 2.2", "sec. 2.2"
+_SECTION_SCOPE_RE = re.compile(
+    r"(?i)\b(?:глава|раздел|пункт|подраздел|секц(?:ия)?|sec(?:tion)?\.?|chapter)\s*"
+    r"(?:№\s*|no\.?\s*|номер\s*)?"
+    r"([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)"
+)
+
+def _parse_section_scope(q: str) -> Optional[str]:
+    """
+    Возвращает нормализованный префикс секции ('2.2' или 'A.1') если в вопросе есть
+    явная ссылка на главу/раздел/пункт. Иначе — None.
+    """
+    m = _SECTION_SCOPE_RE.search(q or "")
+    if not m:
+        return None
+    raw = (m.group(1) or "").strip().replace(" ", "")
+    return raw.replace(",", ".")
+
+# ID/область
+RE_CHAPTER = re.compile(
+    r"(?i)\b(?:(?:в|по)\s+)?(?:глав[аеы]|раздел|пункт|подраздел|секц(?:ия)?|chapter|section|sec\.?)\s*"
+    r"([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)"
+)
+RE_FIG = re.compile(r"(?i)\b(?:рис(?:\.|унок)?|figure|fig\.?)\s*(?:№\s*)?([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)")
+RE_TBL = re.compile(r"(?i)\b(?:табл(?:ица)?|table)\s*(?:№\s*)?([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)")
+
 def _norm_text(s: str | None) -> str:
     if not s:
         return ""
@@ -27,12 +53,20 @@ def _table_has(con, table: str) -> bool:
     cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,))
     return cur.fetchone() is not None
 
+def _table_info(con, table: str) -> set[str]:
+    cur = con.cursor()
+    cur.execute(f"PRAGMA table_info({table})")
+    return {row[1] for row in cur.fetchall()}
+
 def _fts_available(con) -> bool:
     return _table_has(con, "chunks_fts")
 
 def _sanitize_like(q: str) -> str:
     # экранирование для LIKE
     return (q or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+def _has_col(con, table: str, col: str) -> bool:
+    return col in _table_info(con, table)
 
 # ---------- безопасная сборка FTS5-запроса ----------
 
@@ -54,15 +88,222 @@ def _make_fts_query(raw: str) -> str:
     parts = [f'"{t}"*' for t in toks[:10]]  # ограничим до 10 токенов
     return " OR ".join(parts)
 
-# ------------------------- core: lex search -------------------------
+# ---------------------------- ID parsing ----------------------------
 
-def lex_search(owner_id: int, doc_id: int, query: str, limit: int = 20) -> List[Dict[str, Any]]:
+def _norm_label(s: str | None) -> str:
+    if not s:
+        return ""
+    return re.sub(r"\s+", "", str(s)).replace(",", ".").strip()
+
+def parse_query_ids(q: str) -> Dict[str, Any]:
+    """
+    Парсит запрос пользователя на предмет:
+    - area: глава/раздел N  -> {'area_num': '1.2'}
+    - target: рисунок/таблица N -> {'target_kind': 'figure'|'table', 'target_num': '2.1'}
+    """
+    s = _norm_text(q)
+    out: Dict[str, Any] = {}
+
+    m_area = RE_CHAPTER.search(s)
+    if m_area:
+        out["area_num"] = _norm_label(m_area.group(1))
+
+    m_fig = RE_FIG.search(s)
+    m_tbl = RE_TBL.search(s)
+    if m_fig:
+        out["target_kind"] = "figure"
+        out["target_num"] = _norm_label(m_fig.group(1))
+    elif m_tbl:
+        out["target_kind"] = "table"
+        out["target_num"] = _norm_label(m_tbl.group(1))
+
+    return out
+
+# ---------------------------- suggestions (Levenshtein) ----------------------------
+
+def _levenshtein(a: str, b: str) -> int:
+    a, b = a or "", b or ""
+    n, m = len(a), len(b)
+    if n == 0: return m
+    if m == 0: return n
+    prev = list(range(m + 1))
+    cur = [0] * (m + 1)
+    for i in range(1, n + 1):
+        cur[0] = i
+        ca = a[i - 1]
+        for j in range(1, m + 1):
+            cb = b[j - 1]
+            cost = 0 if ca == cb else 1
+            cur[j] = min(cur[j-1] + 1, prev[j] + 1, prev[j-1] + cost)
+        prev, cur = cur, prev
+    return prev[m]
+
+# ---------------------------- document_sections helpers ----------------------------
+
+def _load_sections(owner_id: int, doc_id: int, *, kind: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Пытаемся читать из document_sections; если таблицы нет — мягкий фолбэк на chunks.
+    kind: 'figure' | 'table' | 'heading' | None (все)
+    """
+    con = get_conn()
+    cur = con.cursor()
+    use_doc_sections = _table_has(con, "document_sections")
+
+    rows = []
+    if use_doc_sections:
+        if kind:
+            cur.execute(
+                "SELECT ord, title, level, page, section_path, element_type, text, attrs "
+                "FROM document_sections WHERE doc_id=? AND element_type=? ORDER BY ord ASC",
+                (doc_id, kind),
+            )
+        else:
+            cur.execute(
+                "SELECT ord, title, level, page, section_path, element_type, text, attrs "
+                "FROM document_sections WHERE doc_id=? ORDER BY ord ASC",
+                (doc_id,),
+            )
+        rows = cur.fetchall() or []
+    else:
+        # Фолбэк: собираем «секции» прямо из chunks
+        cols = _table_info(con, "chunks")
+        has_attrs = "attrs" in cols
+        has_et   = "element_type" in cols
+        sel_attrs = "attrs" if has_attrs else "NULL AS attrs"
+        sel_et    = "element_type" if has_et else "'' AS element_type"
+
+        if kind and has_et:
+            cur.execute(
+                f"""
+                SELECT id AS ord, '' AS title, 0 AS level, page, section_path, {sel_et} AS element_type, text, {sel_attrs} AS attrs
+                FROM chunks
+                WHERE owner_id=? AND doc_id=? AND element_type=?
+                ORDER BY id ASC
+                """,
+                (owner_id, doc_id, kind),
+            )
+        else:
+            cur.execute(
+                f"""
+                SELECT id AS ord, '' AS title, 0 AS level, page, section_path, {sel_et} AS element_type, text, {sel_attrs} AS attrs
+                FROM chunks
+                WHERE owner_id=? AND doc_id=?
+                ORDER BY id ASC
+                """,
+                (owner_id, doc_id),
+            )
+        rows = cur.fetchall() or []
+
+    con.close()
+
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        try:
+            import json
+            attrs = json.loads(r["attrs"]) if "attrs" in r.keys() and r["attrs"] else {}
+        except Exception:
+            attrs = {}
+        out.append({
+            "ord": r["ord"],
+            "title": r.get("title") or "",
+            "level": r.get("level"),
+            "page": r["page"],
+            "section_path": r["section_path"] or "",
+            "element_type": (r.get("element_type") or "").lower(),
+            "text": r["text"] or "",
+            "attrs": attrs,
+        })
+    return out
+
+def _find_area_prefix(owner_id: int, doc_id: int, area_num: str) -> Optional[str]:
+    """
+    Ищем префикс области. Если заголовок не нашли — пробуем по chunks.section_path LIKE 'N%'.
+    В крайнем случае возвращаем сам номер как префикс.
+    """
+    if not area_num:
+        return None
+
+    sections = _load_sections(owner_id, doc_id, kind="heading")
+    pat = re.compile(rf"(^|\D){re.escape(area_num)}(\D|$)")
+    for s in sections:
+        t = f"{s.get('title','')} || {s.get('section_path','')}"
+        if pat.search(t):
+            return s.get("section_path") or s.get("title") or area_num
+
+    # Фолбэк по chunks
+    con = get_conn()
+    cur = con.cursor()
+    try:
+        cur.execute(
+            "SELECT section_path FROM chunks WHERE owner_id=? AND doc_id=? AND section_path LIKE ? || '%' ORDER BY id ASC LIMIT 1",
+            (owner_id, doc_id, area_num),
+        )
+        row = cur.fetchone()
+        if row and row["section_path"]:
+            return row["section_path"]
+    finally:
+        con.close()
+    return area_num
+
+def _find_target_by_id(owner_id: int, doc_id: int, kind: str, num: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Сначала ищем по attrs.caption_num/label в document_sections;
+    если таблицы нет — _load_sections() вернёт данные из chunks (фолбэк).
+    """
+    want = _norm_label(num)
+    secs = _load_sections(owner_id, doc_id, kind=kind)
+
+    hits: List[Dict[str, Any]] = []
+    cands: List[Tuple[int, Dict[str, Any]]] = []
+
+    for s in secs:
+        a = s.get("attrs") or {}
+        lab = _norm_label(a.get("caption_num") or a.get("label") or "")
+        if lab:
+            if lab == want:
+                hits.append(s)
+            else:
+                cands.append((_levenshtein(want, lab), s))
+
+    # если точного попадания по attrs нет — пробуем по подписи в section_path/text
+    if not hits:
+        needle_ru = rf"(?i)\b{'рисунок' if kind=='figure' else 'таблица'}\s+{re.escape(want)}\b"
+        needle_en = rf"(?i)\b{'figure' if kind=='figure' else 'table'}\s+{re.escape(want)}\b"
+        rgx_ru = re.compile(needle_ru)
+        rgx_en = re.compile(needle_en)
+        for s in secs:
+            sp = s.get("section_path") or ""
+            tx = s.get("text") or ""
+            if rgx_ru.search(sp) or rgx_ru.search(tx) or rgx_en.search(sp) or rgx_en.search(tx):
+                hits.append(s)
+
+    cands.sort(key=lambda x: x[0])
+    sugg = [{
+        "label": _norm_label((s.get("attrs") or {}).get("caption_num") or (s.get("attrs") or {}).get("label") or ""),
+        "title": s.get("title") or "",
+        "section_path": s.get("section_path") or "",
+        "dist": int(d),
+    } for d, s in cands[:5]]
+
+    return hits, sugg
+
+# ------------------------- core: lex search (с фильтрами) -------------------------
+
+def lex_search(owner_id: int,
+               doc_id: int,
+               query: str,
+               limit: int = 20,
+               *,
+               section_prefix: Optional[str] = None,
+               element_types: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     """
     Лексический поиск по документу:
-    - если есть FTS5 (chunks_fts) — используем MATCH (строка-запрос параметризуется),
+    - если есть FTS5 (chunks_fts) — используем MATCH,
     - иначе fallback на LIKE.
-    Возвращает [{id, page, section_path, text, score, source}], где source ∈ {"fts","like"}.
-    score: для bm25 — значение ранга (чем МЕНЬШЕ, тем лучше), без bm25 — 1.0; для LIKE — эвристика.
+    Фильтры:
+      section_prefix: ограничить section_path LIKE '{prefix}%'
+      element_types:  ограничить по типам (если колонка есть): ['paragraph','table','figure','heading','page','table_row']
+    Возвращает [{id, page, section_path, text, score, source}].
     """
     q = _norm_text(query)
     if not q:
@@ -71,6 +312,27 @@ def lex_search(owner_id: int, doc_id: int, query: str, limit: int = 20) -> List[
     con = get_conn()
     rows: List[Dict[str, Any]] = []
 
+    # Какая схема у chunks
+    chunks_cols = _table_info(con, "chunks")
+    has_elem_col = ("element_type" in chunks_cols)
+
+    # WHERE кусочки
+    extra_where = []
+    params: List[Any] = []
+
+    if section_prefix:
+        extra_where.append("c.section_path LIKE ? ESCAPE '\\'")
+        params.append(_sanitize_like(section_prefix) + "%")
+
+    if element_types and has_elem_col:
+        placeholders = ",".join("?" for _ in element_types)
+        extra_where.append(f"c.element_type IN ({placeholders})")
+        params.extend([et for et in element_types])
+
+    extra_sql = ""
+    if extra_where:
+        extra_sql = " AND " + " AND ".join(extra_where)
+
     if _fts_available(con):
         fts_q = _make_fts_query(q)
         if not fts_q:
@@ -78,16 +340,15 @@ def lex_search(owner_id: int, doc_id: int, query: str, limit: int = 20) -> List[
             return []
         cur = con.cursor()
         try:
-            # Вариант с bm25() — может отсутствовать в сборке sqlite
-            sql = """
+            sql = f"""
             SELECT c.id, c.page, c.section_path, c.text, bm25(chunks_fts) AS rank
             FROM chunks_fts
             JOIN chunks c ON c.id = chunks_fts.rowid
-            WHERE c.owner_id = ? AND c.doc_id = ? AND chunks_fts MATCH ?
+            WHERE c.owner_id = ? AND c.doc_id = ? AND chunks_fts MATCH ? {extra_sql}
             ORDER BY rank ASC, c.id ASC
             LIMIT ?
             """
-            cur.execute(sql, (owner_id, doc_id, fts_q, limit))
+            cur.execute(sql, (owner_id, doc_id, fts_q, *params, limit))
             for r in cur.fetchall():
                 rows.append({
                     "id": r["id"],
@@ -98,23 +359,22 @@ def lex_search(owner_id: int, doc_id: int, query: str, limit: int = 20) -> List[
                     "source": "fts"
                 })
         except sqlite3.OperationalError:
-            # Без bm25 — просто MATCH + стабильный порядок
-            sql = """
+            sql = f"""
             SELECT c.id, c.page, c.section_path, c.text
             FROM chunks_fts
             JOIN chunks c ON c.id = chunks_fts.rowid
-            WHERE c.owner_id = ? AND c.doc_id = ? AND chunks_fts MATCH ?
+            WHERE c.owner_id = ? AND c.doc_id = ? AND chunks_fts MATCH ? {extra_sql}
             ORDER BY c.id ASC
             LIMIT ?
             """
-            cur.execute(sql, (owner_id, doc_id, fts_q, limit))
+            cur.execute(sql, (owner_id, doc_id, fts_q, *params, limit))
             for r in cur.fetchall():
                 rows.append({
                     "id": r["id"],
                     "page": r["page"],
                     "section_path": r["section_path"],
                     "text": r["text"],
-                    "score": 1.0,   # нейтральный скор для гибрида
+                    "score": 1.0,
                     "source": "fts"
                 })
         con.close()
@@ -123,15 +383,16 @@ def lex_search(owner_id: int, doc_id: int, query: str, limit: int = 20) -> List[
     # --- fallback: LIKE (без FTS) ---
     like_q = "%" + _sanitize_like(q) + "%"
     cur = con.cursor()
-    cur.execute(
-        """
+    base = f"""
         SELECT id, page, section_path, text
-        FROM chunks
-        WHERE owner_id=? AND doc_id=? AND (text LIKE ? ESCAPE '\\' OR section_path LIKE ? ESCAPE '\\')
-        LIMIT ?
-        """,
-        (owner_id, doc_id, like_q, like_q, limit)
-    )
+        FROM chunks c
+        WHERE c.owner_id=? AND c.doc_id=? AND (c.text LIKE ? ESCAPE '\\' OR c.section_path LIKE ? ESCAPE '\\')
+    """
+    tail = ""
+    if extra_where:
+        tail = " AND " + " AND ".join(extra_where)
+    sql = base + tail + " LIMIT ?"
+    cur.execute(sql, (owner_id, doc_id, like_q, like_q, *params, limit))
     for r in cur.fetchall():
         t = r["text"] or ""
         # грубая эвристика: больше общих чисел и точных токенов — лучше
@@ -153,23 +414,32 @@ def lex_search(owner_id: int, doc_id: int, query: str, limit: int = 20) -> List[
     rows.sort(key=lambda x: x["score"])  # лучше сверху
     return rows[:limit]
 
-# ----------------------- hybrid: semantic + lex -----------------------
+# ----------------------- hybrid: semantic + lex (с областью) -----------------------
 
 def hybrid_search(owner_id: int,
                   doc_id: int,
                   query: str,
                   sem_top_k: int = 6,
                   lex_top_k: int = 10,
-                  merge_top_k: int = 8) -> List[Dict[str, Any]]:
+                  merge_top_k: int = 8,
+                  *,
+                  section_prefix: Optional[str] = None) -> List[Dict[str, Any]]:
     """
-    Объединяем семантический RAG (retrieve) и лексический поиск:
-    - берём top семантических и лексических хитов,
-    - мерджим по chunk id,
-    - пересчитываем скор: sem_score + бонусы за лекс.совпадение/числа,
-    - возвращаем top-k.
+    Объединяем семантический RAG (retrieve) и лексический поиск.
+    Если задан section_prefix — семантику оставить как есть (retrieve не умеет фильтры),
+    а лексический — ограничить областью; затем смержить.
     """
-    sem_hits = retrieve(owner_id, doc_id, query, top_k=sem_top_k)  # [{id,page,section_path,text,score}]
-    lex_hits = lex_search(owner_id, doc_id, query, limit=lex_top_k)
+    try:
+        sem_hits = retrieve(owner_id, doc_id, query, top_k=sem_top_k)  # [{id,page,section_path,text,score}]
+    except Exception:
+        sem_hits = []
+
+    # Если задана область — остаются только те сем-хиты, которые попадают в неё
+    if section_prefix:
+        pfx = section_prefix
+        sem_hits = [h for h in sem_hits if str(h.get("section_path","")).startswith(pfx)]
+
+    lex_hits = lex_search(owner_id, doc_id, query, limit=lex_top_k, section_prefix=section_prefix)
 
     lex_by_id: Dict[int, Dict[str, Any]] = {int(h["id"]): h for h in lex_hits if h.get("id") is not None}
 
@@ -179,8 +449,11 @@ def hybrid_search(owner_id: int,
 
     # семантика — базовый скор + бонусы, если подтверждается лексикой
     for h in sem_hits:
-        cid = int(h["id"])
-        base = float(h["score"])
+        try:
+            cid = int(h["id"])
+        except Exception:
+            continue
+        base = float(h.get("score", 0.0))
         bonus = 0.0
 
         l = lex_by_id.get(cid)
@@ -226,19 +499,210 @@ def hybrid_search(owner_id: int,
         })
     return merged
 
+# ----------------------- ID-aware orchestration -----------------------
+
+def id_aware_search(owner_id: int,
+                    doc_id: int,
+                    query: str,
+                    *,
+                    max_ctx_chars: int = 6000) -> Dict[str, Any]:
+    """
+    Главная точка: понимает ID, область, собирает контекст.
+    """
+    meta = parse_query_ids(query)
+    area_prefix: Optional[str] = None
+    if meta.get("area_num"):
+        area_prefix = _find_area_prefix(owner_id, doc_id, meta["area_num"])
+
+    # Приоритет: если явно указан ID рисунка/таблицы — находим его
+    tkind = meta.get("target_kind")
+    tnum = meta.get("target_num")
+    if tkind and tnum:
+        hits, sugg = _find_target_by_id(owner_id, doc_id, tkind, tnum)
+        if hits:
+            sec = hits[0]
+            attrs = sec.get("attrs") or {}
+            scope = attrs.get("section_scope") or sec.get("section_path") or ""
+
+            # Якорный чанк той же секции (если есть)
+            anchor_hits: List[Dict[str, Any]] = []
+            con = get_conn()
+            cur = con.cursor()
+            try:
+                cur.execute(
+                    "SELECT id, page, section_path, text FROM chunks WHERE owner_id=? AND doc_id=? AND section_path=? LIMIT 1",
+                    (owner_id, doc_id, sec.get("section_path") or "")
+                )
+                row = cur.fetchone()
+            finally:
+                con.close()
+                anchor_id = int(row["id"]) if row else None
+            if row:
+                anchor_hits.append({
+                    "id": row["id"],
+                    "page": row["page"],
+                    "section_path": row["section_path"],
+                    "text": row["text"] or "",
+                    "score": 1.0
+                })
+
+            # NEW: расширяем локальный контекст вокруг найденной секции
+            neighbor_hits: List[Dict[str, Any]] = []
+            heading_hits: List[Dict[str, Any]] = []
+            mention_hits: List[Dict[str, Any]] = []
+            if anchor_id is not None:
+                neighbor_hits = _gather_neighbors(con, owner_id, doc_id, anchor_id, before=3, after=3)
+                heading_hits = _nearest_heading(con, owner_id, doc_id, anchor_id)
+            # упоминания "Рисунок/Таблица N.M" по всему документу (пара абзацев)
+            mention_hits = _gather_mentions(con, owner_id, doc_id, tnum, tkind, limit=4)
+
+            area_hits = hybrid_search(
+                owner_id, doc_id, query, sem_top_k=6, lex_top_k=12, merge_top_k=10,
+                section_prefix=scope
+            )
+
+            # дедупликация в порядке значимости: якорь → заголовок → соседи → упоминания → область
+            by_id: Dict[int, Dict[str, Any]] = {}
+            for lst in (anchor_hits, heading_hits, neighbor_hits, mention_hits, area_hits):
+                for h in lst:
+                    by_id.setdefault(int(h["id"]), h)
+
+            final_hits = list(by_id.values())
+            ctx = build_context(final_hits, max_chars=max_ctx_chars)
+
+            return {
+                "found": True, "context": ctx, "kind": tkind, "label": tnum,
+                "area_prefix": scope, "suggestions": None
+            }
+
+        return {
+            "found": False, "context": "", "kind": tkind, "label": tnum,
+            "area_prefix": area_prefix, "suggestions": sugg or []
+        }
+
+    # Если область задана, но без ID — ограничим поиск ей
+    if area_prefix:
+        hits = hybrid_search(owner_id, doc_id, query, sem_top_k=6, lex_top_k=12, merge_top_k=8,
+                             section_prefix=area_prefix)
+        if not hits:
+            return {"found": False, "context": "", "kind": None, "label": None, "area_prefix": area_prefix, "suggestions": []}
+        ctx = build_context(hits, max_chars=max_ctx_chars)
+        return {"found": True, "context": ctx, "kind": None, "label": None, "area_prefix": area_prefix, "suggestions": None}
+
+    # Обычный путь — без области/ID
+    hits = hybrid_search(owner_id, doc_id, query, sem_top_k=6, lex_top_k=12, merge_top_k=8)
+    if not hits:
+        return {"found": False, "context": "", "kind": None, "label": None, "area_prefix": None, "suggestions": []}
+    ctx = build_context(hits, max_chars=max_ctx_chars)
+    return {"found": True, "context": ctx, "kind": None, "label": None, "area_prefix": None, "suggestions": None}
+
 # ----------------------- helpers for bot usage -----------------------
 
 def best_context(owner_id: int, doc_id: int, query: str, max_chars: int = 6000) -> str:
     """
-    Строит контекст, используя гибридный поиск (лучше покрытие формулировок/таблиц).
+    ID-aware: если в запросе указан рисунок/таблица/область — отдаём локальный контекст.
+    Иначе — гибридный контекст по всему документу.
     """
-    hits = hybrid_search(owner_id, doc_id, query, sem_top_k=6, lex_top_k=12, merge_top_k=8)
-    if not hits:
-        return ""
-    return build_context(hits, max_chars=max_chars)
+    res = id_aware_search(owner_id, doc_id, query, max_ctx_chars=max_chars)
+    return res["context"] or ""
 
 def quick_find(owner_id: int, doc_id: int, query: str, limit: int = 5) -> List[Dict[str, Any]]:
     """
     Быстрый лексический поиск без семантики (например, для UI-подсказок).
     """
     return lex_search(owner_id, doc_id, query, limit=limit)
+
+# --- neighbors/mentions/heading helpers (NEW) ---
+
+def _gather_neighbors(con, owner_id: int, doc_id: int, anchor_id: int, *, before: int = 3, after: int = 3) -> List[Dict[str, Any]]:
+    """Берём N чанков до и после якорного id по порядку вставки."""
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT id, page, section_path, text
+        FROM chunks
+        WHERE owner_id=? AND doc_id=? AND id BETWEEN ? AND ?
+        ORDER BY id ASC
+        """,
+        (owner_id, doc_id, max(1, anchor_id - max(1, before)), anchor_id + max(1, after)),
+    )
+    rows = cur.fetchall() or []
+    hits: List[Dict[str, Any]] = []
+    for r in rows:
+        hits.append({
+            "id": r["id"],
+            "page": r["page"],
+            "section_path": r["section_path"],
+            "text": r["text"] or "",
+            "score": 0.86,  # около-якорная важность
+        })
+    return hits
+
+def _gather_mentions(con, owner_id: int, doc_id: int, label: str, kind: str, *, limit: int = 4) -> List[Dict[str, Any]]:
+    """
+    Находим места в тексте, где встречается 'Рисунок N'/'Figure N' или 'Таблица N'/'Table N'.
+    kind: 'figure' | 'table'
+    """
+    lab = (label or "").replace(",", ".")
+    ru_word = "рисунок" if kind == "figure" else "таблица"
+    en_word = "figure" if kind == "figure" else "table"
+    rx = re.compile(rf"(?i)\b({ru_word}|{en_word})\s+{re.escape(lab)}\b")
+
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT id, page, section_path, text
+        FROM chunks
+        WHERE owner_id=? AND doc_id=? AND (
+            text LIKE '%Рисун%' ESCAPE '\\' OR text LIKE '%Figure%' ESCAPE '\\'
+            OR text LIKE '%Таблиц%' ESCAPE '\\' OR text LIKE '%Table%' ESCAPE '\\'
+        )
+        ORDER BY id ASC
+        """,
+        (owner_id, doc_id),
+    )
+    rows = cur.fetchall() or []
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        t = r["text"] or ""
+        if rx.search(t):
+            out.append({
+                "id": r["id"],
+                "page": r["page"],
+                "section_path": r["section_path"],
+                "text": t,
+                "score": 0.84,
+            })
+            if len(out) >= limit:
+                break
+    return out
+
+def _nearest_heading(con, owner_id: int, doc_id: int, around_id: int) -> List[Dict[str, Any]]:
+    """
+    Если в chunks есть element_type — подтягиваем ближайший заголовок перед якорём.
+    Иначе возвращаем пусто.
+    """
+    cur = con.cursor()
+    cur.execute("PRAGMA table_info(chunks)")
+    cols = {row[1] for row in cur.fetchall()}
+    if "element_type" not in cols:
+        return []
+    cur.execute(
+        """
+        SELECT id, page, section_path, text
+        FROM chunks
+        WHERE owner_id=? AND doc_id=? AND element_type='heading' AND id<=?
+        ORDER BY id DESC LIMIT 1
+        """,
+        (owner_id, doc_id, around_id),
+    )
+    r = cur.fetchone()
+    if not r:
+        return []
+    return [{
+        "id": r["id"],
+        "page": r["page"],
+        "section_path": r["section_path"],
+        "text": r["text"] or "",
+        "score": 0.90,  # глава важнее соседей
+    }]

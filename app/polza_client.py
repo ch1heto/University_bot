@@ -11,6 +11,7 @@ import re
 from typing import List, Dict, Any, Optional, Union, Tuple, Iterable
 
 from openai import OpenAI
+import requests
 
 from .config import Cfg  # ключи/модели/базовый URL
 
@@ -216,56 +217,90 @@ def chat_with_gpt_stream(
     max_tokens: int = 800,
 ) -> Iterable[str]:
     """
-    Стриминговая версия chat-комплишна (с санацией входа и устойчивым фолбэком).
-    Если стрим ломается в любой момент — исключение НЕ утекает наружу:
-    - если не успели отдать ни одной дельты → переключаемся на нестрим и режем ответ кусками;
-    - если успели отдать часть → просто завершаем поток (чтобы не ронять пайплайн).
+    Стриминговая версия с ручным парсингом SSE (устойчиво к «битым» строкам JSON).
+    Если поток обрывается до первой дельты — мягкий фолбэк на нестрим.
     """
     def _gen():
-        stream = None
         yielded_any = False
+        resp = None
         try:
             smsg = _sanitize_messages(messages)
-            stream = _client.chat.completions.create(
-                model=Cfg.POLZA_CHAT,
-                messages=smsg,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                stream=True,
-            )
-            # OpenAI SDK v1: по чанкам; контент в choices[0].delta.content
-            for chunk in stream:
+            payload = {
+                "model": Cfg.POLZA_CHAT,
+                "messages": smsg,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "stream": True,
+            }
+            headers = {
+                "Authorization": f"Bearer {Cfg.POLZA_KEY}",
+                "Content-Type": "application/json; charset=utf-8",
+                "Accept": "text/event-stream",
+                "Accept-Charset": "utf-8",
+            }
+            url = f"{(Cfg.BASE_POLZA or '').rstrip('/')}/chat/completions"
+            resp = requests.post(url, headers=headers, json=payload, stream=True, timeout=(10, 300))
+            resp.raise_for_status()
+
+            pending: Optional[str] = None
+            for data in _iter_sse_lines(resp):
+                if data == "[DONE]":
+                    break
+
+                # Если до этого получили неполный JSON — склеим
+                if pending:
+                    data = pending + data
+                    pending = None
+
                 try:
-                    choice = (chunk.choices or [None])[0]
-                    if not choice:
-                        continue
-                    delta = getattr(choice, "delta", None)
-                    if not delta:
-                        continue
-                    text = getattr(delta, "content", None) or ""
-                    if text:
-                        yielded_any = True
-                        yield text
-                except Exception as inner_e:
-                    # Спорный/неполный chunk — пропускаем
-                    logging.debug("stream chunk parse warning: %s", inner_e)
+                    obj = json.loads(data)
+                except json.JSONDecodeError:
+                    # Пришёл обрезанный JSON — ждём продолжение
+                    pending = data
                     continue
+
+                # Поддерживаем два формата:
+                # 1) {"delta":"..."} — упрощённый
+                # 2) {"choices":[{"delta":{"content":"..."}}]} — openai-совместимый
+                delta = obj.get("delta")
+                if delta is None:
+                    chs = obj.get("choices") or []
+                    if chs:
+                        delta = (chs[0].get("delta") or {}).get("content")
+
+                if delta:
+                    yielded_any = True
+                    yield str(delta)
+
+            # Если поток завершился, а в pending висит валидный JSON — доберём
+            if pending:
+                try:
+                    obj = json.loads(pending)
+                    delta = obj.get("delta")
+                    if delta is None:
+                        chs = obj.get("choices") or []
+                        if chs:
+                            delta = (chs[0].get("delta") or {}).get("content")
+                    if delta:
+                        yielded_any = True
+                        yield str(delta)
+                except Exception:
+                    pass
+
         except Exception as e:
-            # Самая частая причина по логам: JSONDecodeError в openai._streaming.sse.json()
             logging.error("chat_with_gpt_stream: stream aborted: %s", e)
             if not yielded_any:
-                # Мягкий фолбэк: единый ответ → режем на части
+                # Фолбэк на нестрим — режем на части, чтобы UI продолжал «капать»
                 try:
                     answer = chat_with_gpt(messages, temperature=temperature, max_tokens=max_tokens)
                     for part in _chunk_text(answer, 480):
                         yield part
                 except Exception as e2:
                     logging.exception("chat_with_gpt_stream fallback failed: %s", e2)
-            # Если уже что-то отдали — просто завершаем без исключения
         finally:
             try:
-                if stream and hasattr(stream, "close"):
-                    stream.close()
+                if resp is not None:
+                    resp.close()
             except Exception:
                 pass
 
@@ -439,3 +474,23 @@ def vision_describe_many(
             logging.exception("vision_describe_many: ошибка на файле %s: %s", p, e)
             out.append({"description": "описание недоступно из-за ошибки обработки.", "tags": []})
     return out
+
+def _iter_sse_lines(resp) -> Iterable[str]:
+    """
+    Читаем SSE как БАЙТЫ и декодируем только UTF-8 (серверные charset-ы игнорируем),
+    чтобы не ловить mojibake на cp1251/latin-1.
+    """
+    for raw in resp.iter_lines(decode_unicode=False):
+        if not raw:
+            continue
+        try:
+            line = raw.decode("utf-8", "replace")
+        except Exception:
+            # на всякий случай: если что-то совсем нетипичное
+            line = raw.decode("latin-1", "replace")
+        if line.startswith(":"):
+            continue
+        if line.startswith("data:"):
+            yield line[5:].strip()
+        else:
+            yield line.strip()

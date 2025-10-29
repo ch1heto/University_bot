@@ -187,7 +187,7 @@ def _embed_query(query: str) -> Optional[np.ndarray]:
         return None
 
 # ---------------------------
-# Внутренний скорер/ранжирование (переиспользуется)
+# Регексы-помощники для ID-aware
 # ---------------------------
 
 def _mk_table_pattern(q: str) -> Optional[str]:
@@ -239,10 +239,22 @@ def _mk_figure_pattern(q: str) -> Optional[str]:
         pat_num = re.sub(r"\\\.", "[.,]", re.escape(raw))
     return rf"(?:рис(?:унок)?|fig(?:ure)?\.?)\s*\.?\s*(?:№\s*|no\.?\s*|номер\s*)?{pat_num}"
 
-def _score_and_rank(pack: dict, query: str, *, prelim_k: int = 48) -> List[Tuple[int, float]]:
+# ---------------------------
+# Внутренний скорер/ранжирование (ID-aware + область)
+# ---------------------------
+
+def _score_and_rank(
+    pack: dict,
+    query: str,
+    *,
+    prelim_k: int = 48,
+    section_prefix: Optional[str] = None,
+    element_types: Optional[List[str]] = None,
+) -> List[Tuple[int, float]]:
     """
     Возвращает список индексов чанков и их скорингов, отсортированный по убыванию.
     Используем в retrieve() и coverage-вариантах.
+    Можно ограничить кандидатов областью документа (section_prefix) и/или типами чанков.
     """
     if pack["mat"].shape[0] == 0:
         return []
@@ -256,9 +268,30 @@ def _score_and_rank(pack: dict, query: str, *, prelim_k: int = 48) -> List[Tuple
     if N == 0:
         return []
 
-    prelim_k = max(min(prelim_k, N), 1)
-    part_idx = np.argpartition(sims, -prelim_k)[-prelim_k:]
-    idx = part_idx[np.argsort(-sims[part_idx])]
+    # --- кандидаты по области/типам ---
+    cand_idx = list(range(N))
+    if section_prefix or element_types:
+        spfx = section_prefix or ""
+        want_types = {t.lower() for t in (element_types or [])}
+        cand_idx = []
+        for i, m in enumerate(pack["meta"]):
+            ok = True
+            if spfx and not str(m.get("section_path") or "").startswith(spfx):
+                ok = False
+            if ok and want_types and (_chunk_type(m) not in want_types):
+                ok = False
+            if ok:
+                cand_idx.append(i)
+        if not cand_idx:
+            return []
+
+    cand_idx = np.asarray(cand_idx, dtype=np.int64)
+    sims_sub = sims[cand_idx]
+
+    prelim_k = max(min(prelim_k, sims_sub.shape[0]), 1)
+    part_idx_local = np.argpartition(sims_sub, -prelim_k)[-prelim_k:]
+    order_local = part_idx_local[np.argsort(-sims_sub[part_idx_local])]
+    idx = cand_idx[order_local]
 
     sig = _query_signals(query)
     q_nums = _extract_numbers(query)
@@ -271,7 +304,7 @@ def _score_and_rank(pack: dict, query: str, *, prelim_k: int = 48) -> List[Tuple
     for i in idx:
         m = pack["meta"][int(i)]
         text = (m["text"] or "")
-        score = float(sims[i])
+        score = float(sims[int(i)])
 
         ctype = _chunk_type(m)
 
@@ -314,16 +347,31 @@ def _score_and_rank(pack: dict, query: str, *, prelim_k: int = 48) -> List[Tuple
     return rescored
 
 # ---------------------------
-# Основной RAG-поиск (backward-compatible)
+# Основной RAG-поиск (ID-aware + область)
 # ---------------------------
 
-def retrieve(owner_id: int, doc_id: int, query: str, top_k: int = 8) -> List[Dict]:
+def retrieve(
+    owner_id: int,
+    doc_id: int,
+    query: str,
+    top_k: int = 8,
+    *,
+    section_prefix: Optional[str] = None,
+    element_types: Optional[List[str]] = None,
+) -> List[Dict]:
     """
     Возвращает top-k чанков по косинусному сходству с вопросом (с лёгким переранжированием).
+    Можно ограничивать областью (section_prefix) и/или типами чанков (element_types).
     Каждый элемент: {id, page, section_path, text, score}.
     """
     pack = _load_doc(owner_id, doc_id)
-    rescored = _score_and_rank(pack, query, prelim_k=max(top_k * 3, 16))
+    rescored = _score_and_rank(
+        pack,
+        query,
+        prelim_k=max(top_k * 3, 16),
+        section_prefix=section_prefix,
+        element_types=element_types,
+    )
     if not rescored:
         return []
 
@@ -352,6 +400,9 @@ def retrieve(owner_id: int, doc_id: int, query: str, top_k: int = 8) -> List[Dic
         )
     return out
 
+def retrieve_in_area(owner_id: int, doc_id: int, query: str, section_prefix: str, top_k: int = 8) -> List[Dict]:
+    """Семантический поиск, жёстко ограниченный заданной областью документа."""
+    return retrieve(owner_id, doc_id, query, top_k=top_k, section_prefix=section_prefix)
 
 def build_context(snippets: List[Dict], max_chars: int = 6000) -> str:
     """
@@ -375,7 +426,6 @@ def build_context(snippets: List[Dict], max_chars: int = 6000) -> str:
         if total >= max_chars:
             break
     return "\n\n".join(parts)
-
 
 def invalidate_cache(owner_id: int, doc_id: int):
     """Сбрасывает кэш матрицы для документа (вызывать после переиндексации)."""
@@ -423,9 +473,11 @@ def keyword_find(owner_id: int, doc_id: int, pattern: str, max_hits: int = 3) ->
 # =======================================================================
 
 # «Рисунок 3.2 — ...», «Рисунок 5: ...», «Figure 2 — ...»
+# Поддерживаем: «Рисунок 3.2», «Рис. 3.2», «Рис.3.2.», «Figure 2», «Fig. 2»
 _FIG_TITLE_RE = re.compile(
-    r"(?i)\b(?:рис(?:унок)?|figure)\s+([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)\b(?:\s*[—\-–:]\s*(.+))?"
+    r"(?i)\b(?:рис(?:\.|унок)?|fig(?:\.|ure)?)\s*([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*\.?)\s*(?:[—\-–:\u2013\u2014]\s*(.+))?"
 )
+
 
 def _shorten(s: str, limit: int = 120) -> str:
     s = (s or "").strip()
@@ -444,19 +496,14 @@ def _last_segment(name: str) -> str:
     return s
 
 def _parse_figure_title(text: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Извлекаем номер и хвост подписи из строки вида 'Рисунок 2.3 — Название'.
-    Возвращает (num, title).
-    """
     t = (text or "").strip()
     m = _FIG_TITLE_RE.search(t)
     if not m:
         return (None, None)
-    raw_num = (m.group(1) or "").strip()
-    raw_num = raw_num.replace(" ", "")
-    num = raw_num.replace(",", ".") or None
+    raw_num = (m.group(1) or "").strip().replace(" ", "")
+    num = _num_norm(raw_num)
     title = (m.group(2) or "").strip() or None
-    return (num, title)
+    return (num or None, title)
 
 def _distinct_figure_basenames(uid: int, doc_id: int) -> List[str]:
     """
@@ -585,36 +632,62 @@ def describe_figures_by_numbers(
             found = cur.fetchone()
 
         # 2) fallback: по подписям/пути (RU/EN)
+        # 2) fallback: по подписям/пути (RU/EN, «Рис.», без пробела и с пробелом)
         if not found and has_ext:
+            pat_ru_full   = f"%Рисунок {num}%"
+            pat_ru_abbr_s = f"%Рис. {num}%"
+            pat_ru_abbr_n = f"%Рис.{num}%"
+            pat_en_full   = f"%Figure {num}%"
+            pat_en_abbr_s = f"%Fig. {num}%"
+            pat_en_abbr_n = f"%Fig.{num}%"
             cur.execute(
                 """
                 SELECT page, section_path, text, attrs
                 FROM chunks
                 WHERE owner_id=? AND doc_id=? AND element_type='figure'
-                  AND (section_path LIKE ? COLLATE NOCASE
-                       OR text LIKE ? COLLATE NOCASE
-                       OR section_path LIKE ? COLLATE NOCASE
-                       OR text LIKE ? COLLATE NOCASE)
+                AND (
+                        section_path LIKE ? COLLATE NOCASE OR text LIKE ? COLLATE NOCASE OR
+                        section_path LIKE ? COLLATE NOCASE OR text LIKE ? COLLATE NOCASE OR
+                        section_path LIKE ? COLLATE NOCASE OR text LIKE ? COLLATE NOCASE OR
+                        section_path LIKE ? COLLATE NOCASE OR text LIKE ? COLLATE NOCASE OR
+                        section_path LIKE ? COLLATE NOCASE OR text LIKE ? COLLATE NOCASE
+                    )
                 ORDER BY id ASC LIMIT 1
                 """,
-                (uid, doc_id, f"%Рисунок {num}%", f"%Рисунок {num}%", f"%Figure {num}%", f"%Figure {num}%"),
+                (uid, doc_id,
+                pat_ru_full, pat_ru_full,
+                pat_ru_abbr_s, pat_ru_abbr_s,
+                pat_ru_abbr_n, pat_ru_abbr_n,
+                pat_en_full, pat_en_full,
+                pat_en_abbr_s, pat_en_abbr_s),
             )
             found = cur.fetchone()
+
 
         # 3) самый старый fallback для индексов без element_type='figure'
         if not found:
             sel = "SELECT page, section_path, text" + (", attrs" if has_ext else "")
+            # 3) самый старый fallback: учитываем [Рисунок]/[Figure] и «Рис.»
             cur.execute(
                 f"""
                 {sel}
                 FROM chunks
-                WHERE owner_id=? AND doc_id=? AND (text LIKE '[Рисунок]%%' OR text LIKE '[Figure]%%'
-                                                   OR section_path LIKE '%%Рисунок %%' OR section_path LIKE '%%Figure %%')
-                  AND (section_path LIKE ? COLLATE NOCASE OR text LIKE ? COLLATE NOCASE
-                       OR section_path LIKE ? COLLATE NOCASE OR text LIKE ? COLLATE NOCASE)
+                WHERE owner_id=? AND doc_id=? AND (
+                    text LIKE '[Рисунок]%%' OR text LIKE '[Figure]%%'
+                    OR lower(section_path) LIKE '%%рисунок %%' OR lower(section_path) LIKE '%%figure %%'
+                    OR lower(section_path) LIKE '%%рис.%%'     OR lower(section_path) LIKE '%%fig.%%'
+                )
+                AND (
+                    section_path LIKE ? COLLATE NOCASE OR text LIKE ? COLLATE NOCASE OR
+                    section_path LIKE ? COLLATE NOCASE OR text LIKE ? COLLATE NOCASE OR
+                    section_path LIKE ? COLLATE NOCASE OR text LIKE ? COLLATE NOCASE
+                )
                 ORDER BY id ASC LIMIT 1
                 """,
-                (uid, doc_id, f"%Рисунок {num}%", f"%Рисунок {num}%", f"%Figure {num}%", f"%Figure {num}%"),
+                (uid, doc_id,
+                f"%Рисунок {num}%", f"%Рисунок {num}%",
+                f"%Рис.{num}%",     f"%Рис.{num}%",
+                f"%Figure {num}%",  f"%Figure {num}%"),
             )
             found = cur.fetchone()
 
@@ -706,6 +779,7 @@ _ROW_TAG_RE = re.compile(r"\[\s*row\s+(\d+)\s*\]", re.IGNORECASE)
 def _num_norm(s: str | None) -> str:
     s = (s or "").strip()
     s = s.replace(" ", "").replace(",", ".")
+    s = re.sub(r"[.)]+$", "", s)  # «3.1.» -> «3.1», «(3.1)» -> «3.1»
     return s
 
 def _table_base_from_section(section_path: str) -> str:

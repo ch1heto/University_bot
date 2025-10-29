@@ -20,19 +20,23 @@ except Exception:
     from .answer_builder import generate_answer  # type: ignore
     generate_answer_stream = None  # стрима нет — будем фолбэкать
 
-from .config import Cfg
+from .config import Cfg, ProcessingState
 from .db import (
     ensure_user, get_conn,
     set_document_indexer_version, get_document_indexer_version,
     CURRENT_INDEXER_VERSION,
     update_document_meta, delete_document_chunks,
-    set_user_active_doc, get_user_active_doc,  # ⬅️ персист активного документа
+    set_user_active_doc, get_user_active_doc,
+    # ↓ новое для FSM/очереди
+    enqueue_pending_query, dequeue_all_pending_queries,
+    get_processing_state, start_downloading,
 )
 from .parsing import parse_docx, parse_doc, save_upload
 from .indexing import index_document
 from .retrieval import (
     retrieve, build_context, invalidate_cache,
     retrieve_coverage, build_context_coverage,
+    describe_figures_by_numbers,
 )
 from .intents import detect_intents
 
@@ -56,7 +60,7 @@ except Exception:
     chat_with_gpt_stream = None
 
 # НОВОЕ: оркестратор приёма/обогащения (OCR таблиц-картинок, нормализация чисел)
-from .ingest_orchestrator import enrich_sections
+from .ingest_orchestrator import enrich_sections, ingest_document
 # НОВОЕ: аналитика таблиц
 from .analytics import analyze_table_by_num
 
@@ -197,21 +201,142 @@ async def _send(m: types.Message, text: str):
     for chunk in _split_multipart(text or ""):
         await m.answer(_to_html(chunk), parse_mode="HTML", disable_web_page_preview=True)
 
+
+# ---- Verbosity helpers ----
+def _detect_verbosity(text: str) -> str:
+    t = (text or "").lower()
+    detailed = re.search(r"\b(подробн|детал|развёрнут|развернут|разбор|explain in detail|detailed)\b", t)
+    brief    = re.search(r"\b(кратк|в\s*двух\s*слов|коротк|выжимк|summary|brief)\b", t)
+    if detailed:
+        return "detailed"
+    if brief:
+        return "brief"
+    # эвристика: очень длинное сообщение — скорее подробный ответ
+    if len(t) > 600:
+        return "detailed"
+    return "normal"
+
+
+def _verbosity_addendum(verbosity: str, *, for_what: str = "ответа") -> str:
+    if verbosity == "brief":
+        return "Формат ответа: краткая выжимка — 5–7 буллетов, по 1–2 строки; без воды и новых фактов."
+    if verbosity == "detailed":
+        return ("Формат ответа: подробный разбор — сначала 3–5 тезисов, затем разъяснения с "
+                "цитатами/формулами/числами из контекста; 8–15 буллетов или 6–10 абзацев.")
+    return "Формат: связный ответ по делу; избегай разделов вида «Чего не хватает»."
+
 # --------------------- STREAM: вспомогалки ---------------------
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
 async def _typing_loop(chat_id: int, stop_event: asyncio.Event):
-    """Периодически отправляет индикатор 'typing', пока не остановим."""
     try:
         while not stop_event.is_set():
             await bot.send_chat_action(chat_id, ChatAction.TYPING)
-            await asyncio.wait_for(stop_event.wait(), timeout=TYPE_INDICATION_EVERY_MS / 1000)
-    except asyncio.TimeoutError:
-        pass
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=TYPE_INDICATION_EVERY_MS / 1000)
+            except asyncio.TimeoutError:
+                # просто продолжаем цикл, чтобы периодически слать "typing"
+                pass
     except Exception:
+        # глушим любые нетипичные ошибки, чтобы не ронять стрим
         pass
+
+
+
+def _section_context(owner_id: int, doc_id: int, sec: str, *, max_chars: int = 9000) -> str:
+    # 1) генерим варианты записи номера
+    base = (sec or "").strip()
+    variants = {
+        base,
+        base.replace(" ", ""),
+        base.replace(" ", "").replace(",", "."),
+        base.replace(" ", "").replace(".", ","),
+    }
+    prefixes = ["", "Раздел ", "Пункт ", "Глава ", "Подраздел "]
+    patterns = [f"%{v}%" for v in variants]
+    patterns += [f"%{p}{base}%" for p in prefixes]
+    # уберём дубли и ограничим разумным числом плейсхолдеров
+    patterns = list(dict.fromkeys(patterns))[:8]
+
+    con = get_conn()
+    cur = con.cursor()
+
+    rows = []
+    if patterns:
+        placeholders = " OR ".join(["section_path LIKE ?"] * len(patterns))
+        cur.execute(
+            f"""
+            SELECT page, section_path, text
+            FROM chunks
+            WHERE owner_id=? AND doc_id=? AND ({placeholders})
+            ORDER BY page ASC, id ASC
+            """,
+            (owner_id, doc_id, *patterns),
+        )
+        rows = cur.fetchall() or []
+
+    # 2) фолбэк: найдём heading с номером и возьмём его секцию
+    if not rows:
+        has_et = _table_has_columns(con, "chunks", ["element_type"])
+        if has_et:
+            cur.execute(
+                """
+                SELECT section_path
+                FROM chunks
+                WHERE owner_id=? AND doc_id=?
+                AND (element_type='heading' OR element_type IS NULL)
+                AND (section_path LIKE ? OR text LIKE ?)
+                ORDER BY page ASC, id ASC LIMIT 1
+                """,
+                (owner_id, doc_id, f"%{base}%", f"%{base}%"),
+            )
+        else:
+            # старая схема — без условия по element_type
+            cur.execute(
+                """
+                SELECT section_path
+                FROM chunks
+                WHERE owner_id=? AND doc_id=?
+                AND (section_path LIKE ? OR text LIKE ?)
+                ORDER BY page ASC, id ASC LIMIT 1
+                """,
+                (owner_id, doc_id, f"%{base}%", f"%{base}%"),
+            )
+        h = cur.fetchone()
+        if h and h["section_path"]:
+            cur.execute(
+                """
+                SELECT page, section_path, text
+                FROM chunks
+                WHERE owner_id=? AND doc_id=? AND section_path=?
+                ORDER BY page ASC, id ASC
+                """,
+                (owner_id, doc_id, h["section_path"]),
+            )
+            rows = cur.fetchall() or []
+
+    con.close()
+    if not rows:
+        return ""
+
+    parts, total = [], 0
+    header_inserted = False
+    for r in rows:
+        secpath = (r["section_path"] or "").strip()
+        t = (r["text"] or "").strip()
+        if not t:
+            continue
+        chunk = (f"[{secpath}]\n{t}") if not header_inserted else t
+        header_inserted = True
+        if total + len(chunk) > max_chars:
+            parts.append(chunk[: max_chars - total])
+            break
+        parts.append(chunk)
+        total += len(chunk)
+    return "\n\n".join(parts)
+
 
 def _ensure_iterable(stream_obj) -> Iterable[str]:
     """Нормализуем в (a)синхронный итератор строк; поддерживаем случай, когда прилетела корутина."""
@@ -388,7 +513,7 @@ async def _run_multistep_answer(
 
     # план из coverage или строим планерoм
             # план из coverage или строим планером
-        items = (discovered_items or [])
+    items = (discovered_items or [])
     if not items:
         try:
             items = plan_subtasks(q_text) or []
@@ -430,7 +555,6 @@ async def _run_multistep_answer(
     for i, it in enumerate(items, start=1):
         ask = (it.get("ask") or "").strip()
         # контекст для конкретного подпункта
-                # контекст для конкретного подпункта
         ctx_text = ""
         try:
             # если есть coverage-бакет — собираем контекст прямо из чанков подпункта
@@ -457,7 +581,7 @@ async def _run_multistep_answer(
             part = ""
 
         # отправка блока
-        header = f"<b>{i}. {html.escape(ask)}</b>\n\n"
+        header = f"**{i}. {ask}**\n\n"
         await _send(m, header + (part or "Не удалось сгенерировать ответ по этому подпункту."))
         subanswers.append(f"{header}{part}")
 
@@ -469,7 +593,7 @@ async def _run_multistep_answer(
         try:
             merged = merge_subanswers(q_text, items, subanswers).strip()
             if merged:
-                await _send(m, "<b>Итоговый сводный ответ</b>\n\n" + merged)
+                await _send(m, "**Итоговый сводный ответ**\n\n" + merged)
         except Exception as e:
             logging.exception("merge_subanswers failed: %s", e)
 
@@ -534,6 +658,15 @@ except Exception:
 
 # «Активный документ» в памяти процесса
 ACTIVE_DOC: dict[int, int] = {}  # user_id -> doc_id
+# NEW: короткая «память» последнего упомянутого объекта пользователем
+LAST_REF: dict[int, dict] = {}   # {uid: {"figure_nums": list[str], "area": "3.2"}}
+
+# NEW: для подстановки номера раздела из вопроса и для анафоры «этот пункт/рисунок»
+_SECTION_NUM_RE = re.compile(
+    r"(?i)\b(?:глава\w*|раздел\w*|пункт\w*|подраздел\w*|sec(?:tion)?\.?|chapter)"
+    r"\s*(?:№\s*)?((?:[A-Za-zА-Яа-я](?=[\.\d]))?\s*\d+(?:[.,]\d+)*)"
+)
+_ANAPH_HINT_RE = re.compile(r"(?i)\b(этот|эта|это|данн\w+|про него|про неё|про нее)\b")
 
 
 # ------------------------ Гардрейлы ------------------------
@@ -574,7 +707,6 @@ def topical_check(text: str) -> str | None:
                 "Если пришлёте файл диплома — смогу объяснять прямо по вашему тексту.")
     return None
 
-
 # --------------------- БД / утилиты ---------------------
 
 def _table_has_columns(con, table: str, cols: list[str]) -> bool:
@@ -583,48 +715,6 @@ def _table_has_columns(con, table: str, cols: list[str]) -> bool:
     have = {row[1] for row in cur.fetchall()}
     return all(c in have for c in cols)
 
-def _find_existing_doc(con, owner_id: int, sha256: str | None, file_uid: str | None):
-    """Поиск уже загруженного документа пользователя по sha/file_unique_id (если колонки есть)."""
-    if not _table_has_columns(con, "documents", ["content_sha256", "file_uid"]):
-        return None
-    cur = con.cursor()
-    if sha256 and file_uid:
-        cur.execute(
-            "SELECT id FROM documents WHERE owner_id=? AND (content_sha256=? OR file_uid=?) "
-            "ORDER BY id DESC LIMIT 1",
-            (owner_id, sha256, file_uid),
-        )
-    elif sha256:
-        cur.execute(
-            "SELECT id FROM documents WHERE owner_id=? AND content_sha256=? "
-            "ORDER BY id DESC LIMIT 1",
-            (owner_id, sha256),
-        )
-    elif file_uid:
-        cur.execute(
-            "SELECT id FROM documents WHERE owner_id=? AND file_uid=? "
-            "ORDER BY id DESC LIMIT 1",
-            (owner_id, file_uid),
-        )
-    row = cur.fetchone()
-    return (row["id"] if row else None)
-
-def _insert_document(con, owner_id: int, kind: str, path: str,
-                     sha256: str | None, file_uid: str | None) -> int:
-    cur = con.cursor()
-    if _table_has_columns(con, "documents", ["content_sha256", "file_uid"]):
-        cur.execute(
-            "INSERT INTO documents(owner_id, kind, path, content_sha256, file_uid) VALUES(?,?,?,?,?)",
-            (owner_id, kind, path, sha256, file_uid),
-        )
-    else:
-        cur.execute(
-            "INSERT INTO documents(owner_id, kind, path) VALUES(?,?,?)",
-            (owner_id, kind, path),
-        )
-    doc_id = cur.lastrowid
-    con.commit()
-    return doc_id
 
 
 # --------------------- Таблицы: парсинг/нормализация ---------------------
@@ -1111,8 +1201,9 @@ def _list_figures_db(uid: int, doc_id: int, limit: int = 25) -> dict:
             (uid, doc_id),
         )
     else:
+        # старые индексы — колонки attrs может не быть, не выбираем её
         cur.execute(
-            "SELECT DISTINCT section_path, attrs, text FROM chunks "
+            "SELECT DISTINCT section_path, text FROM chunks "
             "WHERE owner_id=? AND doc_id=? AND (text LIKE '[Рисунок]%' OR lower(section_path) LIKE '%рисунок%') "
             "ORDER BY id ASC",
             (uid, doc_id),
@@ -1123,7 +1214,7 @@ def _list_figures_db(uid: int, doc_id: int, limit: int = 25) -> dict:
     items: list[str] = []
     for r in rows:
         section_path = r["section_path"] or ""
-        attrs_json = r["attrs"] if "attrs" in r.keys() else None
+        attrs_json = r["attrs"] if ("attrs" in r.keys()) else None  # в else её просто нет — ок
         txt = r["text"] or None
         disp = _compose_figure_display(attrs_json, section_path, txt)
         items.append(disp)
@@ -1142,6 +1233,119 @@ def _list_figures_db(uid: int, doc_id: int, limit: int = 25) -> dict:
         "list": uniq[:limit],
         "more": max(0, total - limit),
     }
+
+
+
+# -------- Ранний обработчик вопросов вида «рисунок 2.1», «рис. 3», «figure 1.2» --------
+
+FIG_NUM_RE = re.compile(
+    r"(?i)\b(?:рис(?:\.|унок)?|figure|fig\.?)\s*(?:№\s*|no\.?\s*|номер\s*)?([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)"
+)
+
+def _num_norm_fig(s: str | None) -> str:
+    s = (s or "").strip()
+    s = s.replace(" ", "").replace(",", ".")
+    # поддержка буквенных префиксов: "А.1" / "A.1"
+    if not s:
+        return s
+    # латиницу/кириллицу оставляем как есть (в индексе храним как в тексте)
+    return s
+
+async def _answer_figure_query(
+    m: types.Message, uid: int, doc_id: int, text: str, *, verbosity: str = "normal"
+) -> bool:
+    """
+    Если пользователь явно спросил про рисунок N — отвечаем детерминированно и коротко:
+    - если нет такого рисунка → «данного рисунка нет в работе»;
+    - если есть, но vision/картинка не читается → «Рисунок плохого качества…» + подпись/хайлайты;
+    - иначе даём краткое «что изображено» + 1–2 ключевые детали из текста рядом.
+    Возвращает True, если ответ сформирован.
+    """
+    nums = [ _num_norm_fig(m.group(1)) for m in FIG_NUM_RE.finditer(text or "") ]
+    nums = [n for n in {n for n in nums if n}]
+    if not nums:
+        return False
+
+    # Берём карточки из retrieval (он сам ищет по attrs.label/caption_num и по путям секций)
+    cards = []
+    try:
+        cards = describe_figures_by_numbers(
+            uid, doc_id, nums, sample_chunks=2, use_vision=True, lang="ru", vision_first_image_only=True
+        ) or []
+    except Exception as e:
+        logging.exception("describe_figures_by_numbers failed: %s", e)
+        cards = []
+
+    found_norm = { _num_norm_fig(c.get("num")) for c in cards if c.get("num") }
+    missing = [n for n in nums if _num_norm_fig(n) not in found_norm]
+
+    parts: list[str] = []
+    # Сообщения по найденным
+    # Сообщения по найденным
+    for c in cards:
+        disp = c.get("display") or f"Рисунок {c.get('num') or ''}".strip()
+        page = (c.get("where") or {}).get("page")
+        hl = [h.strip() for h in (c.get("highlights") or []) if (h or "").strip()]
+        vis = (c.get("vision") or {})
+        vis_desc = (vis.get("description") or "").strip()
+        has_images = bool(c.get("images"))
+
+        header = f"**{disp}**" + (f" (стр. {page})" if page else "")
+        body_lines: list[str] = []
+
+        if verbosity == "brief":
+            if has_images and vis_desc:
+                body_lines.append(f"Краткое описание: {vis_desc}")
+            elif has_images:
+                body_lines.append("Рисунок плохого качества, не могу проанализировать.")
+            else:
+                body_lines.append("Рисунок в тексте без прикреплённого изображения.")
+            if hl:
+                body_lines.append("Подпись/рядом в тексте: " + hl[0])
+                if len(hl) > 1:
+                    body_lines.append("Ещё: " + hl[1])
+
+        elif verbosity == "detailed":
+            if has_images and vis_desc:
+                body_lines.append("Что изображено: " + vis_desc)
+            elif has_images:
+                body_lines.append("Картинка есть, но качество низкое — описание затруднено.")
+            else:
+                body_lines.append("В тексте указан рисунок, файла изображения нет.")
+            if hl:
+                body_lines.append("Контекст/подписи:")
+                for h in hl[:4]:  # до 4 деталей
+                    body_lines.append("— " + h)
+
+        else:  # normal
+            if has_images and vis_desc:
+                body_lines.append("Описание: " + vis_desc)
+            elif has_images:
+                body_lines.append("Рисунок плохого качества, не могу проанализировать.")
+            else:
+                body_lines.append("Рисунок в тексте без прикреплённого изображения.")
+            if hl:
+                body_lines.append("Из подписи: " + hl[0])
+
+        if not body_lines:  # подстраховка
+            body_lines.append("Описание недоступно.")
+
+        parts.append(header + "\n\n" + "\n".join(body_lines))
+
+
+    # Сообщения по отсутствующим
+    for n in missing:
+        parts.append(f"Данного рисунка {n} нет в работе.")
+
+    if parts:
+        await _send(m, "\n\n".join(parts))
+        # NEW: запомним последние номера рисунков для анафоры «этот рисунок/подробнее»
+        try:
+            LAST_REF.setdefault(uid, {})["figure_nums"] = nums
+        except Exception:
+            pass
+        return True
+    return False
 
 
 # -------------------------- САМОВОССТАНОВЛЕНИЕ ИНДЕКСА --------------------------
@@ -1406,7 +1610,7 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
                 })
             con.close()
 
-        facts["tables"]["describe"] = desc_cards
+            facts["tables"]["describe"] = desc_cards
 
     # ----- Рисунки -----
     if intents["figures"]["want"]:
@@ -1420,11 +1624,27 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
 
         if intents["figures"]["describe"]:
             try:
-                desc_text = vision_describe_figures(uid, doc_id, intents["figures"]["describe"])
-                lines = [ln.strip() for ln in (desc_text or "").splitlines() if ln.strip()]
-                figs_block["describe_lines"] = lines[:25]
+                cards = describe_figures_by_numbers(
+                    uid, doc_id, intents["figures"]["describe"],
+                    sample_chunks=2, use_vision=True, lang="ru"
+                )
+                if not cards:
+                    figs_block["describe_lines"] = ["Данного рисунка нет в работе."]
+                else:
+                    lines = []
+                    for c in cards:
+                        disp = c.get("display") or "Рисунок"
+                        vis  = (c.get("vision") or {}).get("description", "")
+                        hint = "; ".join([h for h in (c.get("highlights") or []) if h])
+                        if vis:
+                            lines.append(f"{disp}: {vis}")
+                        elif hint:
+                            lines.append(f"{disp}: {hint}")
+                        else:
+                            lines.append(disp)
+                    figs_block["describe_lines"] = lines[:25]
             except Exception as e:
-                figs_block["describe_lines"] = [f"Не удалось получить описания рисунков: {e}"]
+                figs_block["describe_lines"] = [f"Не удалось описать рисунки: {e}"]
 
         facts["figures"] = figs_block
 
@@ -1544,6 +1764,18 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
     return facts
 
 
+def _strip_unwanted_sections(s: str) -> str:
+    """Удаляем разделы 'Чего не хватает'/'Не хватает' и подобные хвосты."""
+    if not s:
+        return s
+    # вырезаем заголовок + абзац(ы) до следующего пустого разрыва
+    pat = re.compile(r"(?mis)^\s*(?:чего|что)\s+не\s+хватает\s*:.*?(?:\n\s*\n|\Z)")
+    s = pat.sub("", s)
+    # отдельные строки-метки
+    s = re.sub(r"(?mi)^\s*не\s+хватает\s*:.*$", "", s)
+    return s.strip()
+
+
 # ------------------------------ FULLREAD: модель читает весь файл ------------------------------
 
 def _full_document_text(owner_id: int, doc_id: int, *, limit_chars: int | None = None) -> str:
@@ -1590,16 +1822,21 @@ def _fullread_try_answer(uid: int, doc_id: int, q_text: str) -> str | None:
 
     system_prompt = (
         "Ты ассистент по дипломным работам. Тебе дан ПОЛНЫЙ текст ВКР/документа.\n"
-        "Отвечай строго по этому тексту, без внешних фактов. Если данных недостаточно — скажи об этом.\n"
-        "Если вопрос про таблицы/рисунки — используй подписи и текст рядом; не придумывай номера/значения.\n"
-        "Цитируй короткими фрагментами при необходимости, без ссылок на страницы."
+        "Отвечай строго по этому тексту, без внешних фактов. Не добавляй разделов вида "
+        "«Чего не хватает» и не проси дополнительные данные.\n"
+        "Если вопрос про таблицы/рисунки — используй подписи и ближайший текст; не придумывай номера/значения.\n"
+        "Если запрошенного рисунка/таблицы нет в тексте — ответь: «данного рисунка нет в работе».\n"
+        "Если объект есть, но он в плохом качестве/нечитаем — ответь: «Рисунок плохого качества, не могу проанализировать», "
+        "и добавь краткую подпись/контекст из текста. Цитируй коротко, без ссылок на страницы."
     )
 
+    verbosity = _detect_verbosity(q_text)
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "assistant", "content": f"[Документ — полный текст]\n{full_text}"},
-        {"role": "user", "content": q_text},
+        {"role": "user", "content": f"{q_text}\n\n{_verbosity_addendum(verbosity)}"},
     ]
+
 
     if STREAM_ENABLED and chat_with_gpt_stream is not None:
         return ("__STREAM__", json.dumps(messages, ensure_ascii=False))
@@ -1610,6 +1847,7 @@ def _fullread_try_answer(uid: int, doc_id: int, q_text: str) -> str | None:
     except Exception as e:
         logging.exception("fullread direct failed: %s", e)
         return None
+
 
 def _fullread_collect_sections(uid: int, doc_id: int, *, max_sections: int = 800) -> List[str]:
     """
@@ -1630,10 +1868,12 @@ def _fullread_collect_sections(uid: int, doc_id: int, *, max_sections: int = 800
 
     def _flush():
         if buf:
-            text = "\n".join([t for t in buf if t.strip()])
-            if text.strip():
-                out.append(text.strip())
+            text = "\n".join([t for t in buf if t.strip()]).strip()
+            if text:
+                title = f"[{cur_sec}]" if cur_sec else ""
+                out.append(f"{title}\n{text}" if title else text)
         buf.clear()
+
 
     for r in rows:
         sec = r["section_path"] or ""
@@ -1694,7 +1934,6 @@ def _iterative_fullread_build_messages(uid: int, doc_id: int, question: str) -> 
     per_step = int(getattr(Cfg, "FULLREAD_STEP_CHARS", 14000))
     max_steps = int(getattr(Cfg, "FULLREAD_MAX_STEPS", 2))
     map_tokens = int(getattr(Cfg, "DIGEST_TOKENS_PER_SECTION", 300))
-    reduce_tokens = int(getattr(Cfg, "FINAL_MAX_TOKENS", 900))
 
     sections = _fullread_collect_sections(uid, doc_id)
     if not sections:
@@ -1717,15 +1956,20 @@ def _iterative_fullread_build_messages(uid: int, doc_id: int, question: str) -> 
 
     sys_reduce = (
         "Ты репетитор по ВКР. Ниже — короткие факты из разных частей документа (map-выжимки). "
-        "Собери из них связный ответ на вопрос. Не выдумывай новых цифр/таблиц. "
-        "Если данных не хватает — отдельной строкой перечисли, чего не хватает."
+        "Собери из них связный ответ на вопрос. Не выдумывай новых цифр/таблиц и не добавляй разделов "
+        "про «чего не хватает». Отвечай только по имеющимся данным. Если запрошенного рисунка/таблицы "
+        "нет в тексте — сформулируй кратко: «данного рисунка нет в работе». Если объект есть, но он "
+        "нечитабелен, дай: «Рисунок плохого качества, не могу проанализировать», и добавь подпись/контекст из текста."
     )
+
+    verbosity = _detect_verbosity(question)
     messages = [
         {"role": "system", "content": sys_reduce},
         {"role": "assistant", "content": f"Сводные факты из документа:\n{ctx}"},
-        {"role": "user", "content": question},
+        {"role": "user", "content": f"{question}\n\n{_verbosity_addendum(verbosity)}"},
     ]
     return messages, None
+
 
 # ------------------------------ загрузка файла ------------------------------
 
@@ -1734,113 +1978,74 @@ async def handle_doc(m: types.Message):
     uid = ensure_user(str(m.from_user.id))
     doc = m.document
 
-    # 1) скачиваем
+    # 0) FSM: фиксируем, что начали скачивание
+    start_downloading(uid)
+    await _send(m, Cfg.MSG_ACK_DOWNLOADING)
+
+    # 1) скачиваем файл
     file = await bot.get_file(doc.file_id)
     stream = await bot.download_file(file.file_path)
     data = stream.read()
     stream.close()
 
-    # 2) дедуп по содержимому + file_unique_id
-    sha256 = sha256_bytes(data)
-    file_uid = getattr(doc, "file_unique_id", None)
-
-    con = get_conn()
-    existing_id = _find_existing_doc(con, uid, sha256, file_uid)
-
-    if existing_id:
-        existing_ver = get_document_indexer_version(existing_id) or 0
-
-        need_reindex = False
-        try:
-            if _needs_reindex_by_embeddings(con, existing_id):
-                need_reindex = True
-        except Exception:
-            need_reindex = True
-
-        if existing_ver < CURRENT_INDEXER_VERSION:
-            need_reindex = True
-
-        if need_reindex:
-            filename = safe_filename(f"{m.from_user.id}_{doc.file_name}")
-            path = save_upload(data, filename, Cfg.UPLOAD_DIR)
-            update_document_meta(existing_id, path=path, content_sha256=sha256, file_uid=file_uid)
-            con.close()
-
-            try:
-                sections = _parse_by_ext(path)
-                sections = enrich_sections(sections, doc_kind=os.path.splitext(path)[1].lower().strip("."))
-                if sum(len(s.get("text") or "") for s in sections) < 500 and not any(
-                    s.get("element_type") in ("table", "table_row", "figure") for s in sections
-                ):
-                    await _send(m, "Похоже, файл не содержит текста/структур. Убедитесь, что загружен .docx с «живыми» таблицами. Если таблицы были картинками — я их распознаю автоматически.")
-                    return
-
-                delete_document_chunks(existing_id, uid)
-                index_document(uid, existing_id, sections)
-                invalidate_cache(uid, existing_id)
-
-                set_document_indexer_version(existing_id, CURRENT_INDEXER_VERSION)
-                update_document_meta(existing_id, layout_profile=_current_embedding_profile())
-
-            except Exception as e:
-                await _send(m, f"Не удалось переиндексировать документ #{existing_id}: {e}")
-                return
-
-            ACTIVE_DOC[uid] = existing_id
-            set_user_active_doc(uid, existing_id)
-            caption = (m.caption or "").strip()
-            await _send(m, f"Документ #{existing_id} переиндексирован. Готов отвечать.")
-            if caption:
-                await respond_with_answer(m, uid, existing_id, caption)
-            return
-
-        con.close()
-        ACTIVE_DOC[uid] = existing_id
-        set_user_active_doc(uid, existing_id)
-        caption = (m.caption or "").strip()
-        await _send(m, f"Этот файл уже загружен ранее как документ #{existing_id}. Использую его.")
-        if caption:
-            await respond_with_answer(m, uid, existing_id, caption)
-        return
-
-    # 3) сохраняем
+    # 2) сохраняем на диск (единственный источник правды для оркестратора)
     filename = safe_filename(f"{m.from_user.id}_{doc.file_name}")
     path = save_upload(data, filename, Cfg.UPLOAD_DIR)
+    await _send(m, Cfg.MSG_ACK_INDEXING)
 
-    # 4) парсим и ОБОГАЩАЕМ
+    # 3) обёртка индексатора под сигнатуру оркестратора (замыкаем uid)
+    def _indexer_fn(doc_id: int, file_path: str, kind: str) -> dict:
+        sections = _parse_by_ext(file_path)
+        sections = enrich_sections(sections, doc_kind=os.path.splitext(file_path)[1].lower().strip("."))
+        # sanity-check на «пустые» файлы
+        if sum(len(s.get("text") or "") for s in sections) < 500 and not any(
+            s.get("element_type") in ("table", "table_row", "figure") for s in sections
+        ):
+            raise RuntimeError("Похоже, файл не содержит «живого» текста/структур.")
+        # индексация «как раньше»
+        delete_document_chunks(doc_id, uid)
+        index_document(uid, doc_id, sections)
+        invalidate_cache(uid, doc_id)
+        update_document_meta(doc_id, layout_profile=_current_embedding_profile())
+        return {"sections_count": len(sections)}
+
+    # 4) запускаем оркестратор (он сам: идемпотентность, INDEXING, READY/IDLE, версия индексатора)
     try:
-        sections = _parse_by_ext(path)
-        sections = enrich_sections(sections, doc_kind=os.path.splitext(path)[1].lower().strip("."))
+        result = ingest_document(
+            user_id=uid,
+            file_path=path,
+            kind=infer_doc_kind(doc.file_name),
+            file_uid=getattr(doc, "file_unique_id", None),
+            content_sha256=sha256_bytes(data),
+            indexer_fn=_indexer_fn,
+        )
     except Exception as e:
-        await _send(m, f"Не удалось обработать файл: {e}")
+        logging.exception("ingest failed: %s", e)
+        await _send(m, Cfg.MSG_INDEX_FAILED + f" Подробности: {e}")
         return
 
-    # 5) проверка объёма — уже после enrich
-    if sum(len(s.get("text") or "") for s in sections) < 500 and not any(
-        s.get("element_type") in ("table", "table_row", "figure") for s in sections
-    ):
-        await _send(m, "Похоже, файл не содержит текста/структур. Загрузите текстовый DOC/DOCX; таблицы-картинки я распознаю автоматически.")
-        return
-
-    # 6) документ → БД и индексация
-    kind = infer_doc_kind(doc.file_name)
-    doc_id = _insert_document(con, uid, kind, path, sha256, file_uid)
-    con.close()
-
-    index_document(uid, doc_id, sections)
-    invalidate_cache(uid, doc_id)
-    set_document_indexer_version(doc_id, CURRENT_INDEXER_VERSION)
-    update_document_meta(doc_id, layout_profile=_current_embedding_profile())
-
+    doc_id = int(result["doc_id"])
     ACTIVE_DOC[uid] = doc_id
     set_user_active_doc(uid, doc_id)
 
+    # 5) READY: сообщаем и обрабатываем (а) подпись к файлу, (б) очередь ожидавших запросов
+    await _send(m, (f"Этот файл уже был загружен как документ #{doc_id}. " if result.get("reused") else "") + Cfg.MSG_READY)
+
     caption = (m.caption or "").strip()
     if caption:
-        await _send(m, f"Документ #{doc_id} проиндексирован. Отвечаю на ваш вопрос из подписи…")
         await respond_with_answer(m, uid, doc_id, caption)
-    else:
-        await _send(m, f"Готово. Документ #{doc_id} проиндексирован. Можете задавать вопросы по работе.")
+
+    # авто-дренаж очереди ожидания
+    try:
+        queued = dequeue_all_pending_queries(uid)
+        for item in queued:
+            q = (item.get("text") or "").strip()
+            if q:
+                await respond_with_answer(m, uid, doc_id, q)
+                await asyncio.sleep(0)  # не блокируем цикл
+    except Exception as e:
+        logging.exception("drain pending queue failed: %s", e)
+
 
 
 # ------------------------------ основной ответчик ------------------------------
@@ -1860,23 +2065,156 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
     if await _maybe_run_gost(m, uid, doc_id, q_text):
         return
 
+    
+
+
+    # NEW: если в вопросе явно указан раздел/пункт — запоминаем его как последний
+    m_area = _SECTION_NUM_RE.search(q_text)
+    if m_area:
+        try:
+            area = (m_area.group(1) or "").replace(" ", "").replace(",", ".")
+            LAST_REF.setdefault(uid, {})["area"] = area
+        except Exception:
+            pass
+
+    # NEW: если вопрос расплывчатый «про этот ...», подставим последний референт
+    def _expand_with_last_referent(uid: int, text: str) -> str:
+        if not _ANAPH_HINT_RE.search(text or ""):
+            return text
+        last = LAST_REF.get(uid) or {}
+        # приоритет — последний рисунок
+        figs = last.get("figure_nums") or []
+        if figs:
+            return f"{text} (имеется в виду рисунок {figs[0]})"
+        area = (last.get("area") or "").strip()
+        if area:
+            # если нет слова «пункт/раздел», добавим
+            if not re.search(r"(?i)\b(глава|раздел|пункт|подраздел)\b", text):
+                return f"{text} (имеется в виду пункт {area})"
+            return f"{text} ({area})"
+        return text
+    q_text = _expand_with_last_referent(uid, q_text)
+
+    # NEW: быстрый детерминированный путь для «поясни рисунок 2.1/3.4 …»
+    # --- Определяем интенты заранее
+    intents = detect_intents(q_text)
+    verbosity = _detect_verbosity(q_text)
+
+    # Чистый запрос про рисунки (нет секций/таблиц/общего обсуждения)
+    pure_figs = intents["figures"]["want"] and not (
+        intents["tables"]["want"] or intents["sources"]["want"] or
+        intents.get("summary") or intents.get("general_question") or
+        _SECTION_NUM_RE.search(q_text)
+    )
+
+    if pure_figs:
+        # Только рисунки — отдали и выходим
+        if await _answer_figure_query(m, uid, doc_id, q_text, verbosity=verbosity):
+            return
+    else:
+        # Рисунки как часть большого вопроса — отправили блок по рисункам и продолжаем дальше
+        if intents["figures"]["want"]:
+            await _answer_figure_query(m, uid, doc_id, q_text, verbosity=verbosity)
+
+
+    # NEW: явная обработка «по пункту/разделу/главе X.Y»
+        # NEW: явная обработка «по пункту/разделу/главе X.Y» (с защитой от «залипаний»)
+    m_sec = _SECTION_NUM_RE.search(q_text)
+    sec = None
+    if m_sec:
+        raw_sec = (m_sec.group(1) or "").strip()
+        raw_sec = re.sub(r"^[A-Za-zА-Яа-я]\s+(?=\d)", "", raw_sec)  # фикс лишней буквы перед цифрой
+        sec = raw_sec.replace(" ", "").replace(",", ".")
+
+    # считаем «чистым» только короткий и однозадачный запрос без других интентов
+    pure_section = False
+    if sec:
+        multi_intent = (
+            intents["figures"]["want"] or
+            intents["tables"]["want"]  or
+            intents["sources"]["want"] or
+            intents.get("summary")     or
+            bool(intents.get("general_question"))
+        )
+        long_msg        = len(q_text) > getattr(Cfg, "SECTION_ONLY_MAX_LEN", 260)
+        many_questions  = q_text.count("?") >= 2
+        explicit_focus  = bool(re.search(r"(?i)\b(только|лишь|по|про)\b.*\b(пункт|раздел|глава)\b", q_text))
+        pure_section    = (not multi_intent) and (explicit_focus or (not long_msg and not many_questions))
+
+    if sec and pure_section:
+        verbosity = _detect_verbosity(q_text)
+        ctx = _section_context(uid, doc_id, sec, max_chars=9000)
+        if ctx:
+            if verbosity == "brief":
+                sys_prompt = ("Ты репетитор по ВКР. Ниже — контекст по указанному пункту. "
+                              "Нужна КРАТКАЯ выжимка.")
+                user_prompt = (f"Сделай краткую выжимку по пункту {sec}. "
+                               f"{_verbosity_addendum('brief')}")
+            elif verbosity == "detailed":
+                sys_prompt = ("Ты репетитор по ВКР. Ниже — контекст по указанному пункту. "
+                              "Нужен ПОДРОБНЫЙ разбор.")
+                user_prompt = (f"Сделай подробный разбор по пункту {sec}. "
+                               f"{_verbosity_addendum('detailed')}")
+            else:
+                sys_prompt = ("Ты репетитор по ВКР. Ниже — контекст по указанному пункту. "
+                              "Ответь по делу, без внешних фактов.")
+                user_prompt = (f"Ответь по пункту {sec}. "
+                               f"{_verbosity_addendum('normal')}")
+
+            messages = [
+                {"role": "system", "content": sys_prompt},
+                {"role": "assistant", "content": f"[Контекст по пункту {sec}]\n{ctx}"},
+                {"role": "user", "content": user_prompt},
+            ]
+
+            if STREAM_ENABLED and chat_with_gpt_stream is not None:
+                try:
+                    stream = chat_with_gpt_stream(messages, temperature=0.2, max_tokens=FINAL_MAX_TOKENS)  # type: ignore
+                    await _stream_to_telegram(m, stream)
+                    return
+                except Exception as e:
+                    logging.exception("section summary stream failed: %s", e)
+            try:
+                ans = chat_with_gpt(messages, temperature=0.2, max_tokens=FINAL_MAX_TOKENS)
+                if ans:
+                    await _send(m, _strip_unwanted_sections(ans))
+            except Exception as e:
+                logging.exception("section summary non-stream failed: %s", e)
+            return
+        else:
+            # В «чистом» запросе честно сообщаем, что пункт не найден
+            await _send(m, f"Пункт {sec} не найден в индексе документа.")
+            return
+
+    # Если sec найден, но запрос НЕ чистый — не отправляем отдельный ответ по пункту,
+    # продолжаем обычный пайплайн ниже (RAG / FULLREAD), чтобы ответить на всё целиком.
+
+
+
+
     # ====== FULLREAD: auto ======
-    mode = (Cfg.FULLREAD_MODE or "off")
-    if mode == "auto":
+    fr_mode = (Cfg.FULLREAD_MODE or "off")
+    if fr_mode == "auto":
         # пробуем дать модели ПОЛНЫЙ текст, если влазит
         full_text = _full_document_text(uid, doc_id, limit_chars=Cfg.DIRECT_MAX_CHARS + 1)
         if full_text and len(full_text) <= Cfg.DIRECT_MAX_CHARS:
             system_prompt = (
                 "Ты ассистент по дипломным работам. Тебе дан ПОЛНЫЙ текст ВКР/документа.\n"
-                "Отвечай строго по этому тексту, без внешних фактов. Если данных недостаточно — скажи об этом.\n"
-                "Если вопрос про таблицы/рисунки — используй подписи и текст рядом; не придумывай номера/значения.\n"
-                "Цитируй короткими фрагментами при необходимости, без ссылок на страницы."
+                "Отвечай строго по этому тексту, без внешних фактов. Не добавляй разделов вида "
+                "«Чего не хватает» и не проси дополнительные данные.\n"
+                "Если вопрос про таблицы/рисунки — используй подписи и ближайший текст; не придумывай номера/значения.\n"
+                "Если запрошенного рисунка/таблицы нет в тексте — ответь: «данного рисунка нет в работе».\n"
+                "Если объект есть, но он в плохом качестве/нечитаем — ответь: «Рисунок плохого качества, не могу проанализировать», "
+                "и добавь краткую подпись/контекст из текста. Цитируй коротко, без ссылок на страницы."
             )
+
+            verbosity = _detect_verbosity(q_text)
             messages = [
                 {"role": "system", "content": system_prompt},
                 {"role": "assistant", "content": f"[Документ — полный текст]\n{full_text}"},
-                {"role": "user", "content": q_text},
+                {"role": "user", "content": f"{q_text}\n\n{_verbosity_addendum(verbosity)}"},
             ]
+
             if STREAM_ENABLED and chat_with_gpt_stream is not None:
                 try:
                     stream = chat_with_gpt_stream(messages, temperature=0.2, max_tokens=FINAL_MAX_TOKENS)  # type: ignore
@@ -1887,7 +2225,7 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
             try:
                 ans = chat_with_gpt(messages, temperature=0.2, max_tokens=FINAL_MAX_TOKENS)
                 if ans:
-                    await _send(m, ans)
+                    await _send(m, _strip_unwanted_sections(ans))
                     return
             except Exception as e:
                 logging.exception("auto fullread non-stream failed: %s", e)
@@ -1905,7 +2243,7 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
                 try:
                     ans = chat_with_gpt(messages, temperature=0.2, max_tokens=FINAL_MAX_TOKENS)
                     if ans:
-                        await _send(m, ans)
+                        await _send(m, _strip_unwanted_sections(ans))
                         return
                 except Exception as e:
                     logging.exception("auto iterative non-stream failed: %s", e)
@@ -1915,7 +2253,7 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
 
 
     # ====== FULLREAD: direct ======
-    if (Cfg.FULLREAD_MODE or "off") == "direct":
+    if fr_mode == "direct":
         fr = _fullread_try_answer(uid, doc_id, q_text)
         if isinstance(fr, tuple) and fr and fr[0] == "__STREAM__":
             messages = json.loads(fr[1])
@@ -1927,12 +2265,12 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
                 logging.exception("direct fullread stream failed: %s", e)
                 # тихо падаем в обычный пайплайн
         elif isinstance(fr, str) and fr:
-            await _send(m, fr)
+            await _send(m, _strip_unwanted_sections(fr))
             return
         # иначе — RAG ниже
 
     # ====== FULLREAD: iterative/digest ======
-    if (Cfg.FULLREAD_MODE or "off") in {"iterative", "digest"}:
+    if fr_mode in {"iterative", "digest"}:
         messages, err = _iterative_fullread_build_messages(uid, doc_id, q_text)
         if messages:
             if STREAM_ENABLED and chat_with_gpt_stream is not None:
@@ -1945,7 +2283,7 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
             try:
                 ans = chat_with_gpt(messages, temperature=0.2, max_tokens=FINAL_MAX_TOKENS)
                 if ans:
-                    await _send(m, ans)
+                    await _send(m, _strip_unwanted_sections(ans))
                     return
             except Exception as e:
                 logging.exception("iterative fullread non-stream failed: %s", e)
@@ -1956,9 +2294,9 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
         # если что-то не вышло — проваливаемся в стандартный режим ниже
 
     # ====== Стандартный мульти-интент пайплайн (RAG) ======
-    intents = detect_intents(q_text)
     await _ensure_modalities_indexed(m, uid, doc_id, intents)
     facts = _gather_facts(uid, doc_id, intents)
+
 
     # ↓ НОВОЕ: если есть план подпунктов — включаем многошаговую подачу
     discovered_items = None
@@ -1974,19 +2312,22 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
     except Exception as e:
         logging.exception("multistep pipeline failed, fallback to normal: %s", e)
 
-    # обычный путь
-    # app/bot.py
+
+    # обычный путь + явная инструкция по вербозности
+    verbosity = _detect_verbosity(q_text)
+    enriched_q = f"{q_text}\n\n{_verbosity_addendum(verbosity)}"
+
     if STREAM_ENABLED and generate_answer_stream is not None:
         try:
-            stream = generate_answer_stream(q_text, facts, language=intents.get("language", "ru"))
+            stream = generate_answer_stream(enriched_q, facts, language=intents.get("language", "ru"))
             await _stream_to_telegram(m, stream)
             return
-
         except Exception as e:
             logging.exception("stream answer failed, fallback to non-stream: %s", e)
 
-    reply = generate_answer(q_text, facts, language=intents.get("language", "ru"))
-    await _send(m, reply)
+    reply = generate_answer(enriched_q, facts, language=intents.get("language", "ru"))
+    await _send(m, _strip_unwanted_sections(reply))
+
 
 
 # ------------------------------ эмбеддинг-профиль ------------------------------
@@ -2033,7 +2374,6 @@ async def qa(m: types.Message):
     uid = ensure_user(str(m.from_user.id))
     doc_id = ACTIVE_DOC.get(uid)
 
-    # НОВОЕ: если в памяти нет — поднимем из БД (устойчивость к рестартам процесса)
     if not doc_id:
         persisted = get_user_active_doc(uid)
         if persisted:
@@ -2042,12 +2382,22 @@ async def qa(m: types.Message):
 
     text = (m.text or "").strip()
 
-    # Строгий режим: без активного документа не отвечаем по содержанию
     if not doc_id:
-        if _is_greeting(text):
-            await start(m)
-        else:
-            await _send(m, "Сначала пришлите файл (.doc/.docx). Без него я не отвечаю по содержанию.")
+        # сохраняем вопрос, чтобы ответить после индексации первого файла
+        if text:
+            enqueue_pending_query(uid, text, meta={"source": "chat", "reason": "no_active_doc"})
+        await _send(m, Cfg.MSG_NEED_FILE_QUEUED)  # «Сначала пришлите файл… Я поставил ваш вопрос в очередь»
+        return
+
+    # FSM-барьер: если документ ещё не готов — ставим запрос в очередь
+    try:
+        state = get_processing_state(uid)
+    except Exception:
+        state = ProcessingState.READY.value
+
+    if state != ProcessingState.READY.value:
+        enqueue_pending_query(uid, text, meta={"source": "chat"})
+        await _send(m, Cfg.MSG_NOT_READY_QUEUED)
         return
 
     await respond_with_answer(m, uid, doc_id, text)

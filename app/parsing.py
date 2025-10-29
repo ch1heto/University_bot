@@ -383,13 +383,6 @@ def _is_title_candidate(text: str, attrs: dict) -> bool:
 
 # ----------------------------- sources / appendix helpers -----------------------------
 
-# ГЛАВНОЕ ИЗМЕНЕНИЕ: намного более терпимый детектор заголовка раздела источников.
-# Покрывает:
-# - "Список литературы"
-# - "Список используемой литературы" / "Список использованной литературы"
-# - "Список использованных источников" / "Список используемых источников"
-# - "Библиографический список", "Библиография"
-# - "References", "Bibliography"
 SOURCES_TITLE_RE = re.compile(
     r"""(?ix)
     (
@@ -437,10 +430,21 @@ def _parse_reference_line(s: str) -> Tuple[Optional[int], str]:
         idx = None
     return idx, (m.group(3) or "").strip()
 
-# ----------------------------- section-path helpers -----------------------------
+# ----------------------------- section-path helpers (НОВОЕ: нумерация) -----------------------------
 
-def _hpath_str(stack: List[str]) -> str:
-    return " / ".join([s for s in stack if s])
+def _hpath(ids: List[str], titles: List[str]) -> str:
+    parts = []
+    for i, t in enumerate(titles):
+        if not t:
+            continue
+        sid = ids[i] if i < len(ids) else None
+        parts.append((f"{sid} {t}".strip() if sid else t).strip())
+    return " / ".join(parts)
+
+def _make_section_id(counters: List[int], upto: Optional[int] = None) -> str:
+    if upto is None or upto > len(counters):
+        upto = len(counters)
+    return ".".join(str(x) for x in counters[:upto] if x > 0)
 
 # ----------------------------- DOCX main -----------------------------
 
@@ -449,6 +453,7 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
     Парсим .docx с поддержкой заголовков, таблиц, базового форматирования и
     аккуратной обработкой подписей к таблицам/рисункам.
     Также извлекаем изображения и привязываем к секциям element_type='figure'.
+    ДОБАВЛЕНО: нумерация разделов (ID вида 1, 1.1, 1.2...) и передача scope_id/path.
     """
     doc = Docx(path)
 
@@ -456,9 +461,48 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
     buf: List[str] = []
     last_para_attrs: Optional[dict] = None
 
-    # текущий заголовок и стек заголовков для section_path
-    title, level = "Документ", 0
-    heading_stack: List[str] = []
+    # текущий заголовок и стек заголовков
+    cur_title, cur_level = "Документ", 0
+
+    # НОВОЕ: счётчики для нумерации и стек для id/заголовков
+    outline_counters: List[int] = []        # [1, 2, ...] по уровням
+    heading_stack_titles: List[str] = []    # названия на уровнях
+    heading_stack_ids: List[str] = []       # текстовые ID на уровнях ("1", "1.2", ...)
+
+    def _current_scope_id() -> str:
+        return _make_section_id(outline_counters)
+
+    def _current_scope_path() -> str:
+        return _hpath(heading_stack_ids, heading_stack_titles)
+
+    def _enter_heading(level: int, title: str) -> str:
+        """Обновляет счётчики и стеки под новый заголовок уровня level, возвращает section_id."""
+        nonlocal outline_counters, heading_stack_titles, heading_stack_ids, cur_title, cur_level
+        if level < 1:
+            level = 1
+        # расширяем/усекаем счётчики до нужного уровня
+        while len(outline_counters) < level:
+            outline_counters.append(0)
+        outline_counters = outline_counters[:level]
+        # инкремент уровня и сброс глубже
+        outline_counters[level - 1] += 1
+
+        # обновляем стеки названий и id
+        if len(heading_stack_titles) < level:
+            heading_stack_titles += [""] * (level - len(heading_stack_titles))
+        if len(heading_stack_ids) < level:
+            heading_stack_ids += [""] * (level - len(heading_stack_ids))
+
+        heading_stack_titles = heading_stack_titles[:level]
+        heading_stack_ids = heading_stack_ids[:level]
+
+        sid = _make_section_id(outline_counters, upto=level)
+        heading_stack_titles[level - 1] = (title or "Без названия")
+        heading_stack_ids[level - 1] = sid
+
+        cur_title = title or "Без названия"
+        cur_level = level
+        return sid
 
     # состояние: находимся ли в разделе «Источники»
     in_sources = False
@@ -474,18 +518,20 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
     figure_counter = 0
 
     def flush_text_section():
-        nonlocal buf, title, level, last_para_attrs
+        nonlocal buf, cur_title, cur_level, last_para_attrs
         if buf:
             text = "\n".join(buf)
             sections.append({
-                "title": title,
-                "level": level,
+                "title": cur_title,
+                "level": cur_level,
                 "text": text,
                 "page": None,
-                "section_path": _hpath_str(heading_stack) or title,
+                "section_path": _current_scope_path() or cur_title,
                 "element_type": "paragraph",
                 "attrs": {
                     "numbers": _extract_numbers(text),
+                    "section_scope_id": _current_scope_id(),
+                    "section_scope_path": _current_scope_path(),
                     **(last_para_attrs or {})
                 }
             })
@@ -525,33 +571,24 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                 try:
                     # извлечь номер уровня из имени стиля
                     m = re.search(r"(\d+)", p_style)
-                    level = max(1, int(m.group(1))) if m else 1
+                    lvl = max(1, int(m.group(1))) if m else 1
                 except Exception:
-                    level = 1
-                if len(heading_stack) < level:
-                    heading_stack += [""] * (level - len(heading_stack))
-                heading_stack = heading_stack[:level]
-                heading_stack[level - 1] = title
+                    lvl = 1
+
+                sec_id = _enter_heading(lvl, title)
 
                 in_sources = _is_sources_title(title)
                 if _is_appendix_title(title):
                     in_sources = False  # раздел «Приложения» заканчивает блок источников
 
-                # сброс ожидаемых подписей
-                pending_tbl_num = None
-                pending_tbl_tail = None
-                awaiting_tail = False
-                last_title_candidate = None
-                last_title_candidate_age = 999
-
                 sections.append({
                     "title": title,
-                    "level": level,
+                    "level": lvl,
                     "text": "",
                     "page": None,
-                    "section_path": _hpath_str(heading_stack),
+                    "section_path": _current_scope_path(),
                     "element_type": "heading",
-                    "attrs": {"style": p_style_name}
+                    "attrs": {"style": p_style_name, "section_id": sec_id}
                 })
                 continue
 
@@ -561,22 +598,19 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                 consider_flush_stale_candidate()
                 flush_text_section()
                 title = p_text or "Приложение"
-                level = max(1, level + 1)
-                if len(heading_stack) < level:
-                    heading_stack += [""] * (level - len(heading_stack))
-                heading_stack = heading_stack[:level]
-                heading_stack[level - 1] = title
+                lvl = max(1, cur_level + 1)
+                sec_id = _enter_heading(lvl, title)
 
                 in_sources = False  # «Приложение» завершает список источников
 
                 sections.append({
                     "title": title,
-                    "level": level,
+                    "level": lvl,
                     "text": "",
                     "page": None,
-                    "section_path": _hpath_str(heading_stack),
+                    "section_path": _current_scope_path(),
                     "element_type": "heading",
-                    "attrs": {"style": "pseudo-heading-appendix", **attrs_here}
+                    "attrs": {"style": "pseudo-heading-appendix", "section_id": sec_id, **attrs_here}
                 })
                 continue
 
@@ -593,16 +627,20 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                 flush_text_section()
                 idx, tail = _parse_reference_line(p_text)
                 attrs = _paragraph_attrs(block)
-                attrs.update({"numbers": _extract_numbers(tail)})
+                attrs.update({
+                    "numbers": _extract_numbers(tail),
+                    "section_scope_id": _current_scope_id(),
+                    "section_scope_path": _current_scope_path()
+                })
                 if idx is not None:
                     attrs["ref_index"] = idx
                 ref_title = f"Источник {idx}" if idx is not None else "Источник"
                 sections.append({
                     "title": ref_title,
-                    "level": max(1, level + 1),
+                    "level": max(1, cur_level + 1),
                     "text": tail,
                     "page": None,
-                    "section_path": _hpath_str(heading_stack + [ref_title]),
+                    "section_path": _hpath(heading_stack_ids, heading_stack_titles + [ref_title]),
                     "element_type": "reference",
                     "attrs": attrs,
                 })
@@ -654,15 +692,16 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                     attrs_here_fig["images"] = imgs
 
                 # добавляем привязку к текущему разделу и стабильный якорь
-                attrs_here_fig["section_scope"] = _hpath_str(heading_stack)
+                attrs_here_fig["section_scope"] = _current_scope_path()
+                attrs_here_fig["section_scope_id"] = _current_scope_id()
                 attrs_here_fig["anchor"] = f"fig-{(num or figure_counter)}"
 
                 sections.append({
                     "title": fig_title,
-                    "level": max(1, level + 1),
+                    "level": max(1, cur_level + 1),
                     "text": p_text or "",
                     "page": None,
-                    "section_path": _hpath_str(heading_stack + [fig_title]),
+                    "section_path": _hpath(heading_stack_ids, heading_stack_titles + [fig_title]),
                     "element_type": "figure",
                     "attrs": attrs_here_fig
                 })
@@ -678,22 +717,19 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                 consider_flush_stale_candidate()
                 flush_text_section()
                 title = p_text or "Список литературы"
-                level = max(1, level + 1)
-                if len(heading_stack) < level:
-                    heading_stack += [""] * (level - len(heading_stack))
-                heading_stack = heading_stack[:level]
-                heading_stack[level - 1] = title
+                lvl = max(1, cur_level + 1)
+                sec_id = _enter_heading(lvl, title)
 
                 in_sources = True  # включаем режим разбора источников
 
                 sections.append({
                     "title": title,
-                    "level": level,
+                    "level": lvl,
                     "text": "",
                     "page": None,
-                    "section_path": _hpath_str(heading_stack),
+                    "section_path": _current_scope_path(),
                     "element_type": "heading",
-                    "attrs": {"style": "pseudo-heading-sources", **attrs_here}
+                    "attrs": {"style": "pseudo-heading-sources", "section_id": sec_id, **attrs_here}
                 })
                 continue
 
@@ -746,19 +782,19 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
             attrs_tbl["title"] = tail_final
             attrs_tbl["caption_source"] = caption_source
             # привязка к разделу + стабильный якорь
-            attrs_tbl["section_scope"] = _hpath_str(heading_stack)
+            attrs_tbl["section_scope"] = _current_scope_path()
+            attrs_tbl["section_scope_id"] = _current_scope_id()
             attrs_tbl["anchor"] = f"tbl-{(num_final or table_counter)}"
 
             sections.append({
                 "title": t_title or f"Таблица {table_counter}",
-                "level": max(1, level + 1),
+                "level": max(1, cur_level + 1),
                 "text": t_text,
                 "page": None,
-                "section_path": _hpath_str(heading_stack + [t_title or f"Таблица {table_counter}"]),
+                "section_path": _hpath(heading_stack_ids, heading_stack_titles + [t_title or f"Таблица {table_counter}"]),
                 "element_type": "table",
                 "attrs": attrs_tbl
             })
-
 
             # сброс состояния
             pending_tbl_num = None

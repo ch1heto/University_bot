@@ -1,7 +1,9 @@
 # app/config.py
 import os
 from pathlib import Path
+from enum import Enum
 
+# Загружаем .env, если есть
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -9,12 +11,13 @@ except Exception:
     pass
 
 
+# ----------------------------- env helpers -----------------------------
+
 def _env_bool(name: str, default: bool = False) -> bool:
     v = os.getenv(name)
     if v is None:
         return default
     return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
-
 
 def _env_int(name: str, default: int) -> int:
     try:
@@ -22,10 +25,18 @@ def _env_int(name: str, default: int) -> int:
     except Exception:
         return default
 
-
 def _env_str(name: str, default: str) -> str:
     v = os.getenv(name)
     return default if v is None else str(v).strip()
+
+
+# --- FSM состояния обработки документа (для детерминированной оркестрации) ---
+class ProcessingState(str, Enum):
+    IDLE = "idle"                 # Нет активного документа / ожидание
+    DOWNLOADING = "downloading"   # Получаем файл от Telegram
+    INDEXING = "indexing"         # Индексируем/парсим документ
+    READY = "ready"               # Документ проиндексирован, можно отвечать
+    ANSWERING = "answering"       # Генерация ответа (RAG/LLM)
 
 
 class Cfg:
@@ -43,8 +54,21 @@ class Cfg:
     POLZA_EMB: str = os.getenv("POLZA_EMB_MODEL", "openai/text-embedding-3-large")
 
     # --- Парсинг / распознавание ---
+    # Сколько соседних блоков проверять при поиске картинок вокруг подписи (DOCX)
     FIG_NEIGHBOR_WINDOW: int = _env_int("FIG_NEIGHBOR_WINDOW", 4)
+    # Извлекать ли картинки из PDF (через PyMuPDF), если доступно
     PDF_EXTRACT_IMAGES: bool = _env_bool("PDF_EXTRACT_IMAGES", True)
+
+    # ВКЛЮЧЕНО ДЛЯ ШАГА «Структурированный парсинг + OCR + кеш по хэшу»
+    # Сохранять структурированный индекс секций в БД (таблица document_sections)
+    SAVE_STRUCT_INDEX: bool = _env_bool("SAVE_STRUCT_INDEX", True)
+    # OCR для изображений/сканов (используется индексатором, если подключён pytesseract/иное)
+    OCR_ENABLED: bool = _env_bool("OCR_ENABLED", True)
+    OCR_LANGS: str = _env_str("OCR_LANGS", "rus+eng")
+    # Какой OCR-движок использовать: "tesseract" | "disabled" | др. (на будущее)
+    OCR_ENGINE: str = _env_str("OCR_ENGINE", "tesseract")
+    # Необязательный путь к бинарю tesseract (если не в PATH)
+    OCR_TESSERACT_CMD: str = _env_str("OCR_TESSERACT_CMD", "")
 
     # --- FULLREAD режим ---
     # По умолчанию "auto": если документ влазит — даём модели целиком,
@@ -61,7 +85,6 @@ class Cfg:
     FULLREAD_MODE: str = _FULLREAD_ALIASES.get(_FULLREAD_MODE_RAW, "auto")
 
     # Лимиты/бюджеты для FULLREAD
-    # Чуть расширены, чтобы реже видеть "Недостающая информация".
     FULLREAD_MAX_STEPS: int = _env_int("FULLREAD_MAX_STEPS", 6)
     FULLREAD_STEP_CHARS: int = _env_int("FULLREAD_STEP_CHARS", 20_000)
     FULLREAD_CHUNK_CHARS: int = _env_int("FULLREAD_CHUNK_CHARS", FULLREAD_STEP_CHARS)
@@ -73,9 +96,7 @@ class Cfg:
     # Токен-бюджеты для map/reduce
     FULLREAD_MAP_TOKENS: int = _env_int("FULLREAD_MAP_TOKENS", 600)
     FULLREAD_REDUCE_TOKENS: int = _env_int("FULLREAD_REDUCE_TOKENS", 2_400)
-    DIGEST_TOKENS_PER_SECTION: int = _env_int(
-        "DIGEST_TOKENS_PER_SECTION", 900  # чуть больше, чтобы map-выжимки были полнее
-    )
+    DIGEST_TOKENS_PER_SECTION: int = _env_int("DIGEST_TOKENS_PER_SECTION", 900)
 
     FULLREAD_ENABLE_VISION: bool = _env_bool("FULLREAD_ENABLE_VISION", True)
 
@@ -88,7 +109,7 @@ class Cfg:
     PLANNER_MAX_TOKENS: int = _env_int("PLANNER_MAX_TOKENS", 500)
     PART_MAX_TOKENS: int = _env_int("PART_MAX_TOKENS", 900)
     MERGE_MAX_TOKENS: int = _env_int("MERGE_MAX_TOKENS", 2_400)
-    # Используется в нескольких местах (stream/non-stream). Подняли до 2400.
+    # Используется в нескольких местах (stream/non-stream)
     FINAL_MAX_TOKENS: int = _env_int("FINAL_MAX_TOKENS", 2_400)
 
     # --- Полные выгрузки таблиц (TablesRaw) ---
@@ -126,15 +147,79 @@ class Cfg:
     PG_USER: str = os.getenv("PG_USER", "postgres")
     PG_PASSWORD: str = os.getenv("PG_PASSWORD", "postgres")
 
-    # --- SQLite / файлы ---
+    # --- Пути / файловая система ---
     SQLITE_PATH: str = os.getenv("SQLITE_PATH", "./vkr.sqlite")
     UPLOAD_DIR: str = os.getenv("UPLOAD_DIR", "./uploads")
+    # Опциональный кэш (например, для временных OCR-результатов/картинок)
+    CACHE_DIR: str = os.getenv("CACHE_DIR", "./.cache")
 
+    # Гарантируем наличие директорий
     _upload_dir = Path(UPLOAD_DIR)
     _upload_dir.mkdir(parents=True, exist_ok=True)
 
     _sqlite_parent = Path(SQLITE_PATH).resolve().parent
     _sqlite_parent.mkdir(parents=True, exist_ok=True)
+
+    _cache_dir = Path(CACHE_DIR)
+    _cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # =========================
+    #   FSM / READY-БАРЬЕР
+    # =========================
+    FSM_ENABLED: bool = _env_bool("FSM_ENABLED", True)
+
+    # Жёсткий контроль на пользователя: запрещает параллельные пайплайны для одного user_id.
+    PER_USER_MAX_CONCURRENCY: int = _env_int("PER_USER_MAX_CONCURRENCY", 1)
+
+    # Очередь запросов, пришедших до READY
+    PENDING_QUEUE_MAX: int = _env_int("PENDING_QUEUE_MAX", 50)
+    PENDING_QUEUE_TTL_SEC: int = _env_int("PENDING_QUEUE_TTL_SEC", 60 * 60 * 12)  # 12 часов
+
+    # Таймауты стадий
+    DOWNLOAD_TIMEOUT_SEC: int = _env_int("DOWNLOAD_TIMEOUT_SEC", 120)
+    INDEX_TIMEOUT_SEC: int = _env_int("INDEX_TIMEOUT_SEC", 15 * 60)  # 15 минут
+
+    # Барьер: ждать READY при обработке текстовых сообщений, если есть активный ingest
+    WAIT_READY_ON_QUERY: bool = _env_bool("WAIT_READY_ON_QUERY", True)
+    WAIT_READY_TIMEOUT_SEC: int = _env_int("WAIT_READY_TIMEOUT_SEC", 15 * 60)  # 15 минут
+    READY_GRACE_SEC: int = _env_int("READY_GRACE_SEC", 2)  # пауза после READY перед ANSWERING
+
+    # Идемпотентность индексации — по хэшу файла (не запускать повторно)
+    INGEST_IDEMPOTENCY_BY_HASH: bool = _env_bool("INGEST_IDEMPOTENCY_BY_HASH", True)
+
+    # Ретраи оркестрации индексации/загрузки
+    RETRY_MAX_ATTEMPTS: int = _env_int("FSM_RETRY_MAX_ATTEMPTS", 3)
+    RETRY_BASE_DELAY_MS: int = _env_int("FSM_RETRY_BASE_DELAY_MS", 500)
+
+    # Диагностика и логирование событий FSM
+    FSM_AUDIT_LOG_ENABLED: bool = _env_bool("FSM_AUDIT_LOG_ENABLED", True)
+
+    # Текстовые шаблоны статусов (переопределяемые через .env)
+    MSG_ACK_DOWNLOADING: str = _env_str(
+        "MSG_ACK_DOWNLOADING",
+        "Файл получен, начинаю загрузку…"
+    )
+    MSG_ACK_INDEXING: str = _env_str(
+        "MSG_ACK_INDEXING",
+        "Индексирую документ, это может занять немного времени…"
+    )
+    # Новое: сообщение, когда ещё нет активного документа — вопрос кладём в очередь
+    MSG_NEED_FILE_QUEUED: str = _env_str(
+        "MSG_NEED_FILE_QUEUED",
+        "Сначала пришлите .doc/.docx. Я поставил ваш вопрос в очередь."
+    )
+    MSG_NOT_READY_QUEUED: str = _env_str(
+        "MSG_NOT_READY_QUEUED",
+        "Документ ещё готовится. Ваш запрос поставлен в очередь и будет выполнен сразу после индексации."
+    )
+    MSG_READY: str = _env_str(
+        "MSG_READY",
+        "Готово: документ проиндексирован. Перехожу к ответам."
+    )
+    MSG_INDEX_FAILED: str = _env_str(
+        "MSG_INDEX_FAILED",
+        "Не удалось проиндексировать документ. Попробуйте ещё раз или загрузите другой файл."
+    )
 
     @classmethod
     def validate(cls) -> None:
@@ -159,6 +244,18 @@ class Cfg:
 
         if cls.STREAM_MODE not in {"edit", "multi"}:
             raise RuntimeError("STREAM_MODE должен быть 'edit' или 'multi'.")
+
+        if cls.PER_USER_MAX_CONCURRENCY < 1:
+            raise RuntimeError("PER_USER_MAX_CONCURRENCY должен быть >= 1.")
+
+        if cls.PENDING_QUEUE_MAX < 0:
+            raise RuntimeError("PENDING_QUEUE_MAX не может быть отрицательным.")
+
+        if cls.DOWNLOAD_TIMEOUT_SEC <= 0 or cls.INDEX_TIMEOUT_SEC <= 0:
+            raise RuntimeError("DOWNLOAD_TIMEOUT_SEC и INDEX_TIMEOUT_SEC должны быть > 0.")
+
+        if cls.WAIT_READY_ON_QUERY and cls.WAIT_READY_TIMEOUT_SEC <= 0:
+            raise RuntimeError("WAIT_READY_TIMEOUT_SEC должен быть > 0, если WAIT_READY_ON_QUERY включён.")
 
     @classmethod
     def fullread_enabled(cls) -> bool:
