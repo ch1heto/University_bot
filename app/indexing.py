@@ -10,6 +10,26 @@ from .polza_client import embeddings
 from .chunking import split_into_chunks
 from .config import Cfg
 
+# мягкие зависимости для OCR
+try:
+    import pytesseract  # type: ignore
+    from PIL import Image  # type: ignore
+except Exception:
+    pytesseract = None
+    Image = None
+
+# --------- OCR конфиг с безопасными дефолтами ---------
+try:
+    OCR_ENABLED = bool(getattr(Cfg, "OCR_ENABLED", True))
+    OCR_LANG = getattr(Cfg, "OCR_LANG", "rus+eng")
+    OCR_MIN_CHARS = int(getattr(Cfg, "OCR_MIN_CHARS", 12))
+    OCR_MAX_IMAGES = int(getattr(Cfg, "OCR_MAX_IMAGES_PER_SECTION", 6))
+except Exception:
+    OCR_ENABLED = True
+    OCR_LANG = "eng"
+    OCR_MIN_CHARS = 12
+    OCR_MAX_IMAGES = 6
+
 
 # ---------- helpers ----------
 
@@ -18,25 +38,12 @@ def _norm(s: str | None) -> str:
 
 
 def _make_anchor_id(section_path: str, page: int | None, title: str | None) -> str:
-    """
-    Стабильный якорь для ссылки на место в тексте.
-    Основан на section_path + page + title (безопасно для старых индексов: хранится только в attrs).
-    """
-    base = f"{_norm(section_path)}|p={page or ''}|t={_norm(title)}"
-    h = hashlib.sha1(base.encode("utf-8")).hexdigest()  # короткий и достаточно стабильный
+    base = f"{_norm(section_path)}|p={{}}|t={_norm(title)}".format(page or "")
+    h = hashlib.sha1(base.encode("utf-8")).hexdigest()
     return f"anch-{h[:16]}"
 
 
 def _prefix(section: Dict[str, Any]) -> str:
-    """
-    Короткий префикс контекста для большинства чанков (повышает качество поиска).
-      [Заголовок] Введение
-      [Таблица] стр.3 Таблица 2.1 — Состав выборки
-      [Рисунок] стр.7 Рисунок 3.2 — Архитектура
-      [Текст] стр.5 Глава 2. Методика исследования
-
-    ВАЖНО: для element_type='reference' префиксы НЕ используются — в text пишем только саму запись источника.
-    """
     et = (section.get("element_type") or "").lower()
     title = _norm(section.get("title")) or "Документ"
     page = section.get("page")
@@ -59,10 +66,6 @@ def _prefix(section: Dict[str, Any]) -> str:
 
 
 def _attach_anchors(attrs: dict, *, section_path: str, page: int | None, title: str | None) -> dict:
-    """
-    Ненавязчиво обогащаем attrs служебными полями для прозрачных ссылок.
-    Не ломает старые пайплайны (всё внутри JSON attrs).
-    """
     out = dict(attrs or {})
     out.setdefault("section_title", _norm(title))
     out.setdefault("section_path_norm", _norm(section_path))
@@ -84,9 +87,6 @@ def _batched(items: List[str], n: int) -> Iterable[List[str]]:
 
 
 def _limit_table_row_columns(row: str, max_cols: int) -> str:
-    """
-    Ограничивает число колонок в строке таблицы (split по ' | ').
-    """
     if max_cols <= 0:
         return row
     parts = [p.strip() for p in (row or "").split(" | ")]
@@ -95,31 +95,170 @@ def _limit_table_row_columns(row: str, max_cols: int) -> str:
     return " | ".join([p for p in parts[:max_cols] if p])
 
 
+# ---------- OCR & CHART synthesis ----------
+
+def _run_ocr_on_images_if_needed(base_attrs: dict) -> Optional[str]:
+    """
+    Если нет ocr_text, но есть images — делаем OCR.
+    Возвращает строку (может быть пустой) или None, если OCR не выполнялся.
+    """
+    if not OCR_ENABLED or pytesseract is None or Image is None:
+        return None
+
+    if not isinstance(base_attrs, dict):
+        return None
+
+    ocr_text = (base_attrs.get("ocr_text") or "").strip()
+    if ocr_text:
+        return ocr_text  # уже есть
+
+    images = base_attrs.get("images") or []
+    if not isinstance(images, (list, tuple)) or not images:
+        return None
+
+    out_lines: List[str] = []
+    processed = 0
+    for pth in images:
+        if processed >= max(1, OCR_MAX_IMAGES):
+            break
+        try:
+            img = Image.open(pth)
+        except Exception:
+            continue
+        try:
+            txt = pytesseract.image_to_string(img, lang=OCR_LANG) or ""
+        except Exception:
+            txt = ""
+        txt = txt.replace("\x0c", "").strip()
+        if txt:
+            out_lines.append(txt)
+        processed += 1
+
+    merged = "\n".join([t for t in out_lines if t.strip()]).strip()
+    if merged and len(merged) >= OCR_MIN_CHARS:
+        # положим в attrs, чтобы переиспользовалось в следующих шагах/повторах
+        base_attrs["ocr_text"] = merged
+        return merged
+    return "" if merged else None
+
+
+def _synth_chart_text(base_attrs: dict, section: Dict[str, Any]) -> Optional[str]:
+    """
+    Из attrs.chart_data собираем читабельный текст.
+    Формат: «метка — значение» построчно + лёгкая сводка (мин/макс/сумма, если числовые).
+    """
+    rows = base_attrs.get("chart_data")
+    if not isinstance(rows, list) or not rows:
+        return None
+
+    lines: List[str] = []
+    numeric_vals: List[float] = []
+
+    # Заголовок/контекст
+    cap_num = base_attrs.get("caption_num") or base_attrs.get("label")
+    cap_tail = base_attrs.get("caption_tail") or base_attrs.get("title")
+    head = None
+    if (section.get("element_type") or "").lower() == "figure":
+        if cap_num and cap_tail:
+            head = f"Данные диаграммы «Рисунок {cap_num} — {cap_tail}»"
+        elif cap_num:
+            head = f"Данные диаграммы «Рисунок {cap_num}»"
+        elif cap_tail:
+            head = f"Данные диаграммы: {cap_tail}"
+    if head:
+        lines.append(head)
+
+    for r in rows:
+        label = _norm(str(r.get("label", "")))
+        val = r.get("value", None)
+        if label == "" and val is None:
+            continue
+        if isinstance(val, float) or isinstance(val, int):
+            numeric_vals.append(float(val))
+            vstr = f"{val}".rstrip("0").rstrip(".") if isinstance(val, float) else str(val)
+        else:
+            vstr = str(val) if val is not None else ""
+        if label and vstr:
+            lines.append(f"{label} — {vstr}")
+        elif label:
+            lines.append(label)
+        elif vstr:
+            lines.append(vstr)
+
+    # простая сводка
+    if numeric_vals:
+        s = sum(numeric_vals)
+        mn = min(numeric_vals)
+        mx = max(numeric_vals)
+        lines.append(f"Сумма = {s:g}; мин = {mn:g}; макс = {mx:g}")
+
+    txt = "\n".join([ln for ln in lines if ln.strip()]).strip()
+    if txt:
+        base_attrs["chart_text"] = txt  # сохраним для дебага/повтора
+        return txt
+    return None
+
+
 def _yield_ocr_chunks_if_any(
     section: Dict[str, Any],
     base_attrs: dict,
 ) -> Iterable[tuple[str, Dict[str, Any], str, dict]]:
     """
-    Если секция (обычно figure) содержит attrs.ocr_text — порождаем отдельные OCR-чанки.
-    Тип оставляем тем же (figure/page/...) и помечаем subtype="ocr" в attrs.
+    Если у секции есть ocr_text — режем и отдаём.
+    Если ocr_text нет, но есть images — пробуем сделать OCR и также отдаём.
+    subtype = "ocr".
     """
     et = (section.get("element_type") or "").lower()
     if not isinstance(base_attrs, dict):
         return
-    ocr_text = (base_attrs.get("ocr_text") or "").strip()
-    if not ocr_text:
+
+    # OCR при необходимости
+    ocr_text_existing = (base_attrs.get("ocr_text") or "").strip()
+    if not ocr_text_existing:
+        maybe = _run_ocr_on_images_if_needed(base_attrs)
+        if isinstance(maybe, str):
+            ocr_text_existing = maybe.strip()
+
+    if not ocr_text_existing:
         return
 
     page = section.get("page")
     section_path = _norm(section.get("section_path")) or _norm(section.get("title")) or "Документ"
-    # OCR-текст режем самостоятельными чанками (без префикса, чтобы не раздувать текст).
-    # Но добавим небольшой OCR-тег в attrs.
-    for ch in split_into_chunks(ocr_text):
+    for ch in split_into_chunks(ocr_text_existing):
         if not ch.strip():
             continue
         attrs = dict(base_attrs)
         attrs["subtype"] = "ocr"
-        yield ch, {"page": page, "section_path": section_path}, et or "figure", attrs
+        yield ch, {"page": page, "section_path": section_path}, (et or "figure"), attrs
+
+
+def _yield_chart_chunks_if_any(
+    section: Dict[str, Any],
+    base_attrs: dict,
+) -> Iterable[tuple[str, Dict[str, Any], str, dict]]:
+    """
+    Если у секции есть chart_data — синтезируем текст и отдаём отдельные чанки.
+    subtype = "chart".
+    """
+    et = (section.get("element_type") or "").lower()
+    if not isinstance(base_attrs, dict):
+        return
+
+    chart_txt = base_attrs.get("chart_text")
+    if not chart_txt:
+        chart_txt = _synth_chart_text(base_attrs, section)
+
+    if not chart_txt:
+        return
+
+    page = section.get("page")
+    section_path = _norm(section.get("section_path")) or _norm(section.get("title")) or "Документ"
+    for ch in split_into_chunks(chart_txt):
+        if not ch.strip():
+            continue
+        attrs = dict(base_attrs)
+        attrs["subtype"] = "chart"
+        yield ch, {"page": page, "section_path": section_path}, (et or "figure"), attrs
 
 
 def _yield_chunks_for_section(
@@ -128,18 +267,6 @@ def _yield_chunks_for_section(
     max_table_rows: Optional[int] = None,
     max_table_cols: Optional[int] = None,
 ) -> Iterable[tuple[str, Dict[str, Any], str, dict]]:
-    """
-    Генерирует чанки для одной секции.
-    Возвращает кортежи: (text, meta, element_type, attrs_dict)
-
-    - Таблицы -> сначала корневой чанк (element_type='table' с описанием),
-                 затем одна строка = один чанк (element_type='table_row', attrs.row_index).
-    - Заголовки -> отдельный малый чанк (element_type='heading').
-    - Источники -> один чанк на запись (element_type='reference'); в text — ТОЛЬКО текст записи.
-    - Остальной текст (включая figure/page) -> split_into_chunks(...) с префиксом в начале.
-      Для figure, если text пустой, синтезируем «Рисунок N — Хвост», чтобы чанк не потерялся.
-    - Если в attrs присутствует ocr_text — добавляем отдельные OCR-чанки (subtype="ocr").
-    """
     et = (section.get("element_type") or "").lower()
     title = _norm(section.get("title")) or "Документ"
     section_path = _norm(section.get("section_path")) or title
@@ -147,27 +274,26 @@ def _yield_chunks_for_section(
     base_attrs = dict(section.get("attrs") or {})
     text = section.get("text") or ""
 
-    # Добавим прозрачные якоря (безопасно: всё уходит в attrs JSON)
+    # якоря
     base_attrs = _attach_anchors(base_attrs, section_path=section_path, page=page, title=title)
 
-    # Заголовок — отдельный небольшой чанк с префиксом
+    # заголовок
     if et == "heading":
         head_txt = _prefix(section)
         yield head_txt, {"page": page, "section_path": section_path}, "heading", base_attrs
         return
 
-    # Источник — отдельный чанк: в text ТОЛЬКО содержимое записи без служебных префиксов
+    # источник
     if et == "reference":
         ref_text = (text or "").strip()
         if ref_text:
             yield ref_text, {"page": page, "section_path": section_path}, "reference", base_attrs
         return
 
-    # Таблица — корневой чанк + построчно
+    # таблица
     if et == "table":
         cap_tail = base_attrs.get("caption_tail") or base_attrs.get("title")
         header_preview = base_attrs.get("header_preview")
-        # попробуем вытащить хвост из заголовка "Таблица N — Хвост"
         tail_from_title = None
         m = re.search(
             r"(?i)\bтабл(?:ица)?\.?\s*(?:№\s*)?(?:[A-Za-zА-Яа-я]\.?[\s-]*\d+(?:[.,]\d+)*|\d+(?:[.,]\d+)*)\s*[—\-–:\u2013\u2014]\s*(.+)",
@@ -179,17 +305,18 @@ def _yield_chunks_for_section(
         root_text = cap_tail or header_preview or tail_from_title or "(таблица)"
         yield root_text, {"page": page, "section_path": section_path}, "table", base_attrs
 
-        # Построчные чанки: с учётом лимитов из конфигурации
         lines = [ln.strip() for ln in (text or "").splitlines() if ln and ln.strip()]
         if not lines:
-            # Таблица без текста (только мета/attrs) — всё равно OCR-чанки добавим, если есть
+            # даже если нет текстовых строк — попробуем OCR по картинкам в attrs.images
             yield from _yield_ocr_chunks_if_any(section, base_attrs)
+            # и текст из диаграммы внутри таблицы (если парсер положил chart_data)
+            yield from _yield_chart_chunks_if_any(section, base_attrs)
             return
 
         n_max_rows = Cfg.FULL_TABLE_MAX_ROWS if max_table_rows is None else max_table_rows
         n_max_cols = Cfg.FULL_TABLE_MAX_COLS if max_table_cols is None else max_table_cols
 
-        for i, row in enumerate(lines[: max(1, n_max_rows) ], 1):
+        for i, row in enumerate(lines[: max(1, n_max_rows)], 1):
             trimmed = _limit_table_row_columns(row, max(0, n_max_cols or 0))
             attrs = dict(base_attrs)
             attrs["row_index"] = i
@@ -197,12 +324,12 @@ def _yield_chunks_for_section(
             attrs = _attach_anchors(attrs, section_path=row_section_path, page=page, title=title)
             yield trimmed, {"page": page, "section_path": row_section_path}, "table_row", attrs
 
-        # OCR по табличным картинкам (если есть)
+        # OCR и диаграмма-текст
         yield from _yield_ocr_chunks_if_any(section, base_attrs)
+        yield from _yield_chart_chunks_if_any(section, base_attrs)
         return
 
-    # Фигуры / страницы / обычные абзацы — делим на чанки, добавляем префикс как контекст
-    # Для figure при пустом текстe синтезируем строку из подписи (важно для поиска «Рисунок N …»).
+    # фигуры / страницы / обычные параграфы
     base = text if isinstance(text, str) else str(text)
     if et == "figure" and not base.strip():
         cap_num = base_attrs.get("caption_num") or base_attrs.get("label")
@@ -223,8 +350,9 @@ def _yield_chunks_for_section(
         out_et = et if et in {"page", "figure", "paragraph"} else ("paragraph" if et == "" else et)
         yield f"{prefix}\n{ch}", {"page": page, "section_path": section_path}, out_et, base_attrs
 
-    # Добавим OCR-чанки (если есть ocr_text)
+    # добавим OCR-чанки и данные диаграмм
     yield from _yield_ocr_chunks_if_any(section, base_attrs)
+    yield from _yield_chart_chunks_if_any(section, base_attrs)
 
 
 # ---------- API ----------
@@ -238,13 +366,13 @@ def index_document(
 ) -> None:
     """
     Индексирует документ:
-    - Источники: element_type='reference', text = чистый текст записи, attrs.ref_index сохраняется как есть.
-    - Таблицы: корневой чанк с описанием (element_type='table') + построчно (element_type='table_row', attrs.row_index),
-      при этом строки/колонки ограничиваются по Cfg.FULL_TABLE_MAX_ROWS / FULL_TABLE_MAX_COLS.
-    - Заголовки: короткие чанки (element_type='heading').
-    - Фигуры: текст подписи и (если есть) OCR — отдельными чанками (subtype="ocr" в attrs).
-    - Остальное: обычные текстовые чанки с префиксом в начале, чтобы улучшить поиск.
-    - Эмбеддинги считаются пакетами (batch_size) и пишутся в таблицу chunks.
+    - Источники -> element_type='reference' (только текст записи).
+    - Таблицы -> корневой чанк + построчно с ограничениями Cfg.FULL_TABLE_MAX_ROWS/COLS.
+    - Заголовки -> отдельные короткие чанки.
+    - Фигуры/страницы/текст -> обычные чанки с контекстным префиксом.
+    - **НОВОЕ**: OCR картинок (attrs.images) прямо здесь (subtype="ocr"), если нет attrs.ocr_text.
+    - **НОВОЕ**: Текст из диаграмм (attrs.chart_data) превращается в чанки (subtype="chart").
+    - Эмбеддинги считаются батчами.
     """
     rows_text: List[str] = []
     rows_meta: List[Dict[str, Any]] = []
@@ -271,10 +399,9 @@ def index_document(
     cur = con.cursor()
     has_extended_cols = _chunks_table_has(con, ["element_type", "attrs"])
 
-    # Считаем эмбеддинги батчами
     idx = 0
     for batch in _batched(rows_text, batch_size):
-        vecs = embeddings(batch)  # list[list[float]] или np.ndarray
+        vecs = embeddings(batch)
         if not vecs or len(vecs) != len(batch):
             raise RuntimeError("embeddings() вернул неожиданный размер результата.")
         for j, vec in enumerate(vecs):

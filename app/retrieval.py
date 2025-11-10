@@ -478,6 +478,50 @@ _FIG_TITLE_RE = re.compile(
     r"(?i)\b(?:рис(?:\.|унок)?|fig(?:\.|ure)?)\s*([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*\.?)\s*(?:[—\-–:\u2013\u2014]\s*(.+))?"
 )
 
+# --- NEW: chart_data → rows/values_str (для диаграмм в DOCX)
+def _chart_rows_from_attrs(attrs_json: str | None) -> list[dict] | None:
+    try:
+        a = json.loads(attrs_json or "{}")
+    except Exception:
+        return None
+
+    raw = (
+        a.get("chart_data")
+        or (a.get("chart") or {}).get("data")
+        or a.get("data")
+        or a.get("series")
+    )
+
+    # уже нормализованный список [{label,value,unit?}]
+    if isinstance(raw, list) and raw:
+        return raw
+
+    # частый вариант: {"categories":[...], "series":[{"values":[...], "unit":"%"}]}
+    if isinstance(raw, dict) and raw.get("categories") and raw.get("series"):
+        cats = list(raw.get("categories") or [])
+        s0   = (raw.get("series") or [{}])[0] or {}
+        vals = list(s0.get("values") or s0.get("data") or [])
+        unit = s0.get("unit")
+        rows = []
+        for i in range(min(len(cats), len(vals))):
+            rows.append({"label": str(cats[i]), "value": vals[i], "unit": unit})
+        if rows:
+            return rows
+    return None
+
+def _format_chart_values(rows: list[dict]) -> str:
+    lines = []
+    for r in rows or []:
+        lab = (str(r.get("label") or r.get("name") or r.get("category") or "")).strip()
+        val = r.get("value")
+        if val is None:
+            val = r.get("y") or r.get("x") or r.get("v") or r.get("count")
+        unit = r.get("unit")
+        unit_s = f" {unit}" if isinstance(unit, str) and unit.strip() else ""
+        if lab or val is not None:
+            lines.append(f"— {lab}: {val}{unit_s}".strip())
+    return "\n".join(lines)
+
 
 def _shorten(s: str, limit: int = 120) -> str:
     s = (s or "").strip()
@@ -752,7 +796,16 @@ def describe_figures_by_numbers(
             "highlights": highlights[:2],
         }
 
-        # 4) vision-описание (опционально)
+        # 4) NEW: chart_data → values_str (без Vision)
+        if has_ext and "attrs" in found.keys() and found["attrs"]:
+            try:
+                rows = _chart_rows_from_attrs(found["attrs"])
+                if rows:
+                    card["values_str"] = _format_chart_values(rows)
+            except Exception:
+                pass
+
+        # 5) vision-описание (опционально)
         if use_vision and images:
             try:
                 img_for_vision = images[0] if vision_first_image_only else images
@@ -762,6 +815,7 @@ def describe_figures_by_numbers(
                 card["vision"] = {"description": "описание изображения недоступно.", "tags": []}
 
         cards.append(card)
+
 
     con.close()
     return cards

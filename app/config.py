@@ -25,6 +25,12 @@ def _env_int(name: str, default: int) -> int:
     except Exception:
         return default
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(str(os.getenv(name, str(default))).replace(",", ".").strip())
+    except Exception:
+        return default
+
 def _env_str(name: str, default: str) -> str:
     v = os.getenv(name)
     return default if v is None else str(v).strip()
@@ -50,29 +56,133 @@ class Cfg:
         BASE_POLZA = BASE_POLZA + "/v1"
 
     POLZA_KEY: str | None = os.getenv("POLZA_API_KEY")
-    POLZA_CHAT: str = os.getenv("POLZA_CHAT_MODEL", "openai/gpt-4o-mini")
-    POLZA_EMB: str = os.getenv("POLZA_EMB_MODEL", "openai/text-embedding-3-large")
 
-    # --- Парсинг / распознавание ---
-    # Сколько соседних блоков проверять при поиске картинок вокруг подписи (DOCX)
-    FIG_NEIGHBOR_WINDOW: int = _env_int("FIG_NEIGHBOR_WINDOW", 4)
-    # Извлекать ли картинки из PDF (через PyMuPDF), если доступно
-    PDF_EXTRACT_IMAGES: bool = _env_bool("PDF_EXTRACT_IMAGES", True)
+    # Фоллбэки имён переменных окружения для совместимости:
+    #   POLZA_CHAT_MODEL | POLZA_MODEL | MODEL_CHAT
+    _CHAT_CANDIDATES = [
+        os.getenv("POLZA_CHAT_MODEL"),
+        os.getenv("POLZA_MODEL"),
+        os.getenv("MODEL_CHAT"),
+    ]
+    POLZA_CHAT: str = next((c for c in _CHAT_CANDIDATES if c and c.strip()), "openai/gpt-5")
+
+    #   POLZA_VISION_MODEL | MODEL_VISION | <fallback: POLZA_CHAT>
+    _VISION_CANDIDATES = [
+        os.getenv("POLZA_VISION_MODEL"),
+        os.getenv("MODEL_VISION"),
+        POLZA_CHAT,
+    ]
+    POLZA_VISION_MODEL: str = next((c for c in _VISION_CANDIDATES if c and c.strip()), POLZA_CHAT)
+
+    #   POLZA_EMB_MODEL | EMB_MODEL
+    _EMB_CANDIDATES = [
+        os.getenv("POLZA_EMB_MODEL"),
+        os.getenv("EMB_MODEL"),
+    ]
+    POLZA_EMB: str = next((c for c in _EMB_CANDIDATES if c and c.strip()), "openai/text-embedding-3-large")
+
+    # =========================
+    #   VISION / РИСУНКИ
+    # =========================
+    # Включает подачу изображений напрямую в чат-модель (b64/url/file).
+    VISION_ENABLED: bool = _env_bool("VISION_ENABLED", True)
+    VISION_LANG: str = _env_str("VISION_LANG", "ru")  # язык ответов vision-пайплайна
+
+    # Как передавать изображение в модель: "base64" | "url" | "file"
+    VISION_IMAGE_TRANSPORT: str = _env_str("VISION_IMAGE_TRANSPORT", "base64").lower()
+
+    # Ограничения и препроцесс
+    VISION_MAX_IMAGES_PER_REQUEST: int = _env_int("VISION_MAX_IMAGES_PER_REQUEST", 4)
+    VISION_MAX_IMAGE_BYTES: int = _env_int("VISION_MAX_IMAGE_BYTES", 8_000_000)  # 8 MB
+    VISION_MAX_SIDE_PX: int = _env_int("VISION_MAX_SIDE_PX", 2048)              # даунскейл длинной стороны
+    VISION_JPEG_QUALITY: int = _env_int("VISION_JPEG_QUALITY", 88)
+
+    # Директория для кеша ответов vision
+    VISION_CACHE_DIR: str = _env_str("VISION_CACHE_DIR", ".cache/vision")
+    VISION_CACHE_TTL_SEC: int = _env_int("VISION_CACHE_TTL_SEC", 7 * 24 * 60 * 60)  # 7 дней
+
+    # Разрешённые расширения изображений (через запятую)
+    _VISION_ACCEPT_EXT_RAW = _env_str(
+        "VISION_ACCEPT_EXT",
+        "png,jpg,jpeg,gif,webp,bmp,tiff,tif"
+    )
+    VISION_ACCEPT_EXT: set[str] = {e.strip().lower().lstrip(".") for e in _VISION_ACCEPT_EXT_RAW.split(",") if e.strip()}
+
+    # MIME по расширениям — может пригодиться клиенту
+    VISION_MIME_BY_EXT: dict[str, str] = {
+        "png": "image/png",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "webp": "image/webp",
+        "bmp": "image/bmp",
+        "tif": "image/tiff",
+        "tiff": "image/tiff",
+    }
+
+    # Таймаут запросов c изображениями больше, чем у обычного чата
+    VISION_TIMEOUT_SEC: int = _env_int("VISION_TIMEOUT_SEC", 120)
+
+    # Хинты для OCR/языков на картинках (передаются в system/meta при необходимости)
+    VISION_OCR_HINT_LANGS: str = _env_str("VISION_OCR_HINT_LANGS", "rus+eng")
+
+    # Если true — даже при наличии текстового контекста картинки отправляются ВСЕГДА,
+    # когда вопрос касается рисунков/диаграмм/изображений.
+    VISION_ENFORCE_INLINE_IMAGES: bool = _env_bool("VISION_ENFORCE_INLINE_IMAGES", True)
+
+    # ---------- Управление двумя шагами анализа ----------
+    # Шаг 1: осмысленное описание (Describe)
+    VISION_DESCRIBE_ENABLED: bool = _env_bool("VISION_DESCRIBE_ENABLED", True)
+    VISION_DESCRIBE_SENTENCES_MIN: int = _env_int("VISION_DESCRIBE_SENTENCES_MIN", 2)
+    VISION_DESCRIBE_SENTENCES_MAX: int = _env_int("VISION_DESCRIBE_SENTENCES_MAX", 4)
+    VISION_JSON_STRICT: bool = _env_bool("VISION_JSON_STRICT", True)  # требовать от vision JSON без "воды"
+
+    # Шаг 2: извлечение значений (Extract)
+    VISION_EXTRACT_VALUES_ENABLED: bool = _env_bool("VISION_EXTRACT_VALUES_ENABLED", True)
+    VISION_EXTRACT_CONF_MIN: float = _env_float("VISION_EXTRACT_CONF_MIN", 0.70)  # нижний порог уверенности
+    VISION_EXTRACT_MAX_ITEMS: int = _env_int("VISION_EXTRACT_MAX_ITEMS", 30)
+
+    # Пост-валидации и форматирование чисел
+    VISION_PIE_SUM_TARGET: float = _env_float("VISION_PIE_SUM_TARGET", 100.0)
+    VISION_PIE_SUM_TOLERANCE_PP: float = _env_float("VISION_PIE_SUM_TOLERANCE_PP", 5.0)  # допуск в п.п.
+    VISION_PERCENT_DECIMALS: int = _env_int("VISION_PERCENT_DECIMALS", 1)
+    VISION_NUMBER_GROUPING: bool = _env_bool("VISION_NUMBER_GROUPING", True)  # 12 300 вместо 12300
+
+    # Включать ли оговорку о погрешности, если числа с OCR/vision (а не из chart XML)
+    VISION_APPEND_CAVEAT_FOR_OCR: bool = _env_bool("VISION_APPEND_CAVEAT_FOR_OCR", True)
+
+    # --- Параметры модуля рисунков (figures.py) / PDF-растрирование векторов ---
+    FIG_CACHE_DIR: str = _env_str("FIG_CACHE_DIR", ".cache/figures")
+    FIG_MEDIA_LIMIT: int = _env_int("FIG_MEDIA_LIMIT", 12)
+    FIG_VALUES_DEFAULT: bool = _env_bool("FIG_VALUES_DEFAULT", True)
+    FIG_NEIGHBOR_WINDOW: int = _env_int("FIG_NEIGHBOR_WINDOW", 10)
+
+    # Управление извлечением для DOCX/PDF (зеркалим переменные figures.py)
+    FIG_DOCX_EXTRACT_IMAGES: bool = _env_bool("DOCX_EXTRACT_IMAGES", True)
+    FIG_PDF_EXTRACT_IMAGES: bool = _env_bool("PDF_EXTRACT_IMAGES", True)
+    FIG_DOCX_PDF_FALLBACK: bool = _env_bool("DOCX_PDF_FALLBACK", True)
+    FIG_DOCX_PDF_BACKEND: str = _env_str("DOCX_TO_PDF_BACKEND", "auto").lower()  # auto|docx2pdf|libreoffice|off
+    FIG_DOCX_PDF_ALWAYS: bool = _env_bool("DOCX_PDF_ALWAYS", False)
+
+    FIG_PDF_CAPTION_MAX_DISTANCE_PX: int = _env_int("PDF_CAPTION_MAX_DISTANCE_PX", 300)
+    FIG_PDF_MIN_IMAGE_AREA: int = _env_int("PDF_MIN_IMAGE_AREA", 20000)
+
+    # Рендер векторов (PyMuPDF get_drawings → clip → PNG)
+    FIG_PDF_VECTOR_RASTERIZE: bool = _env_bool("PDF_VECTOR_RASTERIZE", True)
+    FIG_PDF_VECTOR_DPI: int = _env_int("PDF_VECTOR_DPI", 360)
+    FIG_PDF_VECTOR_MIN_WIDTH_PX: int = _env_int("PDF_VECTOR_MIN_WIDTH_PX", 1200)
+    FIG_PDF_VECTOR_PAD_PX: int = _env_int("PDF_VECTOR_PAD_PX", 16)
+    FIG_PDF_VECTOR_MAX_DPI: int = _env_int("PDF_VECTOR_MAX_DPI", 600)
+
+    FIG_CLEANUP_ON_NEW_DOC: bool = _env_bool("FIG_CLEANUP_ON_NEW_DOC", True)
 
     # ВКЛЮЧЕНО ДЛЯ ШАГА «Структурированный парсинг + OCR + кеш по хэшу»
-    # Сохранять структурированный индекс секций в БД (таблица document_sections)
     SAVE_STRUCT_INDEX: bool = _env_bool("SAVE_STRUCT_INDEX", True)
-    # OCR для изображений/сканов (используется индексатором, если подключён pytesseract/иное)
     OCR_ENABLED: bool = _env_bool("OCR_ENABLED", True)
     OCR_LANGS: str = _env_str("OCR_LANGS", "rus+eng")
-    # Какой OCR-движок использовать: "tesseract" | "disabled" | др. (на будущее)
     OCR_ENGINE: str = _env_str("OCR_ENGINE", "tesseract")
-    # Необязательный путь к бинарю tesseract (если не в PATH)
     OCR_TESSERACT_CMD: str = _env_str("OCR_TESSERACT_CMD", "")
 
     # --- FULLREAD режим ---
-    # По умолчанию "auto": если документ влазит — даём модели целиком,
-    # иначе читаем итеративно (map → reduce).
     _FULLREAD_MODE_RAW: str = _env_str("FULLREAD_MODE", "auto").lower()
     _FULLREAD_ALIASES = {
         "iter": "iterative",
@@ -90,10 +200,8 @@ class Cfg:
     FULLREAD_CHUNK_CHARS: int = _env_int("FULLREAD_CHUNK_CHARS", FULLREAD_STEP_CHARS)
     FULLREAD_MAX_SECTIONS: int = _env_int("FULLREAD_MAX_SECTIONS", 120)
     FULLREAD_CONTEXT_CHARS: int = _env_int("FULLREAD_CONTEXT_CHARS", 30_000)
-    # Сколько символов позволяем "скормить" напрямую (если влезает):
     DIRECT_MAX_CHARS: int = _env_int("DIRECT_MAX_CHARS", 300_000)
 
-    # Токен-бюджеты для map/reduce
     FULLREAD_MAP_TOKENS: int = _env_int("FULLREAD_MAP_TOKENS", 600)
     FULLREAD_REDUCE_TOKENS: int = _env_int("FULLREAD_REDUCE_TOKENS", 2_400)
     DIGEST_TOKENS_PER_SECTION: int = _env_int("DIGEST_TOKENS_PER_SECTION", 900)
@@ -109,7 +217,6 @@ class Cfg:
     PLANNER_MAX_TOKENS: int = _env_int("PLANNER_MAX_TOKENS", 500)
     PART_MAX_TOKENS: int = _env_int("PART_MAX_TOKENS", 900)
     MERGE_MAX_TOKENS: int = _env_int("MERGE_MAX_TOKENS", 2_400)
-    # Используется в нескольких местах (stream/non-stream)
     FINAL_MAX_TOKENS: int = _env_int("FINAL_MAX_TOKENS", 2_400)
 
     # --- Полные выгрузки таблиц (TablesRaw) ---
@@ -150,7 +257,6 @@ class Cfg:
     # --- Пути / файловая система ---
     SQLITE_PATH: str = os.getenv("SQLITE_PATH", "./vkr.sqlite")
     UPLOAD_DIR: str = os.getenv("UPLOAD_DIR", "./uploads")
-    # Опциональный кэш (например, для временных OCR-результатов/картинок)
     CACHE_DIR: str = os.getenv("CACHE_DIR", "./.cache")
 
     # Гарантируем наличие директорий
@@ -163,38 +269,34 @@ class Cfg:
     _cache_dir = Path(CACHE_DIR)
     _cache_dir.mkdir(parents=True, exist_ok=True)
 
+    # Кеш для vision (по умолчанию ./.cache/vision)
+    _vision_cache_dir = Path(VISION_CACHE_DIR)
+    _vision_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # Кеш для figures (изображения + figures_index.json)
+    _fig_cache_dir = Path(FIG_CACHE_DIR)
+    _fig_cache_dir.mkdir(parents=True, exist_ok=True)
+
     # =========================
     #   FSM / READY-БАРЬЕР
     # =========================
     FSM_ENABLED: bool = _env_bool("FSM_ENABLED", True)
-
-    # Жёсткий контроль на пользователя: запрещает параллельные пайплайны для одного user_id.
     PER_USER_MAX_CONCURRENCY: int = _env_int("PER_USER_MAX_CONCURRENCY", 1)
-
-    # Очередь запросов, пришедших до READY
     PENDING_QUEUE_MAX: int = _env_int("PENDING_QUEUE_MAX", 50)
-    PENDING_QUEUE_TTL_SEC: int = _env_int("PENDING_QUEUE_TTL_SEC", 60 * 60 * 12)  # 12 часов
+    PENDING_QUEUE_TTL_SEC: int = _env_int("PENDING_QUEUE_TTL_SEC", 60 * 60 * 12)
 
-    # Таймауты стадий
     DOWNLOAD_TIMEOUT_SEC: int = _env_int("DOWNLOAD_TIMEOUT_SEC", 120)
-    INDEX_TIMEOUT_SEC: int = _env_int("INDEX_TIMEOUT_SEC", 15 * 60)  # 15 минут
+    INDEX_TIMEOUT_SEC: int = _env_int("INDEX_TIMEOUT_SEC", 15 * 60)
 
-    # Барьер: ждать READY при обработке текстовых сообщений, если есть активный ingest
     WAIT_READY_ON_QUERY: bool = _env_bool("WAIT_READY_ON_QUERY", True)
-    WAIT_READY_TIMEOUT_SEC: int = _env_int("WAIT_READY_TIMEOUT_SEC", 15 * 60)  # 15 минут
-    READY_GRACE_SEC: int = _env_int("READY_GRACE_SEC", 2)  # пауза после READY перед ANSWERING
+    WAIT_READY_TIMEOUT_SEC: int = _env_int("WAIT_READY_TIMEOUT_SEC", 15 * 60)
+    READY_GRACE_SEC: int = _env_int("READY_GRACE_SEC", 2)
 
-    # Идемпотентность индексации — по хэшу файла (не запускать повторно)
     INGEST_IDEMPOTENCY_BY_HASH: bool = _env_bool("INGEST_IDEMPOTENCY_BY_HASH", True)
-
-    # Ретраи оркестрации индексации/загрузки
     RETRY_MAX_ATTEMPTS: int = _env_int("FSM_RETRY_MAX_ATTEMPTS", 3)
     RETRY_BASE_DELAY_MS: int = _env_int("FSM_RETRY_BASE_DELAY_MS", 500)
-
-    # Диагностика и логирование событий FSM
     FSM_AUDIT_LOG_ENABLED: bool = _env_bool("FSM_AUDIT_LOG_ENABLED", True)
 
-    # Текстовые шаблоны статусов (переопределяемые через .env)
     MSG_ACK_DOWNLOADING: str = _env_str(
         "MSG_ACK_DOWNLOADING",
         "Файл получен, начинаю загрузку…"
@@ -204,14 +306,14 @@ class Cfg:
         "Индексирую документ, это может занять немного времени…"
     )
     MSG_GREET: str = _env_str(
-    "MSG_GREET",
-    "Привет! Я репетитор по твоей ВКР. Пришлите файл ВКР  — и я помогу по содержанию."
+        "MSG_GREET",
+        "Привет! Я репетитор по твоей ВКР. Пришлите файл ВКР — и я помогу по содержанию."
     )
-    # Новое: сообщение, когда ещё нет активного документа — вопрос кладём в очередь
     MSG_NEED_FILE_QUEUED: str = _env_str(
         "MSG_NEED_FILE_QUEUED",
         "Сначала пришлите файл ВКР. Я поставил ваш вопрос в очередь."
     )
+    # Исправлено имя поля (была ошибка в букве), оставим обратную совместимость ниже.
     MSG_NOT_READY_QUEUED: str = _env_str(
         "MSG_NOT_READY_QUEUED",
         "Документ ещё готовится. Ваш запрос поставлен в очередь и будет выполнен сразу после индексации."
@@ -224,6 +326,18 @@ class Cfg:
         "MSG_INDEX_FAILED",
         "Не удалось проиндексировать документ. Попробуйте ещё раз или загрузите другой файл."
     )
+
+    # ----- Аналитический слой (vision_analyzer) -----
+    ANALYZE_WITH_NUMBERS: bool = _env_bool("ANALYZE_WITH_NUMBERS", True)  # включать числа в связный ответ
+    ANALYZER_ENABLE_CACHE: bool = _env_bool("ANALYZER_ENABLE_CACHE", True)
+    ANALYZER_CACHE_TTL_SEC: int = _env_int("ANALYZER_CACHE_TTL_SEC", 7 * 24 * 60 * 60)
+
+    # ----------------------------- Helpers -----------------------------
+
+    @classmethod
+    def vision_transport(cls) -> str:
+        """Нормализованный способ доставки изображений в модель: 'base64' | 'url' | 'file'."""
+        return (cls.VISION_IMAGE_TRANSPORT or "base64").strip().lower()
 
     @classmethod
     def validate(cls) -> None:
@@ -261,6 +375,33 @@ class Cfg:
         if cls.WAIT_READY_ON_QUERY and cls.WAIT_READY_TIMEOUT_SEC <= 0:
             raise RuntimeError("WAIT_READY_TIMEOUT_SEC должен быть > 0, если WAIT_READY_ON_QUERY включён.")
 
+        # Vision sanity checks (не фейлим, если выключено)
+        if cls.VISION_ENABLED:
+            if cls.VISION_IMAGE_TRANSPORT not in {"base64", "url", "file"}:
+                raise RuntimeError("VISION_IMAGE_TRANSPORT должен быть 'base64', 'url' или 'file'.")
+            if cls.VISION_MAX_IMAGES_PER_REQUEST < 1:
+                raise RuntimeError("VISION_MAX_IMAGES_PER_REQUEST должен быть >= 1.")
+            if cls.VISION_MAX_IMAGE_BYTES <= 0:
+                raise RuntimeError("VISION_MAX_IMAGE_BYTES должен быть > 0.")
+            if cls.VISION_MAX_SIDE_PX <= 0:
+                raise RuntimeError("VISION_MAX_SIDE_PX должен быть > 0.")
+            if not cls.VISION_ACCEPT_EXT:
+                raise RuntimeError("VISION_ACCEPT_EXT не должен быть пустым.")
+            if not (0.0 <= cls.VISION_EXTRACT_CONF_MIN <= 1.0):
+                raise RuntimeError("VISION_EXTRACT_CONF_MIN должен быть в диапазоне [0.0, 1.0].")
+
+        # Figures sanity
+        if cls.FIG_MEDIA_LIMIT < 1:
+            raise RuntimeError("FIG_MEDIA_LIMIT должен быть >= 1.")
+        if not cls.FIG_CACHE_DIR:
+            raise RuntimeError("FIG_CACHE_DIR не должен быть пустым.")
+        if not Path(cls.FIG_CACHE_DIR).exists():
+            raise RuntimeError(f"Директория FIG_CACHE_DIR='{cls.FIG_CACHE_DIR}' не существует (должна была создаться).")
+
+        # Backward-compat alias (если где-то обращались к старому опечатанному имени)
+        # MSG_NOT_READY_QUEУED — с русской буквой 'У'
+        setattr(cls, "MSG_NOT_READY_QUEУED", cls.MSG_NOT_READY_QUEUED)
+
     @classmethod
     def fullread_enabled(cls) -> bool:
         return (cls.FULLREAD_MODE or "off") != "off"
@@ -268,3 +409,20 @@ class Cfg:
     @classmethod
     def fullread_mode(cls) -> str:
         return cls.FULLREAD_MODE
+
+    @classmethod
+    def vision_active(cls) -> bool:
+        """Глобальный флаг готовности подачи изображений в модель."""
+        return bool(cls.VISION_ENABLED and cls.POLZA_VISION_MODEL)
+
+    @classmethod
+    def vision_model(cls) -> str:
+        """Выбор модели для мультимодального чата (с запасным вариантом)."""
+        return cls.POLZA_VISION_MODEL or cls.POLZA_CHAT
+
+    @classmethod
+    def is_image_ext_allowed(cls, ext: str | None) -> bool:
+        """Проверка расширения файла изображения (без точки)."""
+        if not ext:
+            return False
+        return ext.lower().lstrip(".") in cls.VISION_ACCEPT_EXT

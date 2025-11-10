@@ -5,6 +5,10 @@ from docx.text.paragraph import Paragraph
 from docx.text.run import Run
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
+try:
+    from lxml import etree as ET
+except Exception:
+    import xml.etree.ElementTree as ET
 import pdfplumber
 from pathlib import Path
 import subprocess
@@ -15,22 +19,37 @@ import os
 import re
 from typing import List, Dict, Any, Optional, Tuple
 
+_IMG_CACHE: Dict[str, str] = {}
+
 # мягкая зависимость для извлечения изображений из PDF
 try:
     import fitz  # PyMuPDF
 except Exception:
     fitz = None  # без него делаем только текстовые подписи
 
-# локальные утилиты/конфиг
+# ----------------------------- config -----------------------------
 try:
     from .config import Cfg
     DEFAULT_UPLOAD_DIR = Cfg.UPLOAD_DIR
-    CFG_FIG_WINDOW = int(getattr(Cfg, "FIG_NEIGHBOR_WINDOW", 4))
+    # большее окно поиска соседних блоков
+    CFG_FIG_WINDOW = int(getattr(Cfg, "FIG_NEIGHBOR_WINDOW", 24))
+    # явный look-ahead вперёд от подписи
+    CFG_FIG_LOOKAHEAD = int(getattr(Cfg, "FIG_LOOKAHEAD", 60))
     CFG_PDF_EXTRACT = bool(getattr(Cfg, "PDF_EXTRACT_IMAGES", True))
+    CFG_MIN_IMAGE_EMU = int(getattr(Cfg, "MIN_IMAGE_EMU", 600_000))
+    # NEW: управление векторным рендером возле подписи
+    CFG_PDF_VECTOR_RASTERIZE = bool(getattr(Cfg, "PDF_VECTOR_RASTERIZE", True))
+    CFG_PDF_VECTOR_DPI = int(getattr(Cfg, "PDF_VECTOR_DPI", 360))
+    CFG_PDF_VECTOR_MIN_WIDTH_PX = int(getattr(Cfg, "PDF_VECTOR_MIN_WIDTH_PX", 1200))
+    CFG_PDF_VECTOR_PAD_PX = int(getattr(Cfg, "PDF_VECTOR_PAD_PX", 16))
+    CFG_PDF_VECTOR_MAX_DPI = int(getattr(Cfg, "PDF_VECTOR_MAX_DPI", 600))
+    CFG_PDF_CAPTION_DY = int(getattr(Cfg, "PDF_CAPTION_MAX_DISTANCE_PX", 300))
 except Exception:
     DEFAULT_UPLOAD_DIR = "./uploads"
-    CFG_FIG_WINDOW = 4
+    CFG_FIG_WINDOW = 24
+    CFG_FIG_LOOKAHEAD = 60
     CFG_PDF_EXTRACT = True
+    CFG_MIN_IMAGE_EMU = 600_000  # ~1.5 см
 
 try:
     from .utils import save_bytes, safe_filename, sha256_bytes
@@ -108,86 +127,138 @@ def _paragraph_list_info(p: Paragraph) -> dict:
         pass
     return info
 
-# ----------------------------- inline images flag -----------------------------
+# ----------------------------- inline images & units -----------------------------
 
 NS = {
     "a":   "http://schemas.openxmlformats.org/drawingml/2006/main",
     "r":   "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
     "pic": "http://schemas.openxmlformats.org/drawingml/2006/picture",
     "wp":  "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
+    "c":   "http://schemas.openxmlformats.org/drawingml/2006/chart",
+    "v":   "urn:schemas-microsoft-com:vml",
+    "w":   "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
 }
 
 def _paragraph_has_image(p: Paragraph) -> bool:
-    """Грубая эвристика: есть ли в абзаце встроенная картинка."""
     try:
-        pics = p._p.xpath(".//pic:pic", namespaces=NS)
-        return bool(pics)
+        return bool(p._p.xpath(".//pic:pic | .//w:pict//v:imagedata", namespaces=NS))
     except Exception:
         return False
 
-def _extract_paragraph_images(doc: Docx, p: Paragraph, uploads_dir: str = DEFAULT_UPLOAD_DIR) -> List[str]:
-    """
-    Возвращает список абсолютных путей к сохранённым картинкам, найденным в абзаце p (inline/anchored).
-    """
-    paths: List[str] = []
+# EMU converters
+EMU_PER_INCH, EMU_PER_CM, EMU_PER_PT, EMU_PER_PX = 914400, 360000, 12700, 9525
+
+def _to_emu(val: str) -> Optional[int]:
     try:
-        blips = p._p.xpath(".//a:blip", namespaces=NS)
-        for b in blips:
-            rid = b.get(qn("r:embed"))
+        s = val.strip().lower().replace(",", ".")
+        if s.endswith("cm"): return int(float(s[:-2]) * EMU_PER_CM)
+        if s.endswith("in"): return int(float(s[:-2]) * EMU_PER_INCH)
+        if s.endswith("pt"): return int(float(s[:-2]) * EMU_PER_PT)
+        if s.endswith("px"): return int(float(s[:-2]) * EMU_PER_PX)
+        return int(float(s) * EMU_PER_PT)
+    except Exception:
+        return None
+
+def _emu_from_vml_style(style: Optional[str]) -> Tuple[Optional[int], Optional[int]]:
+    if not style:
+        return None, None
+    w = _to_emu(re.search(r"width\s*:\s*([^;]+)", style, re.I).group(1)) if re.search(r"width\s*:\s*([^;]+)", style, re.I) else None
+    h = _to_emu(re.search(r"height\s*:\s*([^;]+)", style, re.I).group(1)) if re.search(r"height\s*:\s*([^;]+)", style, re.I) else None
+    return w, h
+
+# ----------------------------- image extraction -----------------------------
+
+def _extract_images_from_container(doc: Docx, container, uploads_dir: str) -> List[str]:
+    out: List[str] = []
+    try:
+        items: List[Tuple[str, str, Optional[int], Optional[int]]] = []  # (kind, rid, cx, cy)
+
+        # DrawingML (r:embed + ближайший wp:extent)
+        for blip in container.xpath(".//a:blip", namespaces=NS):
+            rid = blip.get(qn("r:embed"))
             if not rid:
                 continue
+            ext = blip.xpath("./ancestor::wp:inline[1]/wp:extent | ./ancestor::wp:anchor[1]/wp:extent", namespaces=NS)
+            cx = cy = None
+            if ext:
+                try:
+                    cx = int(ext[0].get("cx") or 0)
+                    cy = int(ext[0].get("cy") or 0)
+                except Exception:
+                    cx = cy = None
+            items.append(("dml", rid, cx, cy))
+
+        # VML (<w:pict><v:imagedata r:id="…">)
+        for node in container.xpath(".//w:pict//v:imagedata | .//v:shape//v:imagedata", namespaces=NS):
+            rid = node.get(qn("r:id"))
+            if not rid:
+                continue
+            shape = node.getparent()
+            while shape is not None and shape.tag.split('}')[-1].lower() not in ("shape", "pict"):
+                shape = shape.getparent()
+            style = shape.get("style") if shape is not None else None
+            cx, cy = _emu_from_vml_style(style)
+            items.append(("vml", rid, cx, cy))
+
+        for _, rid, cx, cy in items:
+            # фильтруем «мелочь», если известен размер
+            if cx is not None and cy is not None and min(cx, cy) < CFG_MIN_IMAGE_EMU:
+                continue
+
             part = doc.part.related_parts.get(rid)
             if not part:
                 continue
             data = getattr(part, "blob", None)
             if not data:
                 continue
+
             h = sha256_bytes(data)
-            # расширение из content_type
-            ext = ".png"
+            if h in _IMG_CACHE:
+                path = _IMG_CACHE[h]
+                if path not in out:
+                    out.append(path)
+                continue
+
             ct = (getattr(part, "content_type", "") or "").lower()
-            if "jpeg" in ct or "jpg" in ct:
-                ext = ".jpg"
-            elif "png" in ct:
-                ext = ".png"
-            elif "gif" in ct:
-                ext = ".gif"
-            elif "bmp" in ct:
-                ext = ".bmp"
-            elif "tiff" in ct or "tif" in ct:
-                ext = ".tiff"
-            name = safe_filename(f"docx_fig_{h[:12]}{ext}")
-            fp = save_bytes(data, name, uploads_dir)
-            if fp not in paths:
-                paths.append(fp)
+            ext = ".png"
+            if "jpeg" in ct or "jpg" in ct: ext = ".jpg"
+            elif "png" in ct: ext = ".png"
+            elif "gif" in ct: ext = ".gif"
+            elif "bmp" in ct: ext = ".bmp"
+            elif "tiff" in ct or "tif" in ct: ext = ".tiff"
+            elif "svg"  in ct: ext = ".svg"
+            elif "emf"  in ct: ext = ".emf"
+            elif "wmf"  in ct: ext = ".wmf"
+
+            fp = str(Path(save_bytes(data, safe_filename(f"docx_fig_{h[:12]}{ext}"), uploads_dir)).resolve())
+            _IMG_CACHE[h] = fp
+            out.append(fp)
     except Exception:
         pass
-    return paths
+    return out
 
-def _collect_neighbor_images(doc: Docx, block: Paragraph, window: int = CFG_FIG_WINDOW, uploads_dir: str = DEFAULT_UPLOAD_DIR) -> List[str]:
-    """
-    Смотрим соседние блоки (±window) и собираем картинки.
-    Это покрывает случаи: картинка сверху, подпись отдельно; или наоборот.
-    """
+def _extract_paragraph_images(doc: Docx, p: Paragraph, uploads_dir: str = DEFAULT_UPLOAD_DIR) -> List[str]:
+    return _extract_images_from_container(doc, p._p, uploads_dir)
+
+def _extract_table_images(doc: Docx, tbl: Table, uploads_dir: str = DEFAULT_UPLOAD_DIR) -> List[str]:
+    return _extract_images_from_container(doc, tbl._tbl, uploads_dir)
+
+def _collect_neighbor_images(doc: Docx, block: Paragraph, window: int = CFG_FIG_WINDOW,
+                             uploads_dir: str = DEFAULT_UPLOAD_DIR) -> List[str]:
+    """Собираем картинки из блоков в диапазоне [idx-window, idx+window]."""
     try:
         body = doc._element.body
         children = list(body.iterchildren())
-        # находим индекс текущего абзаца
-        idx = None
-        for i, el in enumerate(children):
-            if getattr(block, "_p", None) is el:
-                idx = i
-                break
+        idx = next((i for i, el in enumerate(children) if getattr(block, "_p", None) is el), None)
         if idx is None:
             return []
         out: List[str] = []
-        lo = max(0, idx - window)
-        hi = min(len(children) - 1, idx + window)
-        for j in range(lo, hi + 1):
+        for j in range(max(0, idx - window), min(len(children) - 1, idx + window) + 1):
             el = children[j]
             if el.tag.endswith("p"):
-                p2 = Paragraph(el, doc)
-                out += _extract_paragraph_images(doc, p2, uploads_dir)
+                out += _extract_paragraph_images(doc, Paragraph(el, doc), uploads_dir)
+            elif el.tag.endswith("tbl"):
+                out += _extract_table_images(doc, Table(el, doc), uploads_dir)
         # дедуп
         uniq: List[str] = []
         for pth in out:
@@ -196,6 +267,88 @@ def _collect_neighbor_images(doc: Docx, block: Paragraph, window: int = CFG_FIG_
         return uniq
     except Exception:
         return []
+
+def _first_images_after(doc: Docx, block: Paragraph, steps: int = CFG_FIG_LOOKAHEAD,
+                        uploads_dir: str = DEFAULT_UPLOAD_DIR) -> List[str]:
+    """Жёсткий look-ahead: найдём первую(ые) картинки после подписи в пределах steps."""
+    try:
+        body = doc._element.body
+        children = list(body.iterchildren())
+        idx = next((i for i, el in enumerate(children) if getattr(block, "_p", None) is el), None)
+        if idx is None:
+            return []
+        out: List[str] = []
+        hi = min(len(children) - 1, idx + steps)
+        for j in range(idx + 1, hi + 1):
+            el = children[j]
+            if el.tag.endswith("p"):
+                out += _extract_paragraph_images(doc, Paragraph(el, doc), uploads_dir)
+            elif el.tag.endswith("tbl"):
+                out += _extract_table_images(doc, Table(el, doc), uploads_dir)
+            if out:
+                # как только нашли — завершаем и дедупим
+                uniq: List[str] = []
+                for pth in out:
+                    if pth not in uniq:
+                        uniq.append(pth)
+                return uniq
+        return []
+    except Exception:
+        return []
+
+
+# --- bbox / vector helpers (NEW) ---
+def _rect_union(rects: List[Tuple[float, float, float, float]]) -> Optional[Tuple[float, float, float, float]]:
+    if not rects:
+        return None
+    x0 = min(r[0] for r in rects); y0 = min(r[1] for r in rects)
+    x1 = max(r[2] for r in rects); y1 = max(r[3] for r in rects)
+    return (x0, y0, x1, y1)
+
+def _bbox_vdist_generic(a, b) -> float:
+    ax0, ay0, ax1, ay1 = a; bx0, by0, bx1, by1 = b
+    if by0 >= ay1: return abs(by0 - ay1)
+    if by1 <= ay0: return abs(ay0 - by1)
+    return 0.0
+
+def _fitz_vector_rects(pg) -> List[Tuple[float, float, float, float]]:
+    """bbox'ы векторных примитивов (lines/paths/rects) на странице."""
+    try:
+        drawings = pg.get_drawings() or []
+    except Exception:
+        return []
+    rects = []
+    for d in drawings:
+        r = d.get("rect")
+        if r:
+            rects.append((float(r.x0), float(r.y0), float(r.x1), float(r.y1)))
+    return rects
+
+def _render_clip_png(pg, clip_rect: Tuple[float, float, float, float],
+                     dpi_base: int, min_w_px: int, max_dpi: int, pad_px: int) -> Optional[bytes]:
+    try:
+        import fitz
+    except Exception:
+        return None
+    # расчёт zoom: базовый DPI + гарантия минимальной ширины
+    zoom = max(1.0, float(dpi_base) / 72.0)
+    width_pt = max(1.0, clip_rect[2] - clip_rect[0])
+    need_zoom = float(min_w_px) / width_pt
+    zoom = min(max(zoom, need_zoom), float(max_dpi) / 72.0)
+    # паддинг в поинтах
+    pad_pt = pad_px / zoom
+    page_rect = pg.rect
+    clip = fitz.Rect(
+        max(page_rect.x0, clip_rect[0] - pad_pt),
+        max(page_rect.y0, clip_rect[1] - pad_pt),
+        min(page_rect.x1, clip_rect[2] + pad_pt),
+        min(page_rect.y1, clip_rect[3] + pad_pt),
+    )
+    try:
+        pix = pg.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip, alpha=True)
+        return pix.tobytes("png")
+    except Exception:
+        return None
 
 # ----------------------------- runs formatting -----------------------------
 
@@ -238,7 +391,7 @@ def _paragraph_attrs(p: Paragraph) -> dict:
     attrs.update(_runs_style_summary(p.runs))
     return attrs
 
-# ----------------------------- tables -----------------------------
+# ----------------------------- tables helpers -----------------------------
 
 def _table_row_strings(tbl: Table) -> List[str]:
     """Возвращает строки таблицы: одна строка = ряд, ячейки через ' | ' (с учётом merged)."""
@@ -299,7 +452,7 @@ CAPTION_RE_TABLE = re.compile(
           |
           (?:\d+(?:[.,]\d+)*)                          # 2.1 / 3
         )
-        (?:\s*(?:[.\-—:\u2013\u2014])\s*(.*))?         # ← допускаем точку-тире-двоеточие
+        (?:\s*(?:[.\-—:\u2013\u2014])\s*(.*))?         # точка/двоеточие/тире + подпись
         \s*$""",
     re.IGNORECASE | re.VERBOSE
 )
@@ -308,27 +461,24 @@ CAPTION_RE_TABLE = re.compile(
 CAPTION_RE_FIG = re.compile(
     r"""^\s*
         (?:
-            рис(?:\.|унок)?      # 'Рис.' или 'Рисунок'
-            | figure             # 'Figure'
-            | fig\.?             # 'Fig.' или 'Fig'
+            рис(?:\.|унок)?
+            | figure
+            | fig\.?
         )
         \s*
-        (?:№\s*)?                # опциональное '№'
+        (?:№\s*)?
         (
           (?:[A-Za-zА-Яа-я]\.?[\s-]*\d+(?:[.,]\d+)*)   # А.1 / П1.2
           |
           (?:\d+(?:[.,]\d+)*)                          # 1 / 2.1 / 3,2 / 2.1.3
         )
-        (?:\s*(?:[.\-—:\u2013\u2014])\s*(.*))?         # ← разрешаем и точку/двоеточие/тире
+        (?:\s*(?:[.\-—:\u2013\u2014])\s*(.*))?
         \s*$""",
     re.IGNORECASE | re.VERBOSE
 )
 
 def _classify_caption(text: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """
-    Возвращает (kind, number_label, tail) или (None, None, None).
-    number_label в формате '2.1' / 'А.1' / 'П1.2', tail — подпись (может быть пустой).
-    """
+    """Возвращает (kind, number_label, tail) или (None, None, None)."""
     t = (text or "").strip()
     m = CAPTION_RE_TABLE.match(t)
     if m:
@@ -348,7 +498,7 @@ def _compose_table_title(num: Optional[str], tail: Optional[str]) -> str:
     if num:
         return f"Таблица {num}"
     if tail:
-        return tail  # без слова «Таблица», если номера нет
+        return tail
     return "Таблица"
 
 def _compose_figure_title(num: Optional[str], tail: Optional[str]) -> str:
@@ -357,25 +507,23 @@ def _compose_figure_title(num: Optional[str], tail: Optional[str]) -> str:
     if num:
         return f"Рисунок {num}"
     if tail:
-        return tail  # без слова «Рисунок», если номера нет
+        return tail
     return "Рисунок"
 
 def _is_title_candidate(text: str, attrs: dict) -> bool:
-    """Эвристика: короткий центрированный абзац — кандидат в название таблицы/рисунка."""
+    """Эвристика: короткий (до 200) центрированный/не списочный — кандидат в подпись."""
     t = (text or "").strip()
     if not t:
         return False
     if CAPTION_RE_TABLE.match(t) or CAPTION_RE_FIG.match(t):
-        return False  # это не «название», это сам номер
+        return False
     if len(t) < 3 or len(t) > 200:
         return False
     al = (attrs or {}).get("alignment")
     if al not in {"center", "right", "left"}:
         return False
-    # не списочный элемент
     if (attrs or {}).get("is_list"):
         return False
-    # слишком «цифровая» строка — не подпись
     digits = len(re.findall(r"\d", t))
     if digits > max(8, len(t) // 3):
         return False
@@ -401,11 +549,9 @@ SOURCES_TITLE_RE = re.compile(
     """
 )
 
-APPENDIX_TITLE_RE = re.compile(
-    r"\b(приложени[ея]|appendix)\b", re.IGNORECASE
-)
+APPENDIX_TITLE_RE = re.compile(r"\b(приложени[ея]|appendix)\b", re.IGNORECASE)
 
-# разрешаем «12. », «12) », «12 - », «12 — », «[12] », И ТЕПЕРЬ ТАКЖЕ «12 <пробел>»
+# разрешаем «12. », «12) », «12 - », «12 — », «[12] », и «12 <пробел>»
 REF_LINE_RE = re.compile(r"^\s*(?:\[(\d+)\]|(\d+)(?:[\.\)\-–—:]\s*|\s+))\s*(.+)$")
 
 def _is_sources_title(s: str) -> bool:
@@ -415,10 +561,7 @@ def _is_appendix_title(s: str) -> bool:
     return bool(APPENDIX_TITLE_RE.search(s or ""))
 
 def _parse_reference_line(s: str) -> Tuple[Optional[int], str]:
-    """
-    Из строки источника выделяет номер (если есть) и «хвост».
-    Поддерживает формы: "[12] …", "12. …", "12) …", "12 — …", "12 …".
-    """
+    """Из строки источника выделяет номер (если есть) и хвост."""
     t = _clean(s)
     m = REF_LINE_RE.match(t)
     if not m:
@@ -430,7 +573,180 @@ def _parse_reference_line(s: str) -> Tuple[Optional[int], str]:
         idx = None
     return idx, (m.group(3) or "").strip()
 
-# ----------------------------- section-path helpers (НОВОЕ: нумерация) -----------------------------
+# ----------------------------- charts (docx) -----------------------------
+
+def _paragraph_chart_rids(p: Paragraph) -> List[str]:
+    """RID'ы на встроенные диаграммы в абзаце (w:drawing/a:graphicData/c:chart)."""
+    try:
+        nodes = p._p.xpath(".//a:graphic//a:graphicData//c:chart", namespaces=NS)
+        rids = []
+        for n in nodes:
+            rid = n.get(qn("r:id")) if hasattr(n, "get") else n.attrib.get("{%s}id" % NS["r"])
+            if rid:
+                rids.append(rid)
+        return rids
+    except Exception:
+        return []
+
+def _table_chart_rids(tbl: Table) -> List[str]:
+    """RID'ы на встроенные диаграммы внутри таблицы (w:tbl)."""
+    try:
+        nodes = tbl._tbl.xpath(".//a:graphic//a:graphicData//c:chart", namespaces=NS)
+        rids: List[str] = []
+        for n in nodes:
+            rid = n.get(qn("r:id")) if hasattr(n, "get") else n.attrib.get("{%s}id" % NS["r"])
+            if rid:
+                rids.append(rid)
+        return rids
+    except Exception:
+        return []
+
+def _series_name(ser) -> Optional[str]:
+    try:
+        v = ser.find(".//c:tx/c:v", NS)
+        if v is not None and (v.text or "").strip():
+            return v.text.strip()
+        v = ser.find(".//c:tx/c:strRef/c:strCache/c:pt/c:v", NS)
+        if v is not None and (v.text or "").strip():
+            return v.text.strip()
+    except Exception:
+        pass
+    return None
+
+def _cache_points(root, path: str) -> List[Tuple[int, str]]:
+    """Возвращает [(idx, value_text)] из numCache/strCache по указанному XPath."""
+    pts: List[Tuple[int, str]] = []
+    for pt in root.findall(path + "/c:pt", NS):
+        try:
+            idx = int(pt.attrib.get("idx", "0"))
+        except Exception:
+            continue
+        val_el = pt.find("c:v", NS)
+        val = (val_el.text if val_el is not None else "") or ""
+        pts.append((idx, val))
+    pts.sort(key=lambda x: x[0])
+    return pts
+
+def _parse_chart_xml(xml_bytes: bytes) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+    """
+    Возвращает (chart_type, rows), где rows — список {label, value}.
+    Поддерживаем Pie/Bar/Column/Line.
+    """
+    try:
+        root = ET.fromstring(xml_bytes)
+    except Exception:
+        return None, []
+
+    def _first(*paths):
+        for p in paths:
+            el = root.find(".//" + p, NS)
+            if el is not None:
+                return el
+        return None
+
+    chart_el = _first("c:pieChart", "c:barChart", "c:bar3DChart", "c:colChart",
+                      "c:col3DChart", "c:lineChart")
+    if chart_el is None:
+        return None, []
+
+    tag = chart_el.tag.split("}")[-1]
+    ctype = {
+        "pieChart": "PieChart",
+        "barChart": "BarChart",
+        "bar3DChart": "BarChart",
+        "colChart": "BarChart",
+        "col3DChart": "BarChart",
+        "lineChart": "LineChart",
+    }.get(tag, tag)
+
+    out: List[Dict[str, Any]] = []
+    series = chart_el.findall("./c:ser", NS) or []
+    multi_series = len(series) > 1
+
+    for ser in series:
+        sname = _series_name(ser)
+        cat_pts = _cache_points(ser, ".//c:cat/c:strRef/c:strCache") or \
+                  _cache_points(ser, ".//c:cat/c:numRef/c:numCache")
+        val_pts = _cache_points(ser, ".//c:val/c:numRef/c:numCache") or \
+                  _cache_points(ser, ".//c:val/c:numCache")
+
+        by_idx = {i: {"label": l, "value": None} for i, l in cat_pts}
+        for i, v in val_pts:
+            try:
+                by_idx.setdefault(i, {})["value"] = float(str(v).replace(",", "."))
+            except Exception:
+                by_idx.setdefault(i, {})["value"] = v
+
+        for i in sorted(by_idx):
+            row = by_idx[i]
+            label = str(row.get("label") or "").strip()
+            value = row.get("value")
+            if multi_series and sname:
+                label = f"{sname}: {label}" if label else sname
+            if label or value is not None:
+                out.append({"label": label, "value": value})
+    return ctype, out
+
+def _chart_data_from_rid(doc: Docx, rid: str) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+    """Достаём chart*.xml по rId и парсим."""
+    try:
+        part = doc.part.related_parts.get(rid)
+        if not part:
+            return None, []
+        xml_bytes = getattr(part, "blob", None)
+        if not xml_bytes:
+            return None, []
+        return _parse_chart_xml(xml_bytes)
+    except Exception:
+        return None, []
+
+def _extract_chart_data_from_paragraph(doc: Docx, p: Paragraph) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+    """Для абзаца возвращает первую найденную (тип, data) диаграмму."""
+    for rid in _paragraph_chart_rids(p):
+        ctype, rows = _chart_data_from_rid(doc, rid)
+        if rows:
+            return ctype, rows
+    return None, []
+
+def _extract_chart_data_from_table(doc: Docx, tbl: Table) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+    """Для таблицы возвращает первую найденную (тип, data) диаграмму."""
+    for rid in _table_chart_rids(tbl):
+        ctype, rows = _chart_data_from_rid(doc, rid)
+        if rows:
+            return ctype, rows
+    return None, []
+
+def _collect_neighbor_chart_data(doc: Docx, block: Paragraph, window: int = CFG_FIG_WINDOW) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+    """Ищем диаграмму в диапазоне блоков вокруг anchor-параграфа."""
+    try:
+        body = doc._element.body
+        children = list(body.iterchildren())
+        idx = None
+        for i, el in enumerate(children):
+            if getattr(block, "_p", None) is el:
+                idx = i
+                break
+        if idx is None:
+            return None, []
+        lo = max(0, idx - window)
+        hi = min(len(children) - 1, idx + window)
+        for j in range(lo, hi + 1):
+            el = children[j]
+            if el.tag.endswith("p"):
+                p2 = Paragraph(el, doc)
+                ctype, rows = _extract_chart_data_from_paragraph(doc, p2)
+                if rows:
+                    return ctype, rows
+            elif el.tag.endswith("tbl"):
+                t2 = Table(el, doc)
+                ctype, rows = _extract_chart_data_from_table(doc, t2)
+                if rows:
+                    return ctype, rows
+        return None, []
+    except Exception:
+        return None, []
+
+# ----------------------------- section-path helpers -----------------------------
 
 def _hpath(ids: List[str], titles: List[str]) -> str:
     parts = []
@@ -461,13 +777,10 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
     buf: List[str] = []
     last_para_attrs: Optional[dict] = None
 
-    # текущий заголовок и стек заголовков
     cur_title, cur_level = "Документ", 0
-
-    # НОВОЕ: счётчики для нумерации и стек для id/заголовков
-    outline_counters: List[int] = []        # [1, 2, ...] по уровням
-    heading_stack_titles: List[str] = []    # названия на уровнях
-    heading_stack_ids: List[str] = []       # текстовые ID на уровнях ("1", "1.2", ...)
+    outline_counters: List[int] = []
+    heading_stack_titles: List[str] = []
+    heading_stack_ids: List[str] = []
 
     def _current_scope_id() -> str:
         return _make_section_id(outline_counters)
@@ -476,18 +789,14 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
         return _hpath(heading_stack_ids, heading_stack_titles)
 
     def _enter_heading(level: int, title: str) -> str:
-        """Обновляет счётчики и стеки под новый заголовок уровня level, возвращает section_id."""
         nonlocal outline_counters, heading_stack_titles, heading_stack_ids, cur_title, cur_level
         if level < 1:
             level = 1
-        # расширяем/усекаем счётчики до нужного уровня
         while len(outline_counters) < level:
             outline_counters.append(0)
         outline_counters = outline_counters[:level]
-        # инкремент уровня и сброс глубже
         outline_counters[level - 1] += 1
 
-        # обновляем стеки названий и id
         if len(heading_stack_titles) < level:
             heading_stack_titles += [""] * (level - len(heading_stack_titles))
         if len(heading_stack_ids) < level:
@@ -504,15 +813,13 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
         cur_level = level
         return sid
 
-    # состояние: находимся ли в разделе «Источники»
     in_sources = False
 
-    # состояние по подписям
-    pending_tbl_num: Optional[str] = None          # например '3.2', 'А.1'
-    pending_tbl_tail: Optional[str] = None         # текст подписи (если есть)
-    awaiting_tail: bool = False                    # видели «Таблица N», ждём подпись строкой ниже
-    last_title_candidate: Optional[str] = None     # запомненный короткий центрированный абзац
-    last_title_candidate_age: int = 999            # «возраст» кандидата (в блоках)
+    pending_tbl_num: Optional[str] = None
+    pending_tbl_tail: Optional[str] = None
+    awaiting_tail: bool = False
+    last_title_candidate: Optional[str] = None
+    last_title_candidate_age: int = 999
 
     table_counter = 0
     figure_counter = 0
@@ -539,7 +846,6 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
             last_para_attrs = None
 
     def consume_title_candidate() -> Optional[str]:
-        """Забираем и сбрасываем сохранённый заголовок-кандидат."""
         nonlocal last_title_candidate, last_title_candidate_age
         t = last_title_candidate
         last_title_candidate = None
@@ -547,7 +853,6 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
         return t
 
     def consider_flush_stale_candidate():
-        """Если кандидат «залежался», возвращаем его в обычный текст."""
         nonlocal last_title_candidate, last_title_candidate_age, buf
         if last_title_candidate and last_title_candidate_age > 3:
             buf.append(last_title_candidate)
@@ -555,7 +860,6 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
             last_title_candidate_age = 999
 
     for block in _iter_block_items(doc):
-        # возраст кандидатного заголовка увеличиваем каждый блок
         last_title_candidate_age = last_title_candidate_age + 1
 
         if isinstance(block, Paragraph):
@@ -563,23 +867,21 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
             p_style_name = (block.style.name if block.style else "") or ""
             p_style = p_style_name.lower()
 
-            # Заголовок раздела (поддержка RU/EN локалей)
+            # Heading*
             if re.match(r"^(heading|заголовок)\s*\d+", p_style):
                 consider_flush_stale_candidate()
                 flush_text_section()
                 title = p_text or "Без названия"
                 try:
-                    # извлечь номер уровня из имени стиля
                     m = re.search(r"(\d+)", p_style)
                     lvl = max(1, int(m.group(1))) if m else 1
                 except Exception:
                     lvl = 1
-
                 sec_id = _enter_heading(lvl, title)
 
                 in_sources = _is_sources_title(title)
                 if _is_appendix_title(title):
-                    in_sources = False  # раздел «Приложения» заканчивает блок источников
+                    in_sources = False
 
                 sections.append({
                     "title": title,
@@ -592,7 +894,7 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                 })
                 continue
 
-            # Подзаголовок «Приложение …» без стиля Heading
+            # Appendix pseudo-heading
             attrs_here = _paragraph_attrs(block)
             if _is_appendix_title(p_text) and _is_title_candidate(p_text, attrs_here):
                 consider_flush_stale_candidate()
@@ -600,9 +902,7 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                 title = p_text or "Приложение"
                 lvl = max(1, cur_level + 1)
                 sec_id = _enter_heading(lvl, title)
-
-                in_sources = False  # «Приложение» завершает список источников
-
+                in_sources = False
                 sections.append({
                     "title": title,
                     "level": lvl,
@@ -614,14 +914,13 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                 })
                 continue
 
-            # Заголовок-кандидат (короткий центрированный/не списочный абзац) — как подпись
+            # Short centered candidate (potential caption tail)
             if _is_title_candidate(p_text, attrs_here) and not _is_sources_title(p_text):
                 last_title_candidate = p_text
                 last_title_candidate_age = 0
-                # не пишем в обычный текст — дождёмся таблицу/рисунок
                 continue
 
-            # Раздел «Источники»
+            # Sources section items
             if in_sources and p_text:
                 consider_flush_stale_candidate()
                 flush_text_section()
@@ -646,26 +945,21 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                 })
                 continue
 
-            # Попытка распознать подписи к таблицам/рисункам
+            # Captions
             kind, num, tail = _classify_caption(p_text or "")
             if kind == "table":
-                # встретили строку «Таблица N [—/./: подпись]»
                 pending_tbl_num = num
                 if tail:
                     pending_tbl_tail = tail
                     awaiting_tail = False
                 else:
-                    # ждём подпись отдельной строкой ниже
                     pending_tbl_tail = None
                     awaiting_tail = True
-                # если прямо перед этим был центрированный кандидат — используем его как хвост
                 if awaiting_tail and last_title_candidate and last_title_candidate_age <= 1:
                     pending_tbl_tail = consume_title_candidate()
                     awaiting_tail = False
-                # не добавляем этот абзац в обычный текст
                 continue
             elif kind == "figure":
-                # Если хвоста нет, а сразу перед этим был центрированный кандидат — используем его как хвост подписи рисунка.
                 if (not tail) and last_title_candidate and last_title_candidate_age <= 1:
                     tail = consume_title_candidate()
 
@@ -675,23 +969,37 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                 fig_title = _compose_figure_title(num, tail)
                 attrs_here_fig = _paragraph_attrs(block)
 
-                # извлечём изображения из текущего и соседних абзацев (±CFG_FIG_WINDOW)
+                # 1) изображения рядом
                 imgs: List[str] = []
-                imgs += _extract_paragraph_images(doc, block, DEFAULT_UPLOAD_DIR)  # из текущего
+                imgs += _extract_paragraph_images(doc, block, DEFAULT_UPLOAD_DIR)
                 neigh = _collect_neighbor_images(doc, block, window=CFG_FIG_WINDOW, uploads_dir=DEFAULT_UPLOAD_DIR)
                 for pth in neigh:
                     if pth not in imgs:
                         imgs.append(pth)
 
+                # 2) диаграмма рядом
+                chart_type, chart_rows = _extract_chart_data_from_paragraph(doc, block)
+                if not chart_rows:
+                    chart_type, chart_rows = _collect_neighbor_chart_data(doc, block, window=CFG_FIG_WINDOW)
+
+                # 3) фолбэк: если не нашли ни картинку, ни диаграмму — жёсткий look-ahead вперёд
+                if not imgs and not chart_rows:
+                    imgs = _first_images_after(doc, block, CFG_FIG_LOOKAHEAD, DEFAULT_UPLOAD_DIR)
+
                 attrs_here_fig["caption_num"] = num
                 attrs_here_fig["caption_tail"] = tail
                 attrs_here_fig["label"] = num
                 attrs_here_fig["title"] = tail
+                attrs_here_fig["origin"] = "docx"
                 attrs_here_fig["numbers"] = _extract_numbers(p_text or "")
-                if imgs:
-                    attrs_here_fig["images"] = imgs
 
-                # добавляем привязку к текущему разделу и стабильный якорь
+                if imgs:
+                    attrs_here_fig.setdefault("images", imgs)
+                if chart_rows:
+                    attrs_here_fig["chart_type"] = chart_type or "Chart"
+                    attrs_here_fig["chart_data"] = chart_rows
+                    attrs_here_fig["chart_origin"] = "docx_chart_xml"
+
                 attrs_here_fig["section_scope"] = _current_scope_path()
                 attrs_here_fig["section_scope_id"] = _current_scope_id()
                 attrs_here_fig["anchor"] = f"fig-{(num or figure_counter)}"
@@ -706,22 +1014,19 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                     "attrs": attrs_here_fig
                 })
 
-                # сброс «табличного» состояния
                 pending_tbl_num = None
                 pending_tbl_tail = None
                 awaiting_tail = False
                 continue
 
-            # Кандидат на заголовок «Список литературы/Источники» без стиля Heading
+            # Sources pseudo-heading
             if _is_sources_title(p_text) and _is_title_candidate(p_text, attrs_here):
                 consider_flush_stale_candidate()
                 flush_text_section()
                 title = p_text or "Список литературы"
                 lvl = max(1, cur_level + 1)
                 sec_id = _enter_heading(lvl, title)
-
-                in_sources = True  # включаем режим разбора источников
-
+                in_sources = True
                 sections.append({
                     "title": title,
                     "level": lvl,
@@ -733,8 +1038,38 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                 })
                 continue
 
-            # Обычный текст — копим в буфер,
-            # а «залежавшийся» кандидат вернём в текст
+            # Orphan inline images/charts (no explicit text)
+            imgs_inline = _extract_paragraph_images(doc, block, DEFAULT_UPLOAD_DIR)
+            chart_type_adhoc, chart_rows_adhoc = _extract_chart_data_from_paragraph(doc, block)
+            if (imgs_inline or chart_rows_adhoc) and not _clean(p_text):
+                consider_flush_stale_candidate()
+                flush_text_section()
+                figure_counter += 1
+                tail_auto = consume_title_candidate() if last_title_candidate and last_title_candidate_age <= 1 else None
+                fig_title = _compose_figure_title(None, tail_auto or "Рисунок без подписи")
+
+                attrs_here_fig = _paragraph_attrs(block)
+                if imgs_inline: attrs_here_fig["images"] = imgs_inline
+                if chart_rows_adhoc:
+                    attrs_here_fig["chart_type"] = chart_type_adhoc or "Chart"
+                    attrs_here_fig["chart_data"] = chart_rows_adhoc
+                    attrs_here_fig["chart_origin"] = "docx_chart_xml"
+                attrs_here_fig["section_scope"] = _current_scope_path()
+                attrs_here_fig["section_scope_id"] = _current_scope_id()
+                attrs_here_fig["anchor"] = f"fig-{figure_counter}"
+
+                sections.append({
+                    "title": fig_title,
+                    "level": max(1, cur_level + 1),
+                    "text": p_text or "",
+                    "page": None,
+                    "section_path": _hpath(heading_stack_ids, heading_stack_titles + [fig_title]),
+                    "element_type": "figure",
+                    "attrs": attrs_here_fig
+                })
+                continue
+
+            # Обычный текст
             consider_flush_stale_candidate()
             if p_text:
                 last_para_attrs = _paragraph_attrs(block)
@@ -747,7 +1082,6 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
             flush_text_section()
             table_counter += 1
 
-            # 1) составляем подпись таблицы по приоритетам
             caption_source = "none"
             num_final: Optional[str] = None
             tail_final: Optional[str] = None
@@ -761,11 +1095,9 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                     tail_final = consume_title_candidate()
                     caption_source = "two_lines_after"
             elif last_title_candidate and last_title_candidate_age <= 1:
-                # заголовок перед таблицей, номера нет
                 tail_final = consume_title_candidate()
                 caption_source = "two_lines_before"
 
-            # 2) фолбэк: если названия всё ещё нет — взять первую строку таблицы
             t_text = _table_to_text(block) or "(пустая таблица)"
             attrs_tbl = _table_attrs(block) | {"numbers": _extract_numbers(t_text)}
 
@@ -774,14 +1106,12 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                 if caption_source == "none":
                     caption_source = "header_row"
 
-            # 3) Компоновка «человеческого» заголовка и атрибутов
             t_title = _compose_table_title(num_final, tail_final)
             attrs_tbl["caption_num"] = num_final
             attrs_tbl["caption_tail"] = tail_final
             attrs_tbl["label"] = num_final
             attrs_tbl["title"] = tail_final
             attrs_tbl["caption_source"] = caption_source
-            # привязка к разделу + стабильный якорь
             attrs_tbl["section_scope"] = _current_scope_path()
             attrs_tbl["section_scope_id"] = _current_scope_id()
             attrs_tbl["anchor"] = f"tbl-{(num_final or table_counter)}"
@@ -796,7 +1126,48 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                 "attrs": attrs_tbl
             })
 
-            # сброс состояния
+            # изображения внутри таблицы → отдельные figure
+            tbl_imgs = _extract_table_images(doc, block, DEFAULT_UPLOAD_DIR)
+            for k, pth in enumerate(tbl_imgs or [], 1):
+                figure_counter += 1
+                ft = _compose_figure_title(None, f"Изображение в таблице {attrs_tbl.get('caption_num') or table_counter} ({k})")
+                sections.append({
+                    "title": ft,
+                    "level": max(1, cur_level + 1),
+                    "text": "",
+                    "page": None,
+                    "section_path": _hpath(heading_stack_ids, heading_stack_titles + [ft]),
+                    "element_type": "figure",
+                    "attrs": {
+                        "images": [pth],
+                        "section_scope": _current_scope_path(),
+                        "section_scope_id": _current_scope_id(),
+                        "anchor": f"tbl-{(attrs_tbl.get('caption_num') or table_counter)}-img-{k}",
+                    }
+                })
+
+            # встроенная диаграмма в таблице → отдельный figure
+            chart_type_t, chart_rows_t = _extract_chart_data_from_table(doc, block)
+            if chart_rows_t:
+                figure_counter += 1
+                ft = _compose_figure_title(None, attrs_tbl.get("caption_tail") or attrs_tbl.get("header_preview") or "Рисунок без подписи")
+                sections.append({
+                    "title": ft,
+                    "level": max(1, cur_level + 1),
+                    "text": "",
+                    "page": None,
+                    "section_path": _hpath(heading_stack_ids, heading_stack_titles + [ft]),
+                    "element_type": "figure",
+                    "attrs": {
+                        "chart_type": chart_type_t or "Chart",
+                        "chart_data": chart_rows_t,
+                        "chart_origin": "docx_chart_xml",
+                        "section_scope": _current_scope_path(),
+                        "section_scope_id": _current_scope_id(),
+                        "anchor": f"fig-{figure_counter}",
+                    }
+                })
+
             pending_tbl_num = None
             pending_tbl_tail = None
             awaiting_tail = False
@@ -804,7 +1175,6 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
             last_title_candidate_age = 999
             continue
 
-    # «Хвост» текста
     if last_title_candidate:
         buf.append(last_title_candidate)
     flush_text_section()
@@ -820,7 +1190,6 @@ def _group_words_into_lines(words: List[dict], y_tol: float = 2.0) -> List[Tuple
     """
     if not words:
         return []
-    # сортируем по Y, затем X
     words = sorted(words, key=lambda w: (w.get("top", 0), w.get("x0", 0)))
     lines: List[Tuple[float, List[dict]]] = []
     for w in words:
@@ -840,19 +1209,15 @@ def _group_words_into_lines(words: List[dict], y_tol: float = 2.0) -> List[Tuple
         ws = sorted(ws, key=lambda z: z.get("x0", 0.0))
         text = " ".join([_clean(z.get("text", "")) for z in ws if _clean(z.get("text", ""))])
         if text:
-            # y_center прикидываем по top + median высоты
             tops = [float(z.get("top", y)) for z in ws]
             bottoms = [float(z.get("bottom", y+10)) for z in ws]
             y_center = (min(tops) + max(bottoms)) / 2.0
             out.append((y_center, text))
-    # сверху-вниз
     out.sort(key=lambda x: x[0])
     return out
 
 def _fitz_images_with_bbox(pg) -> List[Dict[str, Any]]:
-    """
-    Возвращает список изображений страницы PyMuPDF с bbox и xref.
-    """
+    """Возвращает список изображений страницы PyMuPDF с bbox и xref."""
     images: List[Dict[str, Any]] = []
     try:
         info = pg.get_text("dict")
@@ -865,10 +1230,9 @@ def _fitz_images_with_bbox(pg) -> List[Dict[str, Any]]:
                     images.append({
                         "xref": int(xref),
                         "bbox": (float(x0), float(y0), float(x1), float(y1)),
-                        "yc": (float(y0) + float(y1)) / 2.0  # ВАЖНО: в системе fitz (ноль внизу!)
+                        "yc": (float(y0) + float(y1)) / 2.0  # в системе fitz (ноль внизу!)
                     })
     except Exception:
-        # мягко пропускаем
         return []
     return images
 
@@ -882,7 +1246,6 @@ def parse_pdf(path: str) -> List[Dict[str, Any]]:
     """
     out: List[Dict[str, Any]] = []
 
-    # Откроем PyMuPDF один раз (если доступен и включён)
     pdf_fitx = None
     if fitz is not None and CFG_PDF_EXTRACT:
         try:
@@ -890,7 +1253,7 @@ def parse_pdf(path: str) -> List[Dict[str, Any]]:
         except Exception:
             pdf_fitx = None
 
-    xref_cache: Dict[int, str] = {}  # xref -> saved path
+    xref_cache: Dict[int, str] = {}
 
     def _save_xref(xref: int) -> Optional[str]:
         if pdf_fitx is None:
@@ -904,7 +1267,7 @@ def parse_pdf(path: str) -> List[Dict[str, Any]]:
                 return None
             ext = "." + (base.get("ext") or "png")
             h = sha256_bytes(data)
-            fp = save_bytes(data, safe_filename(f"pdf_img_{h[:12]}{ext}"), DEFAULT_UPLOAD_DIR)
+            fp = str(Path(save_bytes(data, safe_filename(f"pdf_img_{h[:12]}{ext}"), DEFAULT_UPLOAD_DIR)).resolve())
             xref_cache[xref] = fp
             return fp
         except Exception:
@@ -912,7 +1275,7 @@ def parse_pdf(path: str) -> List[Dict[str, Any]]:
 
     with pdfplumber.open(path) as pdf:
         for i, page in enumerate(pdf.pages, 1):
-            # 1) Строки и текст
+            # 1) текст страницы
             try:
                 words = page.extract_words() or []
             except Exception:
@@ -931,7 +1294,7 @@ def parse_pdf(path: str) -> List[Dict[str, Any]]:
                 "attrs": {"numbers": _extract_numbers(plain_text)}
             })
 
-            # 2) Простые таблицы (если распознаны pdfplumber'ом)
+            # 2) простые таблицы
             try:
                 tables = page.extract_tables()
             except Exception:
@@ -977,23 +1340,21 @@ def parse_pdf(path: str) -> List[Dict[str, Any]]:
                     except Exception:
                         pass
 
-            # 3) Подписи к рисункам (по строкам с координатами) + привязка изображений по близости
-            fig_caps: List[Tuple[str, str, float]] = []  # [(num, tail, y_center_top)]
+            # 3) подписи к рисункам + ближайшие изображения (вертикальная близость)
+            fig_caps: List[Tuple[str, str, float]] = []
             for y, line_text in lines:
                 k, n, t = _classify_caption(line_text.strip())
                 if k == "figure":
                     fig_caps.append((n or "", t or "", y))
 
-            # подготовим список изображений с bbox для этой страницы
             images_with_bbox: List[Dict[str, Any]] = []
             if pdf_fitx is not None:
                 try:
-                    pg = pdf_fitx[i - 1]  # 0-based
+                    pg = pdf_fitx[i - 1]
                     images_with_bbox = _fitz_images_with_bbox(pg)
                 except Exception:
                     images_with_bbox = []
 
-            # ВАЖНО: согласуем системы координат (fitz: ноль внизу → в top-систему pdfplumber)
             page_height = float(page.height or 0.0)
             for im in images_with_bbox:
                 try:
@@ -1001,7 +1362,7 @@ def parse_pdf(path: str) -> List[Dict[str, Any]]:
                 except Exception:
                     im["yc_top"] = None
 
-            # создаём секции figure
+            used_xrefs = set()
             if fig_caps:
                 for (num, tail, ycap_top) in fig_caps:
                     title = _compose_figure_title(num, tail)
@@ -1013,7 +1374,6 @@ def parse_pdf(path: str) -> List[Dict[str, Any]]:
                         "numbers": _extract_numbers(title),
                     }
 
-                    # сопоставление по близости: ближайшее по вертикали изображение (в согласованной системе)
                     chosen_path: Optional[str] = None
                     if images_with_bbox:
                         best = None
@@ -1023,14 +1383,48 @@ def parse_pdf(path: str) -> List[Dict[str, Any]]:
                             dist = abs(float(im["yc_top"]) - float(ycap_top))
                             if (best is None) or (dist < best[0]):
                                 best = (dist, im)
-                        if best is not None:
-                            # разумный порог — 400pt по вертикали (примерно 14 см)
-                            if best[0] <= 400:
-                                xref = int(best[1]["xref"])
-                                chosen_path = _save_xref(xref)
+                        if best is not None and best[0] <= max(0, CFG_PDF_CAPTION_DY):  # ~14 см
+                            xref = int(best[1]["xref"])
+                            chosen_path = _save_xref(xref)
 
                     if chosen_path:
                         attrs["images"] = [chosen_path]
+                        attrs["origin"] = "pdf"                      # << добавлено
+                        attrs["image_origin"] = "pdf_xref"           # << добавлено
+                        attrs["pdf_page"] = i    
+                        try:
+                            used_xrefs.add(int(best[1]["xref"]))
+                        except Exception:
+                            pass
+                    else:
+                        # NEW: векторный рендер вокруг подписи
+                        if pdf_fitx is not None and CFG_PDF_VECTOR_RASTERIZE:
+                            try:
+                                pg = pdf_fitx[i - 1]
+                                vrects = _fitz_vector_rects(pg)
+                            except Exception:
+                                vrects = []
+                            if vrects:
+                                # фильтруем векторные bbox'ы по вертикальной близости к подписи
+                                near = [r for r in vrects if _bbox_vdist_generic(
+                                    r, (0.0, ycap_top - 1.0, float(pg.rect.x1), ycap_top + 1.0)
+                                ) <= max(0, CFG_PDF_CAPTION_DY)]
+                                cluster = _rect_union(near)
+                                if cluster:
+                                    png = _render_clip_png(
+                                        pg, cluster,
+                                        dpi_base=CFG_PDF_VECTOR_DPI,
+                                        min_w_px=CFG_PDF_VECTOR_MIN_WIDTH_PX,
+                                        max_dpi=CFG_PDF_VECTOR_MAX_DPI,
+                                        pad_px=CFG_PDF_VECTOR_PAD_PX
+                                    )
+                                    if png:
+                                        h = sha256_bytes(png)
+                                        saved = str(Path(save_bytes(png, safe_filename(f"pdf_vec_{h[:12]}.png"), DEFAULT_UPLOAD_DIR)).resolve())
+                                        attrs["images"] = [saved]
+                                        attrs["origin"] = "pdf"                      # << добавлено
+                                        attrs["image_origin"] = "pdf_vector_render"  # << добавлено
+                                        attrs["pdf_page"] = i 
 
                     out.append({
                         "title": title,
@@ -1042,7 +1436,69 @@ def parse_pdf(path: str) -> List[Dict[str, Any]]:
                         "attrs": attrs
                     })
 
-            # 4) Эвристика для списка литературы на странице
+            if images_with_bbox:
+                for idx_im, im in enumerate(images_with_bbox, 1):
+                    xref = int(im.get("xref", 0)) if im.get("xref") is not None else None
+                    if xref and xref in used_xrefs:
+                        continue
+                    saved = _save_xref(xref) if xref else None
+                    if not saved:
+                        continue
+                    title = _compose_figure_title(None, f"Изображение без подписи {i}.{idx_im}")
+                    out.append({
+                        "title": title,
+                        "level": 2,
+                        "text": title,
+                        "page": i,
+                        "section_path": f"Стр. {i} / {title}",
+                        "element_type": "figure",
+                        "attrs": {
+                            "images": [saved],
+                            "origin": "pdf",                 # << добавлено
+                            "image_origin": "pdf_xref",      # << добавлено
+                            "pdf_page": i                    # << добавлено
+                        }
+                    })
+            
+            # после блока с fig_caps / images_with_bbox
+            if CFG_PDF_VECTOR_RASTERIZE and not fig_caps:
+                try:
+                    pg = pdf_fitx[i - 1]
+                    vrects = _fitz_vector_rects(pg)
+                except Exception:
+                    vrects = []
+                if vrects:
+                    # берём крупный кластер на странице как эвристический «рисунок без подписи»
+                    # (срезаем мелочь: шире 40pt и выше 40pt)
+                    big = [r for r in vrects if (r[2]-r[0]) >= 40 and (r[3]-r[1]) >= 40]
+                    cluster = _rect_union(big)
+                    if cluster:
+                        png = _render_clip_png(pg, cluster,
+                                            dpi_base=CFG_PDF_VECTOR_DPI,
+                                            min_w_px=CFG_PDF_VECTOR_MIN_WIDTH_PX,
+                                            max_dpi=CFG_PDF_VECTOR_MAX_DPI,
+                                            pad_px=CFG_PDF_VECTOR_PAD_PX)
+                        if png:
+                            h = sha256_bytes(png)
+                            saved = str(Path(save_bytes(png, safe_filename(f"pdf_vec_{h[:12]}.png"), DEFAULT_UPLOAD_DIR)).resolve())
+                            title = _compose_figure_title(None, f"Изображение без подписи {i}.V")
+                            out.append({
+                                "title": title,
+                                "level": 2,
+                                "text": title,
+                                "page": i,
+                                "section_path": f"Стр. {i} / {title}",
+                                "element_type": "figure",
+                                "attrs": {
+                                    "images": [saved],
+                                    "origin": "pdf",                     # << добавлено
+                                    "image_origin": "pdf_vector_render", # << добавлено
+                                    "pdf_page": i                        # << добавлено
+                                }
+                            })
+
+
+            # 4) эвристика списка литературы на странице
             has_sources_kw = bool(SOURCES_TITLE_RE.search(plain_text))
             ref_lines = []
             for line in (plain_text.splitlines() or []):
@@ -1070,7 +1526,6 @@ def parse_pdf(path: str) -> List[Dict[str, Any]]:
                         "attrs": {"ref_index": idx, "numbers": _extract_numbers(tail)}
                     })
 
-    # закрываем PyMuPDF, если открывали
     try:
         if pdf_fitx is not None:
             pdf_fitx.close()
@@ -1079,7 +1534,7 @@ def parse_pdf(path: str) -> List[Dict[str, Any]]:
 
     return out
 
-# -------- .doc -> .docx без офисов (Aspose.Words) + альтернативы --------
+# -------- .doc -> .docx (Aspose / LibreOffice / Word COM) --------
 
 def _convert_doc_to_docx_with_aspose(doc_path: str, outdir: Path) -> Path:
     """Конвертация .doc -> .docx через Aspose.Words (pip install aspose-words)."""
