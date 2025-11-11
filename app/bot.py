@@ -6,6 +6,7 @@ import json
 import logging
 import asyncio
 import time
+import math
 from typing import Iterable, AsyncIterable, Optional, List, Tuple
 
 from aiogram import Bot, Dispatcher, F, types
@@ -13,6 +14,12 @@ from aiogram.filters import Command
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.enums import ChatAction
 from aiogram.types import FSInputFile, InputMediaPhoto
+
+from .ooxml_lite import (
+    build_index as oox_build_index,
+    figure_lookup as oox_fig_lookup,
+    table_lookup as oox_tbl_lookup,
+)
 
 # ---------- answer builder: пытаемся взять стримовую версию, фолбэк на нестримовую ----------
 try:
@@ -711,6 +718,7 @@ ACTIVE_DOC: dict[int, int] = {}  # user_id -> doc_id
 # NEW: короткая «память» последнего упомянутого объекта пользователем
 LAST_REF: dict[int, dict] = {}   # {uid: {"figure_nums": list[str], "area": "3.2"}}
 FIG_INDEX: dict[int, dict] = {}
+OOXML_INDEX: dict[int, dict] = {}
 
 # NEW: для подстановки номера раздела из вопроса и для анафоры «этот пункт/рисунок»
 _SECTION_NUM_RE = re.compile(
@@ -1131,6 +1139,51 @@ def _first_chunks_context(owner_id: int, doc_id: int, n: int = 10, max_chars: in
         total += len(block)
     return "\n\n".join(parts)
 
+
+def _ooxml_get_index(doc_id: int) -> dict | None:
+    """Возвращает OOXML-индекс из памяти или с диска. Сначала runtime/indexes/<doc_id>.json,
+    затем фолбэк — ищем json с совпадающим meta.file (путь к исходному файлу)."""
+    idx = OOXML_INDEX.get(doc_id)
+    if idx:
+        return idx
+
+    p = os.path.join("runtime", "indexes", f"{doc_id}.json")
+    if os.path.isfile(p):
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                idx = json.load(f)
+            OOXML_INDEX[doc_id] = idx
+            return idx
+        except Exception:
+            pass
+
+    # фолбэк: подобрать индекс по совпадению пути файла
+    try:
+        con = get_conn()
+        cur = con.cursor()
+        cur.execute("SELECT path FROM documents WHERE id=?", (doc_id,))
+        row = cur.fetchone()
+        con.close()
+        doc_path = os.path.abspath(row["path"]) if row else None
+        if doc_path:
+            idx_dir = os.path.join("runtime", "indexes")
+            if os.path.isdir(idx_dir):
+                for name in os.listdir(idx_dir):
+                    if not name.endswith(".json"):
+                        continue
+                    try:
+                        with open(os.path.join(idx_dir, name), "r", encoding="utf-8") as f:
+                            cand = json.load(f)
+                        if (cand.get("meta") or {}).get("file") == doc_path:
+                            OOXML_INDEX[doc_id] = cand
+                            return cand
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+    return None
+
+
 # ---------- verbatim fallback по цитате (шинглы + LIKE/NOCASE) ----------
 
 def _normalize_for_like(s: str) -> str:
@@ -1228,7 +1281,13 @@ async def cmd_diag(m: types.Message):
 
     tables_cnt = _count_tables(uid, doc_id)
     figures_cnt = _list_figures_db(uid, doc_id, limit=999999)["count"]
+    # NEW: если в БД 0 — возьмём число рисунков из OOXML-индекса
+    if figures_cnt == 0:
+        idx_oox = _ooxml_get_index(doc_id)
+        if idx_oox:
+            figures_cnt = len(idx_oox.get("figures", []))
     sources_cnt = _count_sources(uid, doc_id)
+
     indexer_ver = get_document_indexer_version(doc_id) or 0
 
     txt = (
@@ -1414,18 +1473,57 @@ def _parse_chart_data(attrs_json: str | None) -> tuple[list | None, str | None, 
 
 
 def _format_chart_values(chart_data: list) -> str:
-    lines = []
-    for r in (chart_data or []):
-        label = (str(r.get("label") or r.get("name") or r.get("category") or "")).strip()
+    rows = chart_data or []
+
+    # Соберём числа и метки
+    labels, nums, units = [], [], []
+    all_numeric = True
+    for r in rows:
+        labels.append((str(r.get("label") or r.get("name") or r.get("category") or "")).strip())
         val = r.get("value")
         if val is None:
-            # редкий фолбэк на другие распространённые ключи
+            val = r.get("y") or r.get("x") or r.get("v") or r.get("count")
+        units.append(r.get("unit") or "")
+        try:
+            nums.append(float(str(val).replace(",", ".")))
+        except Exception:
+            all_numeric = False
+            break
+
+    # Эвристики "это проценты":
+    #  - единицы содержат '%' ИЛИ
+    #  - все значения в [0..1.2] и сумма ≈ 1 (доли) ИЛИ
+    #  - все значения в [0..100] и сумма ≈ 100 (почти проценты)
+    if all_numeric and rows:
+        total = sum(nums)
+        unit_has_percent = any(isinstance(u, str) and "%" in u for u in units)
+        looks_fraction = all(0 <= v <= 1.2 for v in nums) and 0.98 <= total <= 1.02
+        looks_percent  = all(0 <= v <= 100 for v in nums) and 99 <= total <= 101
+
+        if unit_has_percent or looks_fraction or looks_percent:
+            base = [v * 100 for v in nums] if looks_fraction else nums[:]
+            # Округляем так, чтобы сумма была ровно 100 (метод наибольших остатков)
+            floors = [int(math.floor(x)) for x in base]
+            need = int(round(100 - sum(floors)))
+            remainders = [x - f for x, f in zip(base, floors)]
+            order = sorted(range(len(base)), key=lambda i: remainders[i], reverse=True)
+            for i in order[:max(0, abs(need))]:
+                floors[i] += 1 if need > 0 else -1
+            return "\n".join([f"— {labels[i]}: {floors[i]}%" for i in range(len(floors))])
+
+    # Фолбэк: как было
+    lines = []
+    for i, r in enumerate(rows):
+        label = labels[i] if i < len(labels) else (str(r.get("label") or r.get("name") or r.get("category") or "")).strip()
+        val = r.get("value")
+        if val is None:
             val = r.get("y") or r.get("x") or r.get("v") or r.get("count")
         unit = r.get("unit")
         unit_s = f" {unit}" if isinstance(unit, str) and unit.strip() else ""
         if label or val is not None:
             lines.append(f"— {label}: {val}{unit_s}".strip())
     return "\n".join(lines) if lines else "Нет данных для вывода."
+
 
 
 
@@ -1526,8 +1624,105 @@ async def _answer_figure_query(
             nums.append(n)
     if not nums:
         return False
-    
-    # NEW: прямой поиск по локальному индексу рисунков (figures.py)
+
+    # NEW: OOXML fast-path — сначала пытаемся дать точные данные из DOCX (без рендера)
+    idx_oox = _ooxml_get_index(doc_id)
+    oox_lines: list[str] = []
+    oox_media: list[tuple[str, str]] = []  # (path, caption)
+
+    if idx_oox:
+        for num in nums:
+            # В OOXML-индексе номера фигур обычно целые; пробуем вытащить первую часть до точки
+            try:
+                n_int = int(str(num).split(".", 1)[0])
+            except Exception:
+                n_int = None
+            rec = oox_fig_lookup(idx_oox, n_int) if n_int is not None else None
+            if not rec:
+                continue
+
+            cap = rec.get("caption") or ""
+            display = f"Рисунок {rec.get('n')}" + (f" — {cap}" if cap else "")
+            if rec.get("kind") == "chart":
+                chart = rec.get("chart") or {}
+                ctype = (chart.get("type") or chart.get("kind") or "").lower()
+                series = chart.get("series") or []
+                percent_mode = bool(chart.get("percent"))  # <-- из OOXML индекса
+
+                lines = []
+                for s in series[:6]:
+                    name = (s.get("name") or "").strip()
+                    cats = s.get("cats") or []
+                    vals = s.get("vals") or []
+
+                    # Если из индекса пришли уже проценты ('47%') — выводим как есть
+                    if percent_mode or any(isinstance(v, str) and "%" in v for v in vals):
+                        pairs = [f"{c}: {str(v)}" for c, v in list(zip(cats, vals))[:12]]
+                    else:
+                        # числовая интерпретация (в т.ч. 0..1 для долей)
+                        num_vals, ok = [], True
+                        for v in (vals or []):
+                            try:
+                                num_vals.append(float(str(v).replace(",", ".")))
+                            except Exception:
+                                ok = False
+                                break
+
+                        if ok and cats:
+                            total = sum(num_vals)
+                            is_pie = ctype in ("pie", "doughnut", "donut")
+                            looks_fraction = all(0 <= v <= 1.2 for v in num_vals) and 0.98 <= total <= 1.02
+                            looks_percent  = all(0 <= v <= 100 for v in num_vals) and 99 <= total <= 101
+
+                            if is_pie or looks_fraction or looks_percent:
+                                base = [v * 100 for v in num_vals] if (is_pie or looks_fraction) else num_vals
+                                floors = [int(math.floor(x)) for x in base]
+                                need = int(round(100 - sum(floors)))
+                                remainders = [x - f for x, f in zip(base, floors)]
+                                order = sorted(range(len(base)), key=lambda i: remainders[i], reverse=True)
+                                for i in order[:max(0, abs(need))]:
+                                    floors[i] += 1 if need > 0 else -1
+                                pairs = [f"{c}: {floors[i]}%" for i, c in enumerate(cats[:len(floors)])]
+                            else:
+                                pairs = [f"{c}: {v}" for c, v in list(zip(cats, vals))[:12]]
+                        else:
+                            pairs = [f"{c}: {v}" for c, v in list(zip(cats, vals))[:12]
+                                ]
+                    if pairs:
+                        lines.append(("— " + name + ": " if name else "— ") + "; ".join(pairs))
+
+
+                oox_lines.append(f"**{display}**\n\n" + ("\n".join(lines) if lines else "Данных точек мало или отсутствуют."))
+
+            elif rec.get("kind") == "image" and rec.get("image_path"):
+                oox_media.append((rec["image_path"], display))
+
+    # Если есть медиа — отправим их пользователю (caption на первое фото), затем — текстовые блоки (если есть)
+    if oox_media:
+        media = []
+        for path, disp in oox_media[:FIG_MEDIA_LIMIT]:
+            fh = _safe_fs_input(path)
+            if fh:
+                media.append(InputMediaPhoto(media=fh, caption=_cap(disp)))
+        if media:
+            try:
+                await m.answer_media_group(media[:10])
+            except Exception:
+                for ph in media[:10]:
+                    try:
+                        await m.answer_photo(ph.media, caption=ph.caption)
+                    except Exception:
+                        pass
+
+    if oox_lines:
+        await _send(m, "\n\n".join(oox_lines))
+        try:
+            LAST_REF.setdefault(uid, {})["figure_nums"] = nums
+        except Exception:
+            pass
+        return True
+
+    # (старый путь) прямой поиск по локальному индексу рисунков (figures.py)
     idx = FIG_INDEX.get(doc_id)
     if idx:
         cards = []
@@ -1929,7 +2124,7 @@ async def _ensure_modalities_indexed(m: types.Message, uid: int, doc_id: int, in
     if do_reindex:
         try:
             _reindex_with_sections(uid, doc_id, sections)
-            await _send(m, "Обновил индекс документа: добавлены распознанные рисунки/источники.")
+            await _send(m, "Обновил индекс документа: добавлены распознанные рисунки/источники (включая OOXML-диаграммы).")
         except Exception as e:
             logging.exception("self-heal reindex failed: %s", e)
 
@@ -2595,14 +2790,31 @@ async def handle_doc(m: types.Message):
     ACTIVE_DOC[uid] = doc_id
     set_user_active_doc(uid, doc_id)
 
-    # NEW: построить индекс рисунков из исходного файла и закэшировать
+    # NEW: построить индекс рисунков из исходного файла и закэшировать (старый путь)
     try:
-        FIG_INDEX[doc_id] = fig_index_document(path)  # figures_index.json + файлы изображений
+        FIG_INDEX[doc_id] = fig_index_document(path)
     except Exception as e:
         logging.exception("figures indexing failed: %s", e)
 
-    # 5) READY: сообщаем и обрабатываем (а) подпись к файлу, (б) очередь ожидавших запросов
+    # NEW: построить ЕДИНЫЙ OOXML-индекс (главы/рисунки/таблицы/источники) без LibreOffice
+    # NEW: построить ЕДИНЫЙ OOXML-индекс (главы/рисунки/таблицы/источники) без LibreOffice
+    try:
+        idx_oox = oox_build_index(path)
+        OOXML_INDEX[doc_id] = idx_oox
+        #persist под ID документа из БД — чтобы _ooxml_get_index работал после рестарта процесса
+        try:
+            os.makedirs(os.path.join("runtime", "indexes"), exist_ok=True)
+            with open(os.path.join("runtime", "indexes", f"{doc_id}.json"), "w", encoding="utf-8") as f:
+                json.dump(idx_oox, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+    except Exception as e:
+        logging.exception("ooxml build_index failed: %s", e)
+
+
+    # 5) READY: сообщаем и обрабатываем ...
     await _send(m, (f"Этот файл уже был загружен как документ #{doc_id}. " if result.get("reused") else "") + Cfg.MSG_READY)
+
 
     caption = (m.caption or "").strip()
     if caption:
