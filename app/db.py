@@ -12,7 +12,8 @@ from .config import Cfg, ProcessingState
 CURRENT_INDEXER_VERSION = 5
 
 # Базовые таблицы (минимальный набор столбцов, совместимый со старыми БД)
-# Добавлена таблица document_sections для сохранения структурированного индекса.
+# Добавлена таблица document_sections для сохранения структурированного индекса,
+# а также таблицы figures и figure_analysis для универсального индекса рисунков.
 _BASE_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS users (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -59,6 +60,33 @@ CREATE TABLE IF NOT EXISTS document_sections (
     text          TEXT,
     attrs         TEXT,                      -- JSON (в т.ч. ocr_text, anchors и т.п.)
     FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE
+);
+
+-- НОВОЕ: базовый каталог рисунков документа.
+CREATE TABLE IF NOT EXISTS figures (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    doc_id        INTEGER NOT NULL,
+    figure_label  TEXT,           -- '2.3', 'Рис. 2.3' и т.п.
+    page          INTEGER,
+    image_path    TEXT,           -- относительный путь к файлу png/jpg
+    caption       TEXT,           -- подпись под рисунком (как в документе)
+    kind          TEXT,           -- предварительный тип: bar/pie/org_chart/...
+    attrs         TEXT,           -- доп. JSON (bounding box, source и т.п.)
+    FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE
+);
+
+-- НОВОЕ: результаты универсального анализа рисунков.
+CREATE TABLE IF NOT EXISTS figure_analysis (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    figure_id      INTEGER NOT NULL,   -- FK на figures.id
+    kind           TEXT,               -- итоговый тип (может отличаться от предварительного)
+    data_json      TEXT,               -- JSON со структурой чисел/текстовых блоков
+    exact_numbers  INTEGER,            -- 0/1 — гарантированы ли точные числа
+    exact_text     INTEGER,            -- 0/1 — гарантирован ли точный текст
+    confidence     REAL,               -- уверенность 0..1
+    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (figure_id) REFERENCES figures(id) ON DELETE CASCADE
 );
 """
 
@@ -201,7 +229,7 @@ def _ensure_indexes(con: sqlite3.Connection) -> None:
     if "section_path" in ccols:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_section_path ON chunks(section_path)")
 
-    # Индексы для document_sections
+        # Индексы для document_sections
     cur.execute(
         "CREATE INDEX IF NOT EXISTS idx_sections_doc_ord ON document_sections(doc_id, ord)"
     )
@@ -210,6 +238,20 @@ def _ensure_indexes(con: sqlite3.Connection) -> None:
     )
     cur.execute(
         "CREATE INDEX IF NOT EXISTS idx_sections_doc_path ON document_sections(doc_id, section_path)"
+    )
+
+    # Индексы для figures / figure_analysis (универсальный индекс рисунков)
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_figures_doc ON figures(doc_id)"
+    )
+    cur.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uix_figures_doc_label ON figures(doc_id, figure_label)"
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_figure_analysis_figure ON figure_analysis(figure_id)"
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_figure_analysis_kind ON figure_analysis(kind)"
     )
 
     con.commit()
@@ -548,6 +590,301 @@ def count_document_sections(doc_id: int) -> int:
     cnt = int(cur.fetchone()["c"])
     con.close()
     return cnt
+
+
+# ----------------------------- public API: figures (универсальный индекс) -----------------------------
+
+def upsert_figure(
+    doc_id: int,
+    figure_label: Optional[str],
+    page: Optional[int],
+    image_path: Optional[str],
+    caption: Optional[str],
+    *,
+    kind: Optional[str] = None,
+    attrs: Optional[Dict[str, Any]] = None,
+) -> int:
+    """
+    Создаёт или обновляет запись о рисунке.
+    Пытается найти существующую запись по (doc_id, figure_label) если label задан,
+    иначе по (doc_id, image_path). Возвращает id строки в таблице figures.
+    """
+    con = get_conn()
+    cur = con.cursor()
+    cur.execute("BEGIN IMMEDIATE;")
+    try:
+        row = None
+        if figure_label is not None:
+            cur.execute(
+                "SELECT id FROM figures WHERE doc_id=? AND figure_label=? LIMIT 1",
+                (doc_id, figure_label),
+            )
+            row = cur.fetchone()
+        elif image_path is not None:
+            cur.execute(
+                "SELECT id FROM figures WHERE doc_id=? AND image_path=? LIMIT 1",
+                (doc_id, image_path),
+            )
+            row = cur.fetchone()
+
+        attrs_json = json.dumps(attrs or {}, ensure_ascii=False)
+
+        if row:
+            fid = int(row["id"])
+            cur.execute(
+                """
+                UPDATE figures
+                   SET page      = ?,
+                       image_path= ?,
+                       caption   = ?,
+                       kind      = ?,
+                       attrs     = ?,
+                       figure_label = COALESCE(?, figure_label)
+                 WHERE id = ?
+                """,
+                (page, image_path, caption, kind, attrs_json, figure_label, fid),
+            )
+        else:
+            cur.execute(
+                """
+                INSERT INTO figures(doc_id, figure_label, page, image_path, caption, kind, attrs)
+                VALUES(?,?,?,?,?,?,?)
+                """,
+                (doc_id, figure_label, page, image_path, caption, kind, attrs_json),
+            )
+            fid = int(cur.lastrowid)
+
+        cur.execute("COMMIT;")
+        return fid
+    except Exception:
+        cur.execute("ROLLBACK;")
+        raise
+    finally:
+        con.close()
+
+
+def get_figures_for_doc(doc_id: int) -> List[Dict[str, Any]]:
+    """
+    Возвращает список рисунков документа вместе с результатами анализа (если они есть).
+    """
+    con = get_conn()
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT
+            f.id              AS figure_id,
+            f.doc_id          AS doc_id,
+            f.figure_label    AS figure_label,
+            f.page            AS page,
+            f.image_path      AS image_path,
+            f.caption         AS caption,
+            f.kind            AS figure_kind,
+            f.attrs           AS figure_attrs,
+            a.kind            AS analysis_kind,
+            a.data_json       AS data_json,
+            a.exact_numbers   AS exact_numbers,
+            a.exact_text      AS exact_text,
+            a.confidence      AS confidence,
+            a.created_at      AS created_at,
+            a.updated_at      AS updated_at
+        FROM figures f
+        LEFT JOIN figure_analysis a ON a.figure_id = f.id
+        WHERE f.doc_id = ?
+        ORDER BY f.page NULLS FIRST, f.id ASC
+        """,
+        (doc_id,),
+    )
+    rows = cur.fetchall()
+    con.close()
+
+    out: List[Dict[str, Any]] = []
+    for r in rows or []:
+        try:
+            attrs = json.loads(r["figure_attrs"]) if r["figure_attrs"] else {}
+        except Exception:
+            attrs = {}
+        try:
+            data = json.loads(r["data_json"]) if r["data_json"] else None
+        except Exception:
+            data = None
+
+        out.append(
+            {
+                "figure_id": r["figure_id"],
+                "doc_id": r["doc_id"],
+                "label": r["figure_label"],
+                "page": r["page"],
+                "image_path": r["image_path"],
+                "caption": r["caption"],
+                "figure_kind": r["figure_kind"],
+                "analysis_kind": r["analysis_kind"],
+                "data": data,
+                "exact_numbers": bool(r["exact_numbers"]) if r["exact_numbers"] is not None else None,
+                "exact_text": bool(r["exact_text"]) if r["exact_text"] is not None else None,
+                "confidence": r["confidence"],
+                "attrs": attrs,
+                "created_at": r["created_at"],
+                "updated_at": r["updated_at"],
+            }
+        )
+    return out
+
+
+def delete_figures_for_doc(doc_id: int) -> int:
+    """
+    Удаляет все рисунки документа (анализ удалится каскадно благодаря FK ON DELETE CASCADE).
+    Возвращает число удалённых строк из figures.
+    """
+    con = get_conn()
+    cur = con.cursor()
+    cur.execute("SELECT COUNT(1) AS c FROM figures WHERE doc_id=?", (doc_id,))
+    cnt = int(cur.fetchone()["c"])
+    cur.execute("DELETE FROM figures WHERE doc_id=?", (doc_id,))
+    con.close()
+    return cnt
+
+
+def upsert_figure_analysis(
+    figure_id: int,
+    *,
+    kind: Optional[str],
+    data: Optional[Any],
+    exact_numbers: Optional[bool],
+    exact_text: Optional[bool],
+    confidence: Optional[float],
+) -> int:
+    """
+    Создаёт или обновляет запись в figure_analysis для указанного рисунка.
+    Возвращает id строки в таблице figure_analysis.
+    """
+    con = get_conn()
+    cur = con.cursor()
+    cur.execute("BEGIN IMMEDIATE;")
+    try:
+        cur.execute("SELECT id FROM figure_analysis WHERE figure_id=? LIMIT 1", (figure_id,))
+        row = cur.fetchone()
+
+        if isinstance(data, (dict, list)):
+            data_json = json.dumps(data, ensure_ascii=False)
+        elif data is None:
+            data_json = None
+        else:
+            data_json = str(data)
+
+        exact_numbers_int = int(bool(exact_numbers)) if exact_numbers is not None else None
+        exact_text_int = int(bool(exact_text)) if exact_text is not None else None
+
+        if row:
+            fa_id = int(row["id"])
+            cur.execute(
+                """
+                UPDATE figure_analysis
+                   SET kind          = ?,
+                       data_json     = ?,
+                       exact_numbers = ?,
+                       exact_text    = ?,
+                       confidence    = ?,
+                       updated_at    = CURRENT_TIMESTAMP
+                 WHERE id = ?
+                """,
+                (kind, data_json, exact_numbers_int, exact_text_int, confidence, fa_id),
+            )
+        else:
+            cur.execute(
+                """
+                INSERT INTO figure_analysis(figure_id, kind, data_json, exact_numbers, exact_text, confidence)
+                VALUES(?,?,?,?,?,?)
+                """,
+                (figure_id, kind, data_json, exact_numbers_int, exact_text_int, confidence),
+            )
+            fa_id = int(cur.lastrowid)
+
+        cur.execute("COMMIT;")
+        return fa_id
+    except Exception:
+        cur.execute("ROLLBACK;")
+        raise
+    finally:
+        con.close()
+
+
+def get_figure_analysis(figure_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Возвращает результат анализа рисунка по его figure_id (или None).
+    """
+    con = get_conn()
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT id, figure_id, kind, data_json, exact_numbers, exact_text, confidence,
+               created_at, updated_at
+          FROM figure_analysis
+         WHERE figure_id = ?
+         LIMIT 1
+        """,
+        (figure_id,),
+    )
+    row = cur.fetchone()
+    con.close()
+    if not row:
+        return None
+
+    try:
+        data = json.loads(row["data_json"]) if row["data_json"] else None
+    except Exception:
+        data = None
+
+    return {
+        "id": row["id"],
+        "figure_id": row["figure_id"],
+        "kind": row["kind"],
+        "data": data,
+        "exact_numbers": bool(row["exact_numbers"]) if row["exact_numbers"] is not None else None,
+        "exact_text": bool(row["exact_text"]) if row["exact_text"] is not None else None,
+        "confidence": row["confidence"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def get_figure_analysis_by_label(doc_id: int, figure_label: str) -> Optional[Dict[str, Any]]:
+    """
+    Удобный хелпер: найти анализ по (doc_id, figure_label).
+    """
+    con = get_conn()
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT a.id, a.figure_id, a.kind, a.data_json, a.exact_numbers, a.exact_text,
+               a.confidence, a.created_at, a.updated_at
+          FROM figures f
+          JOIN figure_analysis a ON a.figure_id = f.id
+         WHERE f.doc_id = ? AND f.figure_label = ?
+         LIMIT 1
+        """,
+        (doc_id, figure_label),
+    )
+    row = cur.fetchone()
+    con.close()
+    if not row:
+        return None
+
+    try:
+        data = json.loads(row["data_json"]) if row["data_json"] else None
+    except Exception:
+        data = None
+
+    return {
+        "id": row["id"],
+        "figure_id": row["figure_id"],
+        "kind": row["kind"],
+        "data": data,
+        "exact_numbers": bool(row["exact_numbers"]) if row["exact_numbers"] is not None else None,
+        "exact_text": bool(row["exact_text"]) if row["exact_text"] is not None else None,
+        "confidence": row["confidence"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
 
 
 # ----------------------------- public API: chunks -----------------------------

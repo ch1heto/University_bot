@@ -34,7 +34,9 @@ ENV:
   - find_figure(index, number=None, caption_query=None, chapter=None) -> list[dict]
 
 Каждая запись фигуры имеет поля:
-  id, doc_id, rel_path, abs_path, order, number, title, caption, section, anchors[]
+  id, doc_id, rel_path, abs_path, order,
+  number, title, caption, section, anchors[],
+  chart_data  
 """
 
 from __future__ import annotations
@@ -51,6 +53,9 @@ from dataclasses import dataclass, asdict
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from .config import Cfg
+from . import db as db_mod
+from .vision_analyzer import analyze_figure as va_analyze_figure
 
 # --- Логер ---
 log = logging.getLogger("figures")
@@ -79,7 +84,7 @@ def _env_str(name: str, default: str) -> str:
     v = os.getenv(name)
     return default if v is None else str(v).strip()
 
-FIG_ROOT = Path(os.getenv("FIGURES_ROOT", "./runtime/figures")).resolve()
+FIG_ROOT = Path(os.getenv("FIGURES_ROOT", Cfg.FIG_CACHE_DIR)).resolve()
 DOCX_ON = _env_bool("DOCX_EXTRACT_IMAGES", True)
 PDF_ON = _env_bool("PDF_EXTRACT_IMAGES", True)
 DOCX_FALLBACK = _env_bool("DOCX_PDF_FALLBACK", True)
@@ -135,37 +140,51 @@ def _ensure_clean_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
 def _maybe_cleanup_root():
-    if CLEAN_ON_NEW and FIG_ROOT.exists():
-        shutil.rmtree(FIG_ROOT, ignore_errors=True)
+    """
+    Гарантируем существование FIG_ROOT, но НЕ удаляем всю папку.
+    Очистка конкретного документа делается в index_document.
+    """
     FIG_ROOT.mkdir(parents=True, exist_ok=True)
 
 # --- Разбор подписи "Рисунок N" ---
 
 _CAPTION_PREFIXES = [
     r"рисунок", r"рис\.", r"рис",
-    r"figure", r"fig\.", r"fig"
+    r"figure", r"fig\.", r"fig",
 ]
 _rx_caption = re.compile(
     rf"^\s*(?P<prefix>(?:{'|'.join(_CAPTION_PREFIXES)}))\s*"
-    r"(?P<num>\d+(?:\.\d+)*)\s*[:\-—]?\s*(?P<title>.*)$",
-    re.IGNORECASE | re.UNICODE
+    r"(?:№\s*)?"                                  # опциональное "№"
+    r"(?P<num>[A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)" # A1.2, А 1.2, 2.3, 2,3
+    r"\s*[:\-—]?\s*(?P<title>.*)$",
+    re.IGNORECASE | re.UNICODE,
 )
+
 
 def parse_caption_line(text: str) -> Tuple[Optional[str], Optional[str]]:
     t = _normalize_text(text)
     m = _rx_caption.match(t)
     if not m:
         return None, None
-    num = (m.group("num") or "").replace(",", ".").strip()
+
+    raw_num = (m.group("num") or "").strip()
+    # "А 1.2" → "А1.2", "A 2,3" → "A2.3"
+    raw_num = raw_num.replace(" ", "")
+    num = raw_num.replace(",", ".")
     title = _normalize_text(m.group("title"))
-    return num, (title or None)
+    return (num or None), (title or None)
+
 
 def looks_like_caption(text: str) -> bool:
     num, _ = parse_caption_line(text)
     if num:
         return True
     t = _normalize_text(text).lower()
-    return any(t.startswith(p) for p in ["рис", "figure", "fig"])
+    # грубая эвристика: префикс "рис"/"figure"/"fig" + где-то есть цифра
+    if any(t.startswith(p) for p in ["рис", "figure", "fig"]):
+        return any(ch.isdigit() for ch in t)
+    return False
+
 
 # --- Модель данных ---
 
@@ -181,6 +200,9 @@ class FigureRecord:
     caption: Optional[str] = None
     section: Optional[str] = None
     anchors: Optional[List[str]] = None
+    # новые данные: расшифровка диаграммы (если удалось извлечь из DOCX/PDF)
+    chart_data: Optional[Dict[str, Any]] = None
+    db_id: Optional[int] = None  # ID строки в таблице figures (SQLite), если привязано
 
     def build_anchors(self) -> List[str]:
         out: List[str] = []
@@ -248,9 +270,19 @@ def _is_heading_style(name: str) -> Optional[int]:
                 pass
     return None
 
+# СТАЛО
 def _extract_images_from_run(run, doc_part) -> List[Tuple[bytes, str]]:
+    """
+    Извлекаем встроенные картинки из run через безопасный _oxml_xpath.
+    Если какая-то версия python-docx/oxml чудит — не валим всё извлечение.
+    """
     blobs: List[Tuple[bytes, str]] = []
-    drawing_elems = run._r.xpath(".//w:drawing//a:blip")
+    try:
+        drawing_elems = _oxml_xpath(run._r, ".//w:drawing//a:blip")
+    except Exception as e:
+        log.debug("Не удалось пройтись по drawing-элементам в run: %s", e)
+        drawing_elems = []
+
     for blip in drawing_elems:
         rid = blip.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed")
         if not rid:
@@ -272,23 +304,40 @@ def _extract_images_from_run(run, doc_part) -> List[Tuple[bytes, str]]:
         blobs.append((blob, ext))
     return blobs
 
+# СТАЛО
 def _nearest_caption(paragraphs: List[Any], idx: int, window: int) -> Tuple[Optional[str], Optional[str]]:
-    best = None
+    """
+    Ищем подпись вокруг параграфа с картинкой:
+      1) Сначала смотрим вниз (под картинкой), потом вверх.
+      2) Игнорируем пустые строки.
+    """
+    best_text: Optional[str] = None
     best_dist = 10**9
+
+    # сначала вниз (1), потом вверх (-1) — ближе к реальной вёрстке
+    directions = (1, -1)
+
     for delta in range(0, window + 1):
-        for sign in (-1, 1) if delta > 0 else (1,):
+        for sign in directions if delta > 0 else (1,):
             j = idx + sign * delta
             if j < 0 or j >= len(paragraphs):
                 continue
-            t = _normalize_text(paragraphs[j].text or "")
-            if looks_like_caption(t):
-                d = abs(j - idx)
-                if d < best_dist:
-                    best = t
-                    best_dist = d
-        if best is not None:
+            raw = paragraphs[j].text or ""
+            t = _normalize_text(raw)
+            if not t:
+                continue
+            if not looks_like_caption(t):
+                continue
+
+            d = abs(j - idx)
+            if d < best_dist:
+                best_text = t
+                best_dist = d
+
+        if best_text is not None:
             break
-    return best, None
+
+    return best_text, None
 
 def extract_docx(docx_path: Path, out_dir: Path, neighbor_window: int = NEIGH) -> List[FigureRecord]:
     try:
@@ -568,7 +617,11 @@ def _render_clip_to_png(page, clip_rect: Tuple[float, float, float, float],
         log.debug("Не удалось отрендерить вырезку: %s", e)
         return None
 
-def extract_pdf(pdf_path: Path, out_dir: Path) -> List[FigureRecord]:
+def extract_pdf(pdf_path: Path, out_dir: Path, order_base: int = 0) -> List[FigureRecord]:
+    """
+    Извлекаем изображения/векторные диаграммы из PDF.
+    order_base позволяет продолжить общий счётчик order после DOCX/диаграмм.
+    """
     try:
         import fitz  # PyMuPDF
     except Exception:
@@ -577,7 +630,7 @@ def extract_pdf(pdf_path: Path, out_dir: Path) -> List[FigureRecord]:
 
     fig_records: List[FigureRecord] = []
     doc = fitz.open(str(pdf_path))
-    order = 0
+    order = int(order_base)
     seen_xref_on_page: set[Tuple[int, int]] = set()
 
     for page_index in range(len(doc)):
@@ -771,6 +824,8 @@ def extract_pdf(pdf_path: Path, out_dir: Path) -> List[FigureRecord]:
 
 # --- Индексация / загрузка ---
 
+# --- Индексация / загрузка ---
+
 def _write_index(out_dir: Path, records: List[FigureRecord]) -> Dict[str, Any]:
     idx = {
         "doc_id": out_dir.name,
@@ -781,23 +836,100 @@ def _write_index(out_dir: Path, records: List[FigureRecord]) -> Dict[str, Any]:
         json.dump(idx, f, ensure_ascii=False, indent=2)
     return idx
 
+
 def load_index(fig_dir: str | Path) -> Dict[str, Any]:
     p = Path(fig_dir)
     with open(p / "figures_index.json", "r", encoding="utf-8") as f:
         return json.load(f)
 
-def index_document(path: str | Path) -> Dict[str, Any]:
+
+def _sync_figures_to_db(db_doc_id: int, out_dir: Path, records: List[FigureRecord]) -> None:
+    """
+    Синхронизирует список FigureRecord с таблицей figures в SQLite.
+    Для каждого рисунка делает upsert и сохраняет полученный figure_id в rec.db_id.
+
+    Если у FigureRecord есть chart_data, она уходит в колонку/поле chart_data
+    и дублируется в attrs["chart_data"] для удобства.
+    """
+    root = Path(Cfg.FIG_CACHE_DIR).resolve()
+
+    for rec in records:
+        abs_path = Path(rec.abs_path).resolve()
+        try:
+            image_rel = os.path.relpath(abs_path, root)
+        except Exception:
+            # в крайнем случае сохраняем абсолютный путь
+            image_rel = abs_path.as_posix()
+
+        page = None
+        if rec.section:
+            # парсим "Стр. N" из section, если есть
+            m = re.search(r"стр\.\s*(\d+)", rec.section, re.IGNORECASE)
+            if m:
+                try:
+                    page = int(m.group(1))
+                except Exception:
+                    page = None
+
+        attrs = {
+            "figure_local_id": rec.id,
+            "doc_local_id": rec.doc_id,
+            "rel_path": rec.rel_path,
+            "abs_path": rec.abs_path,
+            "order": rec.order,
+            "section": rec.section,
+            "anchors": rec.anchors or [],
+            # новые поля для удобства в боте / vision
+            "number": rec.number,
+            "title": rec.title,
+            "caption_full": rec.caption,
+        }
+        # дублируем chart_data и в attrs, чтобы боту было проще доставать её из JSON
+        if rec.chart_data is not None:
+            attrs["chart_data"] = rec.chart_data
+
+        fid = db_mod.upsert_figure(
+            doc_id=db_doc_id,
+            figure_label=rec.number,
+            page=page,
+            image_path=image_rel,
+            caption=rec.caption,
+            kind=None,
+            # новое поле: структурированные данные диаграммы (если есть)
+            chart_data=rec.chart_data,
+            attrs=attrs,
+        )
+        rec.db_id = fid
+
+
+def index_document(path: str | Path, *, db_doc_id: Optional[int] = None) -> Dict[str, Any]:
     """
     Главная точка входа: извлечь картинки из файла и построить индекс.
-    Возвращает dict-индекс.
+
+    Если передан db_doc_id (id из таблицы documents), то:
+      - файлы сохраняются под FIG_CACHE_DIR/<db_doc_id>/...
+      - фигуры синхронизируются в таблицу figures (SQLite) с привязкой к doc_id.
+
+    Возвращает dict-индекс (figures_index.json).
     """
     path = Path(path).resolve()
     if not path.exists():
         raise FileNotFoundError(path)
 
     _maybe_cleanup_root()
-    doc_id = _doc_id_for(path)
-    out_dir = (FIG_ROOT / doc_id)
+
+    if db_doc_id is not None:
+        # директория привязана к doc_id из БД
+        out_dir = (FIG_ROOT / str(db_doc_id))
+        doc_id_local = str(db_doc_id)
+    else:
+        # старый режим — doc_id вычисляем по имени файла+хэшу
+        doc_id_local = _doc_id_for(path)
+        out_dir = (FIG_ROOT / doc_id_local)
+
+    # очищаем только каталог текущего документа, если включён флаг
+    if CLEAN_ON_NEW and out_dir.exists():
+        shutil.rmtree(out_dir, ignore_errors=True)
     _ensure_clean_dir(out_dir)
 
     records: List[FigureRecord] = []
@@ -807,18 +939,12 @@ def index_document(path: str | Path) -> Dict[str, Any]:
             log.info("DOCX_EXTRACT_IMAGES=false — пропускаю %s", path.name)
         else:
             log.info("Извлекаю изображения из DOCX: %s", path.name)
+            # Берём только готовые картинки, которые Word уже положил в документ.
+            # Это гарантирует, что диаграммы в боте выглядят так же, как в DOCX,
+            # и ничего не перерисовывается через matplotlib.
             records += extract_docx(path, out_dir, neighbor_window=NEIGH)
+            # ВАЖНО: _extract_docx_charts_to_png больше не вызываем.
 
-            # NEW: извлекаем встроенные диаграммы из chartXML и рендерим PNG без LibreOffice
-            try:
-                chart_records = _extract_docx_charts_to_png(
-                    path, out_dir, neighbor_window=NEIGH, order_base=len(records)
-                )
-                if chart_records:
-                    log.info("Добавил %d PNG из встроенных диаграмм DOCX.", len(chart_records))
-                    records += chart_records
-            except Exception as e:
-                log.info("Не удалось извлечь диаграммы из DOCX: %s", e)
 
         # DOCX→PDF — только если совсем ничего не нашли, либо если явно включён ALWAYS
         if PDF_ON and DOCX_PDF_BACKEND != "off" and (DOCX_PDF_ALWAYS or (DOCX_FALLBACK and len(records) == 0)):
@@ -829,35 +955,73 @@ def index_document(path: str | Path) -> Dict[str, Any]:
             pdf_path = _docx_to_pdf_persistent(path, out_dir)
             if pdf_path and pdf_path.exists():
                 log.info("Извлекаю изображения из PDF: %s", pdf_path.name)
-                records += extract_pdf(pdf_path, out_dir)
+                # PDF-изображения продолжат общий счёт order после DOCX/диаграмм
+                records += extract_pdf(pdf_path, out_dir, order_base=len(records))
             else:
                 log.info("Не удалось выполнить DOCX→PDF.")
-
 
     elif path.suffix.lower() == ".pdf":
         if not PDF_ON:
             log.info("PDF_EXTRACT_IMAGES=false — пропускаю %s", path.name)
         else:
             log.info("Извлекаю изображения из PDF: %s", path.name)
-            records += extract_pdf(path, out_dir)
+            # для «чистого» PDF просто стартуем с нулевого набора
+            records += extract_pdf(path, out_dir, order_base=len(records))
 
     else:
         log.warning("Неподдерживаемый тип: %s", path.suffix)
 
+    # проставляем doc_id_local во все записи
+    for r in records:
+        r.doc_id = doc_id_local
+
+    # сортировка: по номеру (если есть) → по порядку
+    def _parse_number_for_sort(num_str: str) -> Tuple[int, ...]:
+        """
+        '2.3'      → (2, 3)
+        'A1.2'     → (1, 2)
+        'А.1.2'    → (1, 2)
+        '2,3.1'    → (2, 3, 1)
+        Если ничего не разобрали — отправляем в конец.
+        """
+        s = (num_str or "").strip()
+        if not s:
+            return (10**9,)
+        s = s.replace(",", ".")
+        # выбрасываем лидирующую букву + пробелы: 'A1.2' / 'А 1.2'
+        s = re.sub(r"^[A-Za-zА-Яа-я]+\s*", "", s)
+        parts = re.split(r"[.]", s)
+        out: List[int] = []
+        for p in parts:
+            p = p.strip()
+            if not p:
+                continue
+            try:
+                out.append(int(p))
+            except Exception:
+                break
+        return tuple(out) if out else (10**9,)
+
     # сортировка: по номеру (если есть) → по порядку
     def _sort_key(r: FigureRecord):
         if r.number:
-            try:
-                nums = tuple(int(x) for x in r.number.split("."))
-            except Exception:
-                nums = (10**9,)
+            nums = _parse_number_for_sort(str(r.number))
             return (0, nums, r.order)
         return (1, (r.order,), r.order)
 
     records.sort(key=_sort_key)
+
+    # Привязка к SQLite (таблица figures)
+    if db_doc_id is not None:
+        try:
+            _sync_figures_to_db(db_doc_id=db_doc_id, out_dir=out_dir, records=records)
+        except Exception as e:
+            log.warning("Не удалось синхронизировать фигуры с БД для doc_id=%s: %s", db_doc_id, e)
+
     idx = _write_index(out_dir, records)
     log.info("Готово: %d рисунков, индекс: %s", len(records), out_dir / "figures_index.json")
     return idx
+
 
 # --- Поиск ---
 
@@ -869,10 +1033,36 @@ def _best_by_score(items: Iterable[Tuple[Any, float]], top_k: int) -> List[Any]:
     return [x for x, _ in arr[:top_k]]
 
 def query_by_number(index: Dict[str, Any], number: str) -> List[Dict[str, Any]]:
-    number = _normalize_text(number).replace(",", ".")
+    """
+    Ищет по точному номеру, а если не нашлось —
+    по префиксу ( '2' → '2.1', '2.3', '2.3.1' ).
+    """
+    raw = _normalize_text(number)
+    # позволяем передавать сюда целую подпись "Рисунок 2.3 — ..."
+    num_norm, _ = parse_caption_line(raw)
+    if not num_norm:
+        num_norm = raw.replace(",", ".").strip()
+
     figs = index.get("figures", [])
-    out = [f for f in figs if (str(f.get("number") or "").strip() == number)]
-    return out
+
+    # 1) точное совпадение
+    exact = [
+        f for f in figs
+        if str(f.get("number") or "").strip().replace(",", ".") == num_norm
+    ]
+    if exact:
+        return exact
+
+    # 2) префикс: "2" → "2.*"
+    prefix = num_norm.rstrip(".")
+    if not prefix:
+        return []
+
+    prefixed = [
+        f for f in figs
+        if str(f.get("number") or "").strip().replace(",", ".").startswith(prefix + ".")
+    ]
+    return prefixed
 
 def query_by_caption(index: Dict[str, Any], text: str, top_k: int = 3) -> List[Dict[str, Any]]:
     q = _normalize_text(text).lower()
@@ -949,6 +1139,106 @@ def figure_display_name(fig: Dict[str, Any]) -> str:
         return f"Рисунок {num}"
     return Path(fig["rel_path"]).name
 
+
+# --- Vision-анализ с привязкой к БД ---
+
+
+def analyze_figure_for_db(
+    doc_id: int,
+    figure_id: int,
+    *,
+    intent: str = "describe-with-numbers",
+    chart_xml: Optional[bytes] = None,
+    force: bool = False,
+) -> Dict[str, Any]:
+    """
+    Обёртка над vision_analyzer.analyze_figure с привязкой к SQLite.
+
+    - Берёт путь к картинке и подпись из таблицы figures;
+    - если в figure_analysis уже есть результат и force=False — возвращает его;
+    - иначе запускает vision-анализ, сохраняет payload в figure_analysis и возвращает его.
+    """
+    # 1) если уже есть анализ и не просили пересчитать — возвращаем его
+    if not force:
+        row = db_mod.get_figure_analysis(figure_id)
+        if row and row.get("data") is not None:
+            # data здесь — то, что мы ранее положили в data_json (полный payload)
+            return row["data"]
+
+    # 2) достаём сам рисунок
+    figs = db_mod.get_figures_for_doc(doc_id)
+    frow = next((f for f in figs if f["figure_id"] == figure_id), None)
+    if not frow:
+        raise ValueError(f"Figure {figure_id} for doc {doc_id} not found")
+
+    image_rel = frow["image_path"]
+    img_path = Path(Cfg.FIG_CACHE_DIR) / image_rel
+    caption = frow.get("caption")
+    # при желании сюда можно прокинуть заголовок секции/окрестный текст из attrs
+    context = None
+
+    # 3) анализ через универсальный мозг vision_analyzer
+    payload = va_analyze_figure(
+        image_path=str(img_path),
+        caption=caption,
+        context=context,
+        intent=intent,
+        chart_xml=chart_xml,
+    )
+
+    meta = payload.get("meta") or {}
+    source = meta.get("source")
+    strict_passed = meta.get("strict_passed")
+
+    # простая эвристика confidence
+    if source == "ooxml" and strict_passed:
+        confidence = 1.0
+    elif strict_passed:
+        confidence = 0.9
+    else:
+        confidence = 0.7
+
+    # 4) сохранить в figure_analysis
+    db_mod.upsert_figure_analysis(
+        figure_id=figure_id,
+        kind=payload.get("kind") or meta.get("chart_type"),
+        data=payload,  # сохраняем весь payload как JSON
+        exact_numbers=payload.get("exact_numbers"),
+        exact_text=payload.get("exact_text"),
+        confidence=confidence,
+    )
+
+    return payload
+
+
+def analyze_figure_by_label(
+    doc_id: int,
+    figure_label: str,
+    *,
+    intent: str = "describe-with-numbers",
+    chart_xml: Optional[bytes] = None,
+    force: bool = False,
+) -> Dict[str, Any]:
+    """
+    Удобный хелпер: найти рисунок по номеру (label, напр. '2.3') и проанализировать его.
+
+    Если анализ уже есть в figure_analysis и force=False — вернётся он;
+    иначе будет запущен vision-анализ и результат попадёт в БД.
+    """
+    figs = db_mod.get_figures_for_doc(doc_id)
+    frow = next((f for f in figs if (f.get("label") or "") == figure_label), None)
+    if not frow:
+        raise ValueError(f"Figure with label '{figure_label}' for doc {doc_id} not found")
+
+    return analyze_figure_for_db(
+        doc_id=doc_id,
+        figure_id=frow["figure_id"],
+        intent=intent,
+        chart_xml=chart_xml,
+        force=force,
+    )
+
+
 # --- CLI для локальной отладки ---
 
 if __name__ == "__main__":
@@ -962,6 +1252,7 @@ if __name__ == "__main__":
     idx = index_document(args.path)
     print(json.dumps(idx, ensure_ascii=False, indent=2))
 
+
 # --- DOCX chart namespaces (NEW) ---
 _DOCX_NS = {
     "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
@@ -969,6 +1260,20 @@ _DOCX_NS = {
     "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
     "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
 }
+
+def _oxml_xpath(el, expr: str):
+    """
+    Безопасный вызов xpath для oxml-элементов python-docx.
+
+    В новых версиях BaseOxmlElement.xpath поддерживает параметр namespaces,
+    в старых — нет. Поэтому сначала пробуем с namespaces, а при TypeError
+    повторяем без него.
+    """
+    try:
+        return el.xpath(expr, namespaces=_DOCX_NS)
+    except TypeError:
+        return el.xpath(expr)
+
 
 def _parse_chart_xml_bytes(xml_bytes: bytes) -> Optional[Dict[str, Any]]:
     """Извлечь тип диаграммы и серии (label/value) из chartX.xml (без LibreOffice)."""
@@ -1116,7 +1421,10 @@ def _extract_docx_charts_to_png(
         # ищем chart-объекты в runs текущего параграфа
         for run in getattr(p, "runs", []):
             # lxml-узел run._r доступен в python-docx
-            for chart_el in run._r.xpath(".//w:drawing//a:graphic//a:graphicData/c:chart", namespaces=_DOCX_NS):
+            for chart_el in _oxml_xpath(
+                run._r,
+                ".//w:drawing//a:graphic//a:graphicData/c:chart",
+            ):
                 rid = chart_el.get(f"{{{_DOCX_NS['r']}}}id")
                 if not rid:
                     continue

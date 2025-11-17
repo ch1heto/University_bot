@@ -18,6 +18,12 @@ import shutil
 import os
 import re
 from typing import List, Dict, Any, Optional, Tuple
+from decimal import Decimal, InvalidOperation
+# мягкий импорт OOXML-индекса (для вытаскивания chart_data по номерам рисунков)
+try:
+    from . import ooxml_lite as _ooxml_lite
+except Exception:
+    _ooxml_lite = None
 
 _IMG_CACHE: Dict[str, str] = {}
 
@@ -492,6 +498,29 @@ def _classify_caption(text: str) -> Tuple[Optional[str], Optional[str], Optional
         return "figure", num, tail
     return None, None, None
 
+
+def _norm_caption_num(s: Any) -> Optional[str]:
+    """
+    Нормализуем строковый номер подписи:
+    'А. 2,3' -> '2.3'
+    'Рисунок А 2.3' -> '2.3'
+    '2.3 '   -> '2.3'
+    """
+    if s is None:
+        return None
+    try:
+        s = str(s)
+    except Exception:
+        return None
+    s = s.replace("\u00A0", " ").strip()
+    if not s:
+        return None
+    # убираем ведущую литеру/буквы с точками/пробелами/тире
+    s = re.sub(r"^[A-Za-zА-Яа-яЁё]\.?[\s\-]*", "", s)
+    s = s.replace(" ", "")
+    s = s.replace(",", ".")
+    return s or None
+
 def _compose_table_title(num: Optional[str], tail: Optional[str]) -> str:
     if num and tail:
         return f"Таблица {num} — {tail}"
@@ -573,6 +602,29 @@ def _parse_reference_line(s: str) -> Tuple[Optional[int], str]:
         idx = None
     return idx, (m.group(3) or "").strip()
 
+
+def _safe_decimal(text: str) -> Optional[Decimal]:
+    """
+    Аккуратно парсим число из OOXML-строки:
+    - убираем неразрывные пробелы и обычные пробелы
+    - меняем запятую на точку
+    - отрезаем '%' на конце
+    Возвращаем Decimal или None, если парсинг не удался.
+    """
+    try:
+        s = (text or "").strip()
+        s = s.replace("\u00A0", " ").replace(" ", "")
+        if not s:
+            return None
+        if s.endswith("%"):
+            s = s[:-1]
+        s = s.replace(",", ".")
+        if not s:
+            return None
+        return Decimal(s)
+    except (InvalidOperation, ValueError):
+        return None
+
 # ----------------------------- charts (docx) -----------------------------
 
 def _paragraph_chart_rids(p: Paragraph) -> List[str]:
@@ -627,15 +679,41 @@ def _cache_points(root, path: str) -> List[Tuple[int, str]]:
     pts.sort(key=lambda x: x[0])
     return pts
 
-def _parse_chart_xml(xml_bytes: bytes) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+def _parse_chart_xml(xml_bytes: bytes) -> Tuple[Optional[str], List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """
-    Возвращает (chart_type, rows), где rows — список {label, value}.
-    Поддерживаем Pie/Bar/Column/Line.
+    Возвращает (chart_type, rows, chart_matrix).
+
+    rows — плоский список словарей вида:
+      {
+        "label":       str,            # подпись категории + (опц.) имя серии
+        "value":       float | None,   # числовое значение (для процентов уже в шкале 0–100)
+        "unit":        str | None,     # "%", если это проценты, иначе None
+        "value_raw":   str,            # исходная строка из XML
+        "series_name": str | None,     # имя серии (tx)
+        "category":    str,            # подпись категории без префикса серии
+      }
+
+    chart_matrix — нормализованное представление:
+      {
+        "chart_type": str,
+        "categories": [str, ...],
+        "series": [
+          {"name": str | None, "values": [float | None, ...], "unit": str | None}
+        ],
+        "unit": str | None,   # общая единица измерения (если возможна)
+        "meta": {
+          "bar_dir": str | None,          # "bar" / "col" для barChart
+          "cat_orientation": str | None,  # "minMax"/"maxMin" (ось категорий)
+          "val_orientation": str | None,  # "minMax"/"maxMin" (ось значений)
+        }
+      }
+
+    Поддерживаем Pie/Bar/Column/Line. Если парсинг не удался — (None, [], None).
     """
     try:
         root = ET.fromstring(xml_bytes)
     except Exception:
-        return None, []
+        return None, [], None
 
     def _first(*paths):
         for p in paths:
@@ -644,10 +722,16 @@ def _parse_chart_xml(xml_bytes: bytes) -> Tuple[Optional[str], List[Dict[str, An
                 return el
         return None
 
-    chart_el = _first("c:pieChart", "c:barChart", "c:bar3DChart", "c:colChart",
-                      "c:col3DChart", "c:lineChart")
+    chart_el = _first(
+        "c:pieChart",
+        "c:barChart",
+        "c:bar3DChart",
+        "c:colChart",
+        "c:col3DChart",
+        "c:lineChart",
+    )
     if chart_el is None:
-        return None, []
+        return None, [], None
 
     tag = chart_el.tag.split("}")[-1]
     ctype = {
@@ -659,64 +743,214 @@ def _parse_chart_xml(xml_bytes: bytes) -> Tuple[Optional[str], List[Dict[str, An
         "lineChart": "LineChart",
     }.get(tag, tag)
 
+    # --- оси и ориентация (для bar/column/line) ---
+    bar_dir: Optional[str] = None
+    if tag in {"barChart", "bar3DChart", "colChart", "col3DChart"}:
+        bar_dir_el = chart_el.find("./c:barDir", NS)
+        if bar_dir_el is not None:
+            bar_dir = (bar_dir_el.get("val") or "").strip() or None
+
+    cat_orientation: Optional[str] = None
+    val_orientation: Optional[str] = None
+    plot_area = root.find(".//c:plotArea", NS)
+    if plot_area is not None:
+        cat_ax = plot_area.find("./c:catAx", NS)
+        if cat_ax is not None:
+            o_el = cat_ax.find("./c:scaling/c:orientation", NS)
+            if o_el is not None:
+                cat_orientation = (o_el.get("val") or "").strip() or None
+        val_ax = plot_area.find("./c:valAx", NS)
+        if val_ax is not None:
+            o_el = val_ax.find("./c:scaling/c:orientation", NS)
+            if o_el is not None:
+                val_orientation = (o_el.get("val") or "").strip() or None
+
     out: List[Dict[str, Any]] = []
+
+    # Для matrix
+    categories: Optional[List[str]] = None
+    matrix_series: List[Dict[str, Any]] = []
+    matrix_unit: Optional[str] = None
+
     series = chart_el.findall("./c:ser", NS) or []
     multi_series = len(series) > 1
 
-    for ser in series:
+    for si, ser in enumerate(series):
         sname = _series_name(ser)
+
+        # категории
         cat_pts = _cache_points(ser, ".//c:cat/c:strRef/c:strCache") or \
                   _cache_points(ser, ".//c:cat/c:numRef/c:numCache")
+
+        # значения (idx -> raw string)
         val_pts = _cache_points(ser, ".//c:val/c:numRef/c:numCache") or \
                   _cache_points(ser, ".//c:val/c:numCache")
 
-        by_idx = {i: {"label": l, "value": None} for i, l in cat_pts}
-        for i, v in val_pts:
-            try:
-                by_idx.setdefault(i, {})["value"] = float(str(v).replace(",", "."))
-            except Exception:
-                by_idx.setdefault(i, {})["value"] = v
+        # карта idx -> категория (запасной вариант)
+        cats_by_idx = {i: (l or "").strip() for i, l in cat_pts}
+        # последовательности по порядку
+        cat_seq = [(l or "").strip() for _, l in cat_pts]
+        val_seq = [(idx, (v or "")) for idx, v in val_pts]
 
-        for i in sorted(by_idx):
-            row = by_idx[i]
-            label = str(row.get("label") or "").strip()
-            value = row.get("value")
+        if si == 0:
+            # первая серия задаёт «главный» список категорий
+            categories = cat_seq[:]
+
+        # формат серии: ищем numFmt с '%'
+        is_percent_fmt = False
+        for nm in ser.findall(".//c:numFmt", NS):
+            fc = (nm.get("formatCode") or "").lower()
+            if "%" in fc:
+                is_percent_fmt = True
+                break
+
+        # собираем Decimal'ы для эвристики по значениям
+        dec_vals: List[Decimal] = []
+        for _, raw_v in val_seq:
+            d = _safe_decimal(raw_v)
+            if d is not None:
+                dec_vals.append(d)
+
+        # эвристика: если формат не явно процентный, но сумма ≈1 и max≤1 — считаем долями
+        is_percent_by_values = False
+        if dec_vals:
+            max_val = max(dec_vals)
+            s_val = sum(dec_vals)
+            if max_val >= Decimal("0") and max_val <= Decimal("1.05"):
+                if abs(s_val - Decimal("1")) <= Decimal("0.05"):
+                    is_percent_by_values = True
+
+        is_percent = is_percent_fmt or is_percent_by_values
+        unit = "%" if is_percent else None
+        if unit and matrix_unit is None:
+            matrix_unit = unit
+
+        # --- плоский список точек (rows) ---
+        for pos, (idx, raw_v) in enumerate(val_seq):
+            raw_str = (raw_v or "").strip()
+
+            # основное сопоставление — по порядку (позиции)
+            if pos < len(cat_seq):
+                cat_label = cat_seq[pos]
+            else:
+                # запасной вариант — по индексу, как раньше
+                cat_label = cats_by_idx.get(idx, "").strip()
+
+            base_label = cat_label
+            label = base_label
             if multi_series and sname:
-                label = f"{sname}: {label}" if label else sname
-            if label or value is not None:
-                out.append({"label": label, "value": value})
-    return ctype, out
+                label = f"{sname}: {base_label}" if base_label else sname
 
-def _chart_data_from_rid(doc: Docx, rid: str) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+            d = _safe_decimal(raw_str)
+            value_num: Optional[float] = None
+            if d is not None:
+                if is_percent and abs(d) <= Decimal("1.05"):
+                    # доля 0–1 → шкала 0–100
+                    value_num = float(d * Decimal("100"))
+                else:
+                    value_num = float(d)
+
+            if not label and value_num is None and not raw_str:
+                continue
+
+            out.append(
+                {
+                    "label": label,
+                    "value": value_num,
+                    "unit": unit,
+                    "value_raw": raw_str,
+                    "series_name": sname,
+                    "category": cat_label,
+                }
+            )
+
+        # --- значения, выровненные по категориям (для matrix) ---
+        if categories:
+            values_aligned: List[Optional[float]] = []
+            # map idx -> Decimal once
+            idx_to_dec: Dict[int, Optional[Decimal]] = {}
+            for idx, raw_v in val_seq:
+                idx_to_dec[idx] = _safe_decimal(raw_v or "")
+
+            # основной сценарий — одинаковый порядок категорий
+            for pos_cat, cat in enumerate(categories):
+                if pos_cat < len(val_seq):
+                    _, raw_v = val_seq[pos_cat]
+                    d = _safe_decimal(raw_v or "")
+                else:
+                    # если вдруг длины не совпали — пробуем по индексу
+                    d = idx_to_dec.get(pos_cat, None)
+
+                if d is not None:
+                    if is_percent and abs(d) <= Decimal("1.05"):
+                        v_num = float(d * Decimal("100"))
+                    else:
+                        v_num = float(d)
+                else:
+                    v_num = None
+                values_aligned.append(v_num)
+
+            matrix_series.append(
+                {
+                    "name": sname,
+                    "values": values_aligned,
+                    "unit": unit,
+                }
+            )
+
+    chart_matrix: Optional[Dict[str, Any]] = None
+    if categories and matrix_series:
+        chart_matrix = {
+            "chart_type": ctype,
+            "categories": categories[:],
+            "series": matrix_series,
+            "unit": matrix_unit,
+            "meta": {
+                "bar_dir": bar_dir,
+                "cat_orientation": cat_orientation,
+                "val_orientation": val_orientation,
+            },
+        }
+        # если ось категорий идёт max→min — разворачиваем матрицу
+        if chart_matrix["meta"].get("cat_orientation") == "maxMin":
+            chart_matrix["categories"] = list(reversed(chart_matrix["categories"]))
+            for s in chart_matrix["series"]:
+                s["values"] = list(reversed(s["values"]))
+
+    return ctype, out, chart_matrix
+
+
+def _chart_data_from_rid(doc: Docx, rid: str) -> Tuple[Optional[str], List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """Достаём chart*.xml по rId и парсим."""
     try:
         part = doc.part.related_parts.get(rid)
         if not part:
-            return None, []
+            return None, [], None
         xml_bytes = getattr(part, "blob", None)
         if not xml_bytes:
-            return None, []
+            return None, [], None
         return _parse_chart_xml(xml_bytes)
     except Exception:
-        return None, []
+        return None, [], None
 
-def _extract_chart_data_from_paragraph(doc: Docx, p: Paragraph) -> Tuple[Optional[str], List[Dict[str, Any]]]:
-    """Для абзаца возвращает первую найденную (тип, data) диаграмму."""
+
+def _extract_chart_data_from_paragraph(doc: Docx, p: Paragraph) -> Tuple[Optional[str], List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Для абзаца возвращает первую найденную (тип, data, matrix) диаграмму."""
     for rid in _paragraph_chart_rids(p):
-        ctype, rows = _chart_data_from_rid(doc, rid)
-        if rows:
-            return ctype, rows
-    return None, []
+        ctype, rows, matrix = _chart_data_from_rid(doc, rid)
+        if rows or matrix:
+            return ctype, rows, matrix
+    return None, [], None
 
-def _extract_chart_data_from_table(doc: Docx, tbl: Table) -> Tuple[Optional[str], List[Dict[str, Any]]]:
-    """Для таблицы возвращает первую найденную (тип, data) диаграмму."""
+def _extract_chart_data_from_table(doc: Docx, tbl: Table) -> Tuple[Optional[str], List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Для таблицы возвращает первую найденную (тип, data, matrix) диаграмму."""
     for rid in _table_chart_rids(tbl):
-        ctype, rows = _chart_data_from_rid(doc, rid)
-        if rows:
-            return ctype, rows
-    return None, []
+        ctype, rows, matrix = _chart_data_from_rid(doc, rid)
+        if rows or matrix:
+            return ctype, rows, matrix
+    return None, [], None
 
-def _collect_neighbor_chart_data(doc: Docx, block: Paragraph, window: int = CFG_FIG_WINDOW) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+def _collect_neighbor_chart_data(doc: Docx, block: Paragraph, window: int = CFG_FIG_WINDOW) -> Tuple[Optional[str], List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """Ищем диаграмму в диапазоне блоков вокруг anchor-параграфа."""
     try:
         body = doc._element.body
@@ -727,24 +961,24 @@ def _collect_neighbor_chart_data(doc: Docx, block: Paragraph, window: int = CFG_
                 idx = i
                 break
         if idx is None:
-            return None, []
+            return None, [], None
         lo = max(0, idx - window)
         hi = min(len(children) - 1, idx + window)
         for j in range(lo, hi + 1):
             el = children[j]
             if el.tag.endswith("p"):
                 p2 = Paragraph(el, doc)
-                ctype, rows = _extract_chart_data_from_paragraph(doc, p2)
-                if rows:
-                    return ctype, rows
+                ctype, rows, matrix = _extract_chart_data_from_paragraph(doc, p2)
+                if rows or matrix:
+                    return ctype, rows, matrix
             elif el.tag.endswith("tbl"):
                 t2 = Table(el, doc)
-                ctype, rows = _extract_chart_data_from_table(doc, t2)
-                if rows:
-                    return ctype, rows
-        return None, []
+                ctype, rows, matrix = _extract_chart_data_from_table(doc, t2)
+                if rows or matrix:
+                    return ctype, rows, matrix
+        return None, [], None
     except Exception:
-        return None, []
+        return None, [], None
 
 # ----------------------------- section-path helpers -----------------------------
 
@@ -771,6 +1005,14 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
     Также извлекаем изображения и привязываем к секциям element_type='figure'.
     ДОБАВЛЕНО: нумерация разделов (ID вида 1, 1.1, 1.2...) и передача scope_id/path.
     """
+    # Пытаемся заранее построить OOXML-индекс (если модуль доступен).
+    oox_index: Optional[Dict[str, Any]] = None
+    if _ooxml_lite is not None:
+        try:
+            oox_index = _ooxml_lite.build_index(path)
+        except Exception:
+            oox_index = None
+
     doc = Docx(path)
 
     sections: List[Dict[str, Any]] = []
@@ -812,6 +1054,39 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
         cur_title = title or "Без названия"
         cur_level = level
         return sid
+
+    def _ooxml_chart_by_caption(num: Optional[str]) -> Optional[Dict[str, Any]]:
+        """
+        Ищем в OOXML-индексе фигуру с таким же номером подписи и вытаскиваем оттуда chart_data.
+        Возвращаем словарь с ключами chart_type / chart_data / chart_full или None.
+        """
+        if not oox_index or not num:
+            return None
+        norm = _norm_caption_num(num)
+        if not norm:
+            return None
+        try:
+            figs = oox_index.get("figures", []) or []
+        except Exception:
+            return None
+
+        for f in figs:
+            cap_num = f.get("caption_num") or f.get("n")
+            if _norm_caption_num(cap_num) != norm:
+                continue
+
+            chart = f.get("chart") or {}
+            chart_type = chart.get("type") or chart.get("chart_type")
+            chart_data = f.get("chart_data") or chart.get("chart_data") or chart.get("data")
+            if not chart_data:
+                continue
+
+            return {
+                "chart_type": chart_type,
+                "chart_data": chart_data,
+                "chart_full": chart,
+            }
+        return None
 
     in_sources = False
 
@@ -977,13 +1252,18 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                     if pth not in imgs:
                         imgs.append(pth)
 
-                # 2) диаграмма рядом
-                chart_type, chart_rows = _extract_chart_data_from_paragraph(doc, block)
-                if not chart_rows:
-                    chart_type, chart_rows = _collect_neighbor_chart_data(doc, block, window=CFG_FIG_WINDOW)
+                # 2) диаграмма рядом (по inline-XML в .docx)
+                chart_type, chart_rows, chart_matrix = _extract_chart_data_from_paragraph(doc, block)
+                if (not chart_rows) and (chart_matrix is None):
+                    chart_type, chart_rows, chart_matrix = _collect_neighbor_chart_data(
+                        doc, block, window=CFG_FIG_WINDOW
+                    )
+
+                # 2a) если есть OOXML-индекс — пробуем забрать chart_data оттуда по номеру рисунка
+                oox_chart = _ooxml_chart_by_caption(num)
 
                 # 3) фолбэк: если не нашли ни картинку, ни диаграмму — жёсткий look-ahead вперёд
-                if not imgs and not chart_rows:
+                if not imgs and not chart_rows and chart_matrix is None and not (oox_chart and oox_chart.get("chart_data")):
                     imgs = _first_images_after(doc, block, CFG_FIG_LOOKAHEAD, DEFAULT_UPLOAD_DIR)
 
                 attrs_here_fig["caption_num"] = num
@@ -995,10 +1275,22 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
 
                 if imgs:
                     attrs_here_fig.setdefault("images", imgs)
-                if chart_rows:
+
+                # Приоритет: данные из OOXML-индекса, затем локальный разбор chart*.xml
+                if oox_chart and oox_chart.get("chart_data"):
+                    attrs_here_fig["chart_type"] = (oox_chart.get("chart_type") or chart_type or "Chart")
+                    attrs_here_fig["chart_data"] = oox_chart["chart_data"]
+                    attrs_here_fig["chart_origin"] = "ooxml_index"
+                    # полный блок диаграммы из индекса — отдельным полем для отладки/расширений
+                    if oox_chart.get("chart_full") is not None:
+                        attrs_here_fig["chart_ooxml"] = oox_chart["chart_full"]
+                elif chart_rows:
                     attrs_here_fig["chart_type"] = chart_type or "Chart"
                     attrs_here_fig["chart_data"] = chart_rows
                     attrs_here_fig["chart_origin"] = "docx_chart_xml"
+
+                if chart_matrix is not None:
+                    attrs_here_fig["chart_matrix"] = chart_matrix
 
                 attrs_here_fig["section_scope"] = _current_scope_path()
                 attrs_here_fig["section_scope_id"] = _current_scope_id()
@@ -1040,8 +1332,8 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
 
             # Orphan inline images/charts (no explicit text)
             imgs_inline = _extract_paragraph_images(doc, block, DEFAULT_UPLOAD_DIR)
-            chart_type_adhoc, chart_rows_adhoc = _extract_chart_data_from_paragraph(doc, block)
-            if (imgs_inline or chart_rows_adhoc) and not _clean(p_text):
+            chart_type_adhoc, chart_rows_adhoc, chart_matrix_adhoc = _extract_chart_data_from_paragraph(doc, block)
+            if (imgs_inline or chart_rows_adhoc or chart_matrix_adhoc) and not _clean(p_text):
                 consider_flush_stale_candidate()
                 flush_text_section()
                 figure_counter += 1
@@ -1049,11 +1341,14 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                 fig_title = _compose_figure_title(None, tail_auto or "Рисунок без подписи")
 
                 attrs_here_fig = _paragraph_attrs(block)
-                if imgs_inline: attrs_here_fig["images"] = imgs_inline
+                if imgs_inline:
+                    attrs_here_fig["images"] = imgs_inline
                 if chart_rows_adhoc:
                     attrs_here_fig["chart_type"] = chart_type_adhoc or "Chart"
                     attrs_here_fig["chart_data"] = chart_rows_adhoc
                     attrs_here_fig["chart_origin"] = "docx_chart_xml"
+                if chart_matrix_adhoc is not None:
+                    attrs_here_fig["chart_matrix"] = chart_matrix_adhoc
                 attrs_here_fig["section_scope"] = _current_scope_path()
                 attrs_here_fig["section_scope_id"] = _current_scope_id()
                 attrs_here_fig["anchor"] = f"fig-{figure_counter}"
@@ -1147,10 +1442,26 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                 })
 
             # встроенная диаграмма в таблице → отдельный figure
-            chart_type_t, chart_rows_t = _extract_chart_data_from_table(doc, block)
-            if chart_rows_t:
+                        # встроенная диаграмма в таблице → отдельный figure
+            chart_type_t, chart_rows_t, chart_matrix_t = _extract_chart_data_from_table(doc, block)
+            if chart_rows_t or chart_matrix_t is not None:
                 figure_counter += 1
-                ft = _compose_figure_title(None, attrs_tbl.get("caption_tail") or attrs_tbl.get("header_preview") or "Рисунок без подписи")
+                ft = _compose_figure_title(
+                    None,
+                    attrs_tbl.get("caption_tail") or attrs_tbl.get("header_preview") or "Рисунок без подписи"
+                )
+                fig_attrs: Dict[str, Any] = {
+                    "section_scope": _current_scope_path(),
+                    "section_scope_id": _current_scope_id(),
+                    "anchor": f"fig-{figure_counter}",
+                }
+                if chart_rows_t:
+                    fig_attrs["chart_type"] = chart_type_t or "Chart"
+                    fig_attrs["chart_data"] = chart_rows_t
+                    fig_attrs["chart_origin"] = "docx_chart_xml"
+                if chart_matrix_t is not None:
+                    fig_attrs["chart_matrix"] = chart_matrix_t
+
                 sections.append({
                     "title": ft,
                     "level": max(1, cur_level + 1),
@@ -1158,14 +1469,7 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                     "page": None,
                     "section_path": _hpath(heading_stack_ids, heading_stack_titles + [ft]),
                     "element_type": "figure",
-                    "attrs": {
-                        "chart_type": chart_type_t or "Chart",
-                        "chart_data": chart_rows_t,
-                        "chart_origin": "docx_chart_xml",
-                        "section_scope": _current_scope_path(),
-                        "section_scope_id": _current_scope_id(),
-                        "anchor": f"fig-{figure_counter}",
-                    }
+                    "attrs": fig_attrs,
                 })
 
             pending_tbl_num = None

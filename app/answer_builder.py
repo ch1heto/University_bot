@@ -131,12 +131,16 @@ _DEFAULT_RULES = (
     "1) Если в секции [Items] перечислены подпункты — отвечай по ним по порядку, сохраняя нумерацию 1), 2), 3). "
     "Если подпункты не перечислены — закрой все смысловые пункты вопроса последовательно.\n"
     "2) Не используй Markdown-заголовки (#, ##, ###). Для подзаголовков используй жирный текст и двоеточие: **Пункт 2.3:** ...\n"
-    "3) Заголовки таблиц: если есть номер → «Таблица N — Название»; если номера нет — только название.\n"
+    "3) Заголовки таблиц: если есть номер → «Таблица N — Название»; если номера нет — только название. "
+    "Заголовки рисунков/диаграмм: если есть номер → «Рисунок N — Название».\n"
     "4) Не выводи служебные метки и размеры (никаких [Таблица], «ряд 1», «(6×7)»).\n"
     "5) В списках покажи не более 25 строк, затем «… и ещё M», если есть.\n"
-    "6) Не придумывай факты вне блока Facts; если данных нет — скажи честно.\n"
+    "6) Не придумывай факты вне блока Facts (Tables/Figures/TablesRaw/values); если данных нет — скажи честно.\n"
     "7) Если пользователь просит точные значения «как в документе/без нормализации» — сохраняй исходный вид чисел (разделители тысяч, запятая/точка, дефисы).\n"
+    "8) Если вопрос про рисунки/диаграммы/графики — опирайся на раздел [Figures] (включая describe, describe_cards и значения диаграмм), "
+    "не придумывай числа, которых там нет.\n"
 )
+
 
 # конвертируем строки-заголовки в **жирный**
 _HEAD_TO_BOLD_RE = re.compile(r"(?m)^\s*#{1,6}\s*(.+?)\s*$")
@@ -489,6 +493,8 @@ def _make_tables_raw_for_prompt(
     owner_id: Optional[int],
     doc_id: Optional[int],
     question: str,
+    include_all: Optional[bool] = None,
+    rows_limit: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """
     Возвращает массив таблиц (в виде JSON-пакетов) для секции [TablesRaw] промпта.
@@ -501,21 +507,15 @@ def _make_tables_raw_for_prompt(
         return []
 
     q = question or ""
-    include_all = bool(TABLE_ALL_VALUES_RE.search(q))
 
-    # лимит строк для матрицы (по запросу "первые N" или глобальный лимит)
-    rows_limit = None
-    m = TABLE_ROWS_LIMIT_RE.search(q)
-    if m:
-        for g in m.groups():
-            if g and g.isdigit():
-                try:
-                    n = int(g)
-                    if n > 0:
-                        rows_limit = n
-                        break
-                except Exception:
-                    pass
+    # если флаги не передали явно — определяем их из текста вопроса
+    if include_all is None or rows_limit is None:
+        inc_all_auto, rows_limit_auto = _extract_fulltable_request(q)
+        if include_all is None:
+            include_all = inc_all_auto
+        if rows_limit is None:
+            rows_limit = rows_limit_auto
+
     rows_limit_effective = min(
         FULL_TABLE_MAX_ROWS,
         rows_limit if rows_limit is not None else (FULL_TABLE_MAX_ROWS if include_all else 80),
@@ -707,6 +707,7 @@ def facts_to_prompt(
         parts.append("- Items:\n  " + "\n  ".join(lines))
 
     # ----- Таблицы -----
+        # ----- Таблицы -----
     tables = (facts or {}).get("tables") or {}
     if tables:
         block: List[str] = []
@@ -736,14 +737,44 @@ def facts_to_prompt(
         # 3.1) Линейные описания (как было)
         desc_lines = [str(x).strip() for x in (figures.get("describe_lines") or []) if str(x).strip()]
         if desc_lines:
-            block.append("describe:\n" + "\n".join([f"- {(_normalize_numbers(x) if norm_numbers else x)}" for x in desc_lines[:25]]))
+            block.append(
+                "describe:\n"
+                + "\n".join(
+                    [f"- {(_normalize_numbers(x) if norm_numbers else x)}" for x in desc_lines[:25]]
+                )
+            )
 
-        # 3.2) Новое: карточки с полями (num, display, where, images, highlights, vision)
-        if figures.get("describe_cards"):
+        # 3.2) Новое: карточки с полями (num, display, where, images, highlights, vision, values_str, chart_matrix, …)
+        describe_cards = figures.get("describe_cards") or []
+        if describe_cards:
             try:
-                block.append("describe_cards:\n" + json.dumps(figures["describe_cards"], ensure_ascii=False, indent=2))
+                block.append("describe_cards:\n" + json.dumps(describe_cards, ensure_ascii=False, indent=2))
             except Exception:
                 pass
+
+            # 3.3) Дополнительно вытаскиваем values_str из карточек диаграмм в плоский текст,
+            # чтобы модели было проще использовать численные значения.
+            values_lines: List[str] = []
+            for c in describe_cards:
+                try:
+                    vs = (c.get("values_str") or "").strip()
+                except Exception:
+                    vs = ""
+                if not vs:
+                    continue
+                # values_str может быть многострочным — режем по строкам
+                for line in vs.splitlines():
+                    line = line.strip()
+                    if line:
+                        values_lines.append(line)
+
+            if values_lines:
+                if norm_numbers:
+                    values_lines = [_normalize_numbers(v) for v in values_lines]
+                block.append(
+                    "values:\n"
+                    + "\n".join([f"- {v}" for v in values_lines[:25]])
+                )
 
         parts.append("- Figures:\n  " + "\n  ".join(block))
 
@@ -923,7 +954,13 @@ def generate_answer(
 
     # ❗ Тянем TablesRaw (по номерам или по «главе/разделу»)
     include_all, rows_limit = _extract_fulltable_request(q)
-    tables_raw: List[Dict[str, Any]] = _make_tables_raw_for_prompt(owner_id, doc_id, q)
+    tables_raw: List[Dict[str, Any]] = _make_tables_raw_for_prompt(
+        owner_id,
+        doc_id,
+        q,
+        include_all=include_all,
+        rows_limit=rows_limit,
+    )
 
     ctx = facts_to_prompt(
         facts,
@@ -934,6 +971,7 @@ def generate_answer(
         tables_raw=tables_raw if tables_raw else None,
         norm_numbers=not want_exact,
     )
+
     try:
         reply = ace_once(q, ctx, pass_score=pass_score)
         return _headings_to_bold((reply or "").strip())
@@ -975,7 +1013,13 @@ async def generate_answer_stream(
 
     # Полные таблицы: по номеру или по подсказке «в главе/разделе»
     include_all, rows_limit = _extract_fulltable_request(q)
-    tables_raw: List[Dict[str, Any]] = _make_tables_raw_for_prompt(owner_id, doc_id, q)
+    tables_raw: List[Dict[str, Any]] = _make_tables_raw_for_prompt(
+        owner_id,
+        doc_id,
+        q,
+        include_all=include_all,
+        rows_limit=rows_limit,
+    )
 
     ctx = facts_to_prompt(
         facts,

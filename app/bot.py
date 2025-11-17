@@ -87,6 +87,22 @@ except Exception:
     chat_with_gpt_multimodal = None  # type: ignore
     chat_with_gpt_stream_multimodal = None  # type: ignore
 
+    # безопасные заглушки для figures, чтобы остальной код не падал
+    fig_index_document = None       # type: ignore
+    fig_load_index = None           # type: ignore
+
+    def fig_find(*args, **kwargs):  # type: ignore
+        return []
+
+    def figure_display_name(rec):   # type: ignore
+        rec = rec or {}
+        return str(
+            rec.get("title")
+            or rec.get("caption")
+            or rec.get("num")
+            or "Рисунок"
+        )
+
 
 
 # НОВОЕ: оркестратор приёма/обогащения (OCR таблиц-картинок, нормализация чисел)
@@ -128,7 +144,8 @@ _SPLIT_ANCHOR_RE = re.compile(
 STREAM_HEAD_START_MS: int = getattr(Cfg, "STREAM_HEAD_START_MS", 250)        # первый апдейт быстрее
 FINAL_MAX_TOKENS: int = getattr(Cfg, "FINAL_MAX_TOKENS", 1600)
 TYPE_INDICATION_EVERY_MS: int = getattr(Cfg, "TYPE_INDICATION_EVERY_MS", 2000)
-
+# NEW: строгий режим для рисунков — не отдаём числа без надёжного источника
+FIG_STRICT: bool = getattr(Cfg, "FIG_STRICT", True)
 # ↓ новое: управление многошаговой подачей
 MULTI_STEP_SEND_ENABLED: bool = getattr(Cfg, "MULTI_STEP_SEND_ENABLED", True)
 MULTI_STEP_MIN_ITEMS: int = getattr(Cfg, "MULTI_STEP_MIN_ITEMS", 2)
@@ -246,13 +263,23 @@ def _detect_verbosity(text: str) -> str:
     return "normal"
 
 
-def _verbosity_addendum(verbosity: str, *, for_what: str = "ответа") -> str:
-    if verbosity == "brief":
-        return "Формат ответа: краткая выжимка — 5–7 буллетов, по 1–2 строки; без воды и новых фактов."
+def _verbosity_addendum(verbosity: str, what: str = "ответ") -> str:
+    """
+    Небольшая приписка к промпту в зависимости от требуемой детализации.
+    `what` — что именно нужно описывать: 'ответ', 'описания рисунков' и т.п.
+    """
+    what = (what or "ответ").strip()
+
+    if verbosity == "short":
+        # пример: "Ответь кратко (по описанию рисунков)."
+        return f" Ответь кратко (по {what})."
+
     if verbosity == "detailed":
-        return ("Формат ответа: подробный разбор — сначала 3–5 тезисов, затем разъяснения с "
-                "цитатами/формулами/числами из контекста; 8–15 буллетов или 6–10 абзацев.")
-    return "Формат: связный ответ по делу; избегай разделов вида «Чего не хватает»."
+        # пример: "Дай развёрнутое, подробное описание рисунков."
+        return f" Дай развёрнутое, подробное {what}."
+
+    # default — без дополнительных указаний
+    return ""
 
 # --------------------- STREAM: вспомогалки ---------------------
 
@@ -655,8 +682,11 @@ try:
     from .summarizer import is_summary_intent, overview_context  # могут отсутствовать — есть фолбэки ниже
 except Exception:
     def is_summary_intent(text: str) -> bool:
-        return bool(re.search(r"\b(суть|кратко|основн|главн|summary|overview|итог|вывод)\w*\b",
-                              text or "", re.IGNORECASE))
+        return bool(re.search(
+            r"\b(суть|кратко|основн|главн|summary|overview|итог|вывод)\w*\b",
+            text or "",
+            re.IGNORECASE,
+        ))
 
     def overview_context(owner_id: int, doc_id: int, max_chars: int = 6000) -> str:
         con = get_conn()
@@ -690,6 +720,13 @@ except Exception:
             total += len(block)
         return "\n\n".join(parts)
 
+# NEW: точные значения для одного рисунка (через vision-анализ в summarizer.py)
+try:
+    from .summarizer import extract_figure_value as summ_extract_figure_value  # type: ignore
+except Exception:
+    # если summarizer или сама функция недоступны — просто не используем фолбэк по картинкам
+    summ_extract_figure_value = None  # type: ignore
+
 # vision-описание рисунков (мягкий импорт; если нет — отвечаем текстовым фолбэком)
 try:
     from .summarizer import describe_figures as vision_describe_figures
@@ -698,6 +735,7 @@ except Exception:
         if not numbers:
             return "Не указаны номера рисунков."
         return "Описания рисунков недоступны (vision-модуль не подключён)."
+
 
 # NEW: точечный анализ одной картинки (связный текст + числа)
 try:
@@ -1184,6 +1222,26 @@ def _ooxml_get_index(doc_id: int) -> dict | None:
     return None
 
 
+def _ooxml_find_figure_by_label(idx: dict, num_str: str) -> dict | None:
+    """
+    Ищем запись о рисунке по номеру вида '2.3' из подписи.
+    Сравниваем именно текст в caption/title, а не только целую часть.
+    """
+    target = _num_norm_fig(num_str)
+    if not target:
+        return None
+    figs = (idx or {}).get("figures") or []
+    for f in figs:
+        cap = (f.get("caption") or f.get("title") or "").strip()
+        m = _FIG_TITLE_RE.search(cap)
+        if not m:
+            continue
+        cap_num = _num_norm_fig(m.group(2))
+        if cap_num == target:
+            return f
+    return None
+
+
 # ---------- verbatim fallback по цитате (шинглы + LIKE/NOCASE) ----------
 
 def _normalize_for_like(s: str) -> str:
@@ -1524,7 +1582,17 @@ def _format_chart_values(chart_data: list) -> str:
             lines.append(f"— {label}: {val}{unit_s}".strip())
     return "\n".join(lines) if lines else "Нет данных для вывода."
 
+# --- небольшая косметика для процентов из OOXML-графиков ---
 
+# двоеточие + пробелы, сразу перед ';' или концом строки
+_EMPTY_PERCENT_RE = re.compile(r"(:\s*)(?=;|$)")
+
+def _fill_empty_percents(text: str) -> str:
+    """
+    'label:' или 'label: ;' → 'label: 0%' перед ';' или концом строки.
+    Работает и для кусочков вида '…; 3:' и '…; 3: ;'.
+    """
+    return _EMPTY_PERCENT_RE.sub(lambda m: m.group(1) + "0%", text)
 
 
 def _list_figures_db(uid: int, doc_id: int, limit: int = 25) -> dict:
@@ -1579,27 +1647,26 @@ def _list_figures_db(uid: int, doc_id: int, limit: int = 25) -> dict:
 # -------- Ранний обработчик вопросов вида «рисунок 2.1», «рис. 3», «figure 1.2» --------
 
 FIG_NUM_RE = re.compile(
-    r"(?i)\b(?:рис\w*|схем\w*|картин\w*|figure|fig\.?|picture|pic\.?)"
+    r"(?i)\b(?:рис\w*|схем\w*|картин\w*|диаграм\w*|гистограм\w*|diagram|chart|figure|fig\.?|picture|pic\.?)"
     r"\s*(?:№\s*|no\.?\s*|номер\s*)?([A-Za-zА-Яа-я]?\s*[\d.,\s]+(?:\s*(?:и|and)\s*[\d.,\s]+)*)"
 )
 
 # новый хинт для режима «извлечь значения»
 _VALUES_HINT = re.compile(r"(?i)\b(значени[яе]|цифр[аы]|процент[а-я]*|values?|numbers?)\b")
-
+_SPLIT_FIG_LIST_RE = re.compile(r"\s*(?:,|;|\band\b|и)\s*", re.IGNORECASE)
 
 def _extract_fig_nums(text: str) -> list[str]:
     nums: list[str] = []
     for mm in FIG_NUM_RE.finditer(text or ""):
         seg = (mm.group(1) or "").strip()
         # разделители: запятая, точка с запятой, "и/and"
-        parts = re.split(r"(?:\s*(?:,|;|\band\b|и)\s*)", seg, flags=re.IGNORECASE)
+        parts = _SPLIT_FIG_LIST_RE.split(seg)
         for p in parts:
             p = p.strip()
             if not p:
                 continue
             nums.append(p)
     return nums
-
 
 _ALL_FIGS_HINT = re.compile(r"(?i)\b(все\s+рисунк\w*|все\s+схем\w*|все\s+картин\w*|all\s+pictures?|all\s+figs?)\b")
 
@@ -1611,399 +1678,427 @@ def _num_norm_fig(s: str | None) -> str:
     s = re.sub(r"[.:;)\]]+$", "", s)  # срез хвостовой пунктуации: "4." -> "4"
     return s
 
+
+def _is_pure_figure_request(text: str) -> bool:
+    """
+    Эвристика: запрос ТОЛЬКО про рисунки (один или несколько номеров),
+    без таблиц, разделов и общих вопросов.
+
+    Используем, чтобы:
+    — уйти в единый figure-пайплайн;
+    — не запускать потом общий RAG-пайплайн, который дублирует ответы
+      и может выдавать «данного рисунка нет в работе».
+    """
+    t = (text or "").strip()
+    if not t:
+        return False
+
+    # «все рисунки» — отдельная ветка (_ALL_FIGS_HINT)
+    if _ALL_FIGS_HINT.search(t):
+        return False
+
+    # нет упоминания рисунков — не наш случай
+    if not FIG_NUM_RE.search(t):
+        return False
+
+    # если явно упоминают таблицы или разделы/главы — это уже смешанный запрос
+    if _TABLE_ANY.search(t) or _SECTION_NUM_RE.search(t):
+        return False
+
+    return True
+
+
+def _build_figure_records(uid: int, doc_id: int, nums: list[str]) -> list[dict]:
+    """
+    Единая "сборка" информации о рисунках:
+    — номер и красивый display;
+    — пути к картинкам;
+    — точные числовые значения (из chart_data);
+    — подпись и текст рядом;
+    — vision-описание (если есть и не «описание не распознано»).
+    """
+    if not nums:
+        return []
+
+    # заранее тянем карточки из retrieval, чтобы получить images/текст рядом/vision
+    try:
+        cards = describe_figures_by_numbers(
+            uid,
+            doc_id,
+            nums,
+            sample_chunks=2,
+            use_vision=True,
+            lang="ru",
+            vision_first_image_only=True,
+        ) or []
+    except Exception:
+        cards = []
+
+    cards_by_norm: dict[str, dict] = {}
+    for c in cards:
+        key = _num_norm_fig(str(c.get("num") or ""))
+        if key and key not in cards_by_norm:
+            cards_by_norm[key] = c
+
+    idx_oox = _ooxml_get_index(doc_id)
+    fig_idx = FIG_INDEX.get(doc_id)
+
+    # ключ: нормализованный номер рисунка → record
+    records_by_num: dict[str, dict] = {}
+
+    for orig in nums:
+        norm = _num_norm_fig(orig)
+        if not norm:
+            continue
+
+        # если этот номер уже собран — не создаём дубль
+        if norm in records_by_num:
+            continue
+
+        card = cards_by_norm.get(norm)
+        rec: dict = {
+            "owner_id": uid,      # нужен для вызова summarizer.extract_figure_value
+            "doc_id": doc_id,     # идентификатор документа
+            "num": norm,
+            "orig": orig,
+            "display": None,
+            "images": [],
+            "values": None,
+            "near_text": [],
+            "caption": None,
+            "vision_desc": None,
+        }
+
+        # --- 1) данные из RAG-карточек ---
+        if card:
+            rec["display"] = card.get("display") or rec["display"]
+            rec["images"] = [p for p in (card.get("images") or []) if p]
+            rec["near_text"] = [
+                (h or "").strip()
+                for h in (card.get("highlights") or [])
+                if (h or "").strip()
+            ]
+            vis = (card.get("vision") or {}).get("description") or ""
+            vis_clean = vis.strip()
+            low = vis_clean.lower()
+            # отбрасываем заглушки вида «содержимое изображения (описание не распознано)»
+            if vis_clean and "описание не распознано" not in low and "содержимое изображения" not in low:
+                rec["vision_desc"] = vis_clean
+
+        # --- 2) OOXML-индекс: подпись и image_path ---
+        if idx_oox:
+            oox_rec = _ooxml_find_figure_by_label(idx_oox, norm) or _ooxml_find_figure_by_label(idx_oox, orig)
+            if oox_rec:
+                cap = (oox_rec.get("caption") or "").strip()
+                if cap:
+                    rec["caption"] = cap
+                if not rec["display"]:
+                    label = oox_rec.get("n") or norm
+                    rec["display"] = f"Рисунок {label}" + (f" — {cap}" if cap else "")
+                path = oox_rec.get("image_path")
+                if path and path not in rec["images"]:
+                    rec["images"].append(path)
+
+        # --- 3) локальный индекс figures.py: путь к картинке + подпись ---
+        if fig_idx:
+            try:
+                recs = fig_find(fig_idx, number=orig) or fig_find(fig_idx, number=norm) or []
+            except Exception:
+                recs = []
+            for r in recs:
+                if not rec["display"]:
+                    rec["display"] = figure_display_name(r)
+                ap = r.get("abs_path")
+                if ap and ap not in rec["images"]:
+                    rec["images"].append(ap)
+                cap_text = r.get("caption") or r.get("title")
+                if cap_text and not rec["caption"]:
+                    rec["caption"] = cap_text
+                if not rec["near_text"] and cap_text:
+                    rec["near_text"].append(cap_text)
+
+        # --- 4) chart_data из attrs (точные числовые значения) ---
+        row = _fetch_figure_row_by_num(uid, doc_id, orig)
+        if not row and norm != orig:
+            row = _fetch_figure_row_by_num(uid, doc_id, norm)
+        if row:
+            attrs_json = row["attrs"] if ("attrs" in row.keys()) else None
+            cd, _ctype, _attrs = _parse_chart_data(attrs_json)
+            if cd:
+                rec["values"] = _fill_empty_percents(_format_chart_values(cd))
+            if not rec["display"]:
+                title_text = row["text"] if ("text" in row.keys()) else None
+                rec["display"] = _compose_figure_display(
+                    attrs_json,
+                    row["section_path"],
+                    title_text,
+                )
+
+        if not rec["display"]:
+            rec["display"] = f"Рисунок {norm}"
+
+        records_by_num[norm] = rec
+
+    return list(records_by_num.values())
+
+
+def _fig_values_text_from_records(
+    records: list[dict],
+    *,
+    need_values: bool,
+) -> str:
+    """
+    Собираем текстовый блок с точными значениями по рисункам
+    (без отправки в Telegram). Используется как префикс к
+    основному описанию.
+    """
+    lines: list[str] = []
+
+    for rec in records:
+        # 1) chart_data уже мог быть проставлен в _build_figure_records
+        values = (rec.get("values") or "").strip()
+
+        # 2) ФОЛБЭК №1: если chart_data нет, пробуем через summarizer.extract_figure_value
+        if not values and summ_extract_figure_value is not None:
+            owner_id = rec.get("owner_id")
+            doc_id = rec.get("doc_id")
+            num = rec.get("orig") or rec.get("num")
+
+            if owner_id and doc_id and num:
+                try:
+                    raw = summ_extract_figure_value(owner_id, doc_id, str(num)) or ""
+                    raw = raw.strip()
+                except Exception:
+                    raw = ""
+
+                # ожидаемый формат из summarizer.extract_figure_value:
+                # "**Рисунок N.** Заголовок\n<табличка/CSV/...>"
+                if raw.startswith("**Рисунок"):
+                    raw_lines = raw.splitlines()
+                    body = "\n".join(raw_lines[1:]).strip() if len(raw_lines) >= 2 else ""
+                    if body:
+                        values = body
+                        rec["values"] = body  # чтобы GPT-описание тоже видело эти числа
+
+        # 3) ФОЛБЭК №2: если нет ни chart_data, ни summarizer — пробуем OOXML-индекс
+        if not values:
+            try:
+                doc_id = rec.get("doc_id")
+                num = rec.get("orig") or rec.get("num")
+                idx = _ooxml_get_index(doc_id) if doc_id else None
+                body = ""
+
+                if idx and "oox_fig_lookup" in globals() and num:
+                    oox_res = oox_fig_lookup(idx, str(num))
+
+                    # Подстрой под свою реализацию figure_lookup:
+                    # здесь предполагаем, что вернётся либо строка, либо dict.
+                    if isinstance(oox_res, str):
+                        body = oox_res.strip()
+                    elif isinstance(oox_res, dict):
+                        body = (
+                            (oox_res.get("values_text")
+                             or oox_res.get("text")
+                             or "")
+                        ).strip()
+
+                if body:
+                    values = body
+                    rec["values"] = body
+            except Exception:
+                # не ломаем весь ответ, если с OOXML что-то пошло не так
+                pass
+
+        # 4) если после всех попыток чисел нет — пропускаем этот рисунок
+        if not values:
+            continue
+
+        disp = rec.get("display") or f"Рисунок {rec.get('num') or ''}".strip()
+        lines.append(f"**{disp} — точные значения**\n\n{values}")
+
+    if lines:
+        return "\n\n".join(lines)
+
+    if need_values:
+        return (
+            "По указанным рисункам не удалось автоматически извлечь точные числовые данные "
+            "(ни из chart_data, ни через анализ изображения/OOXML). "
+            "Могу дать только текстовое описание."
+        )
+
+    return ""
+
+
+async def _send_fig_values_from_records(
+    m: types.Message,
+    records: list[dict],
+    *,
+    need_values: bool,
+) -> None:
+    """
+    Обратная совместимость: если нужно отдельно отправить только числа.
+    В основном сценарии теперь используем _fig_values_text_from_records
+    и склеиваем с описанием.
+    """
+    text = _fig_values_text_from_records(records, need_values=need_values)
+    if text:
+        await _send(m, text)
+
+
+async def _explain_figures_with_gpt(
+    m: types.Message,
+    records: list[dict],
+    question: str,
+    *,
+    verbosity: str,
+    need_values: bool,
+    values_prefix: str = "",
+) -> None:
+    """
+    Финальный шаг: GPT даёт связное текстовое объяснение по всем рисункам сразу,
+    используя подписи, текст рядом и уже извлечённые числовые данные.
+
+    Если передан values_prefix, то он добавляется в начало ответа:
+    сначала блок «точные значения», затем интерпретация.
+    """
+    if not (chat_with_gpt or chat_with_gpt_stream):
+        return
+
+    if not records:
+        return
+
+    ctx_blocks: list[str] = []
+    for rec in records:
+        disp = rec.get("display") or f"Рисунок {rec.get('num') or ''}".strip()
+        parts: list[str] = [disp]
+        if rec.get("caption"):
+            parts.append(f"Подпись: {rec['caption']}")
+        if rec.get("near_text"):
+            parts.append("Текст рядом: " + " ".join(rec["near_text"][:2]))
+        if rec.get("vision_desc"):
+            parts.append("Описание по картинке: " + rec["vision_desc"])
+        if rec.get("values"):
+            parts.append("Точные значения (как в документе):\n" + rec["values"])
+        ctx_blocks.append("\n".join(parts))
+
+    ctx = "\n\n---\n\n".join(ctx_blocks)
+    if not ctx.strip():
+        return
+
+    focus = (
+        "с акцентом на точные числовые значения и их интерпретацию"
+        if need_values
+        else "подробно поясняя смысл и выводы по рисункам"
+    )
+
+    system_prompt = (
+        "Ты репетитор по дипломным работам. У тебя есть информация о рисунках диплома "
+        "(подписи, текст рядом, распознанные данные диаграмм). "
+        "Объясни студенту, что показывают рисунки, какие тенденции видны и какие выводы можно сделать. "
+        "Не придумывай новые числа и не ссылайся на номера страниц."
+    )
+    user_prompt = (
+        f"Вопрос пользователя: {question}\n\n"
+        f"Сконцентрируйся только на указанных рисунках, опиши их содержание и сделай интерпретацию {focus}.\n"
+        f"{_verbosity_addendum(verbosity, 'описания рисунков')}"
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "assistant", "content": f"[Собранная информация о рисунках]\n{ctx}"},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    try:
+        ans = chat_with_gpt(messages, temperature=0.2, max_tokens=FINAL_MAX_TOKENS)
+    except Exception as e:
+        logging.exception("figure explanation failed: %s", e)
+        ans = ""
+
+    ans = (ans or "").strip()
+    prefix = (values_prefix or "").strip()
+
+    if prefix and ans:
+        final = prefix + "\n\n" + ans
+    elif prefix:
+        final = prefix
+    else:
+        final = ans
+
+    if final:
+        await _send(m, _strip_unwanted_sections(final))
+
 async def _answer_figure_query(
     m: types.Message, uid: int, doc_id: int, text: str, *, verbosity: str = "normal"
 ) -> bool:
+    """
+    Новый единый сценарий:
+    1) всегда вытаскиваем максимум по рисункам (_build_figure_records);
+    2) всегда стараемся отправить сами картинки;
+    3) собираем общий блок с точными значениями (если есть);
+    4) даём одно связное пояснение через GPT, в которое подмешан блок значений.
+
+    Поведение не зависит от того, спросили ли «опиши рисунок 2.3»
+    или «дай точные значения по рисунку 2.3» — меняется только акцент
+    в текстовом объяснении.
+    """
+    # 0) нужен ли особый акцент на числах
+    need_values = bool(_VALUES_HINT.search(text or ""))
+
+    # 1) вытаскиваем номера рисунков из текста
     raw_list = _extract_fig_nums(text or "")
-    seen = set()
+    seen: set[str] = set()
     nums: list[str] = []
     for token in raw_list:
         n = _num_norm_fig(token)
         if n and n not in seen:
             seen.add(n)
-            nums.append(n)
+            nums.append(token)   # сохраняем исходный вид номера
+
     if not nums:
         return False
 
-    # NEW: OOXML fast-path — сначала пытаемся дать точные данные из DOCX (без рендера)
-    idx_oox = _ooxml_get_index(doc_id)
-    oox_lines: list[str] = []
-    oox_media: list[tuple[str, str]] = []  # (path, caption)
-
-    if idx_oox:
-        for num in nums:
-            # В OOXML-индексе номера фигур обычно целые; пробуем вытащить первую часть до точки
-            try:
-                n_int = int(str(num).split(".", 1)[0])
-            except Exception:
-                n_int = None
-            rec = oox_fig_lookup(idx_oox, n_int) if n_int is not None else None
-            if not rec:
-                continue
-
-            cap = rec.get("caption") or ""
-            display = f"Рисунок {rec.get('n')}" + (f" — {cap}" if cap else "")
-            if rec.get("kind") == "chart":
-                chart = rec.get("chart") or {}
-                ctype = (chart.get("type") or chart.get("kind") or "").lower()
-                series = chart.get("series") or []
-                percent_mode = bool(chart.get("percent"))  # <-- из OOXML индекса
-
-                lines = []
-                for s in series[:6]:
-                    name = (s.get("name") or "").strip()
-                    cats = s.get("cats") or []
-                    vals = s.get("vals") or []
-
-                    # Если из индекса пришли уже проценты ('47%') — выводим как есть
-                    if percent_mode or any(isinstance(v, str) and "%" in v for v in vals):
-                        pairs = [f"{c}: {str(v)}" for c, v in list(zip(cats, vals))[:12]]
-                    else:
-                        # числовая интерпретация (в т.ч. 0..1 для долей)
-                        num_vals, ok = [], True
-                        for v in (vals or []):
-                            try:
-                                num_vals.append(float(str(v).replace(",", ".")))
-                            except Exception:
-                                ok = False
-                                break
-
-                        if ok and cats:
-                            total = sum(num_vals)
-                            is_pie = ctype in ("pie", "doughnut", "donut")
-                            looks_fraction = all(0 <= v <= 1.2 for v in num_vals) and 0.98 <= total <= 1.02
-                            looks_percent  = all(0 <= v <= 100 for v in num_vals) and 99 <= total <= 101
-
-                            if is_pie or looks_fraction or looks_percent:
-                                base = [v * 100 for v in num_vals] if (is_pie or looks_fraction) else num_vals
-                                floors = [int(math.floor(x)) for x in base]
-                                need = int(round(100 - sum(floors)))
-                                remainders = [x - f for x, f in zip(base, floors)]
-                                order = sorted(range(len(base)), key=lambda i: remainders[i], reverse=True)
-                                for i in order[:max(0, abs(need))]:
-                                    floors[i] += 1 if need > 0 else -1
-                                pairs = [f"{c}: {floors[i]}%" for i, c in enumerate(cats[:len(floors)])]
-                            else:
-                                pairs = [f"{c}: {v}" for c, v in list(zip(cats, vals))[:12]]
-                        else:
-                            pairs = [f"{c}: {v}" for c, v in list(zip(cats, vals))[:12]
-                                ]
-                    if pairs:
-                        lines.append(("— " + name + ": " if name else "— ") + "; ".join(pairs))
-
-
-                oox_lines.append(f"**{display}**\n\n" + ("\n".join(lines) if lines else "Данных точек мало или отсутствуют."))
-
-            elif rec.get("kind") == "image" and rec.get("image_path"):
-                oox_media.append((rec["image_path"], display))
-
-    # Если есть медиа — отправим их пользователю (caption на первое фото), затем — текстовые блоки (если есть)
-    if oox_media:
-        media = []
-        for path, disp in oox_media[:FIG_MEDIA_LIMIT]:
-            fh = _safe_fs_input(path)
-            if fh:
-                media.append(InputMediaPhoto(media=fh, caption=_cap(disp)))
-        if media:
-            try:
-                await m.answer_media_group(media[:10])
-            except Exception:
-                for ph in media[:10]:
-                    try:
-                        await m.answer_photo(ph.media, caption=ph.caption)
-                    except Exception:
-                        pass
-
-    if oox_lines:
-        await _send(m, "\n\n".join(oox_lines))
-        try:
-            LAST_REF.setdefault(uid, {})["figure_nums"] = nums
-        except Exception:
-            pass
+    # 2) собираем единую структуру по всем рисункам
+    records = _build_figure_records(uid, doc_id, nums)
+    if not records:
+        await _send(m, "Указанные рисунки в работе не найдены.")
         return True
 
-    # (старый путь) прямой поиск по локальному индексу рисунков (figures.py)
-    idx = FIG_INDEX.get(doc_id)
-    if idx:
-        cards = []
-        for num in nums:
-            recs = fig_find(idx, number=num) or []
-            for r in recs:
-                cards.append({
-                    "num": r.get("number") or num,
-                    "display": figure_display_name(r),
-                    "images": [r.get("abs_path")] if r.get("abs_path") else [],
-                    "where": {"section_path": r.get("section")},
-                    "highlights": [t for t in [r.get("caption"), r.get("title")] if t],
-                })
-
-        if cards:
-        # 1) сначала — сами изображения пользователю
-            await _send_media_from_cards(m, cards)
-
-            # 2) затем — связный анализ (без таблиц): prefer vision_analyzer, fallback на vision_extract_values
-            lines = []
-            for c in cards:
-                imgs = c.get("images") or []
-                if not imgs:
-                    continue
-                hint = (c.get("highlights") or [None])[0]
-
-                text_block = ""
-                if va_analyze_figure:
-                    try:
-                        res = va_analyze_figure(imgs[0], caption_hint=hint, lang="ru")
-                        if isinstance(res, dict):
-                            # ожидаем ключ 'text' или 'data' (pairs)
-                            text_block = (res.get("text") or "").strip()
-                            if not text_block:
-                                pairs = res.get("data") or []
-                                if pairs:
-                                    text_block = _pairs_to_bullets(pairs)
-                        else:
-                            text_block = (str(res) or "").strip()
-                    except Exception:
-                        text_block = ""
-
-                if not text_block and vision_extract_values:
-                    try:
-                        res = vision_extract_values(imgs[:1], caption_hint=hint, lang="ru")
-                    except Exception:
-                        res = None
-                    rows = (res or {}).get("data") or []
-                    if rows:
-                        text_block = "\n".join([
-                            f"— {r.get('label')}: {r.get('value')}" + (f" {r.get('unit')}" if r.get('unit') else "")
-                            for r in rows[:25]
-                        ])
-
-                if text_block:
-                    lines.append(f"**{c['display']}**\n\n{text_block}")
-
-            if lines:
-                await _send(m, "\n\n".join(lines))
-                try:
-                    LAST_REF.setdefault(uid, {})["figure_nums"] = nums
-                except Exception:
-                    pass
-                return True
-
-
-    # 0) самовосстановление индекса, если «рисунков» нет
+    # 3) сначала сами изображения (по всем найденным)
     try:
-        db_info = _list_figures_db(uid, doc_id, limit=1)
-        if int(db_info.get("count") or 0) == 0:
-            intents_stub = {"figures": {"want": True}, "sources": {"want": False}}
-            await _ensure_modalities_indexed(m, uid, doc_id, intents_stub)
+        cards_for_media = [
+            {
+                "num": r["num"],
+                "display": r.get("display") or f"Рисунок {r['num']}",
+                "images": r.get("images") or [],
+            }
+            for r in records
+        ]
+        await _send_media_from_cards(m, cards_for_media)
+    except Exception:
+        # если что-то не получилось — не срываем дальнейшие шаги
+        pass
+
+    # 4) собираем общий блок с точными значениями (без отправки)
+    values_block = _fig_values_text_from_records(records, need_values=need_values)
+
+    # 5) один текст: «значения + описание»
+    await _explain_figures_with_gpt(
+        m,
+        records,
+        text,
+        verbosity=verbosity,
+        need_values=need_values,
+        values_prefix=values_block,
+    )
+
+    # 6) обновляем «последний упомянутый рисунок» для анафорических вопросов
+    try:
+        LAST_REF.setdefault(uid, {})["figure_nums"] = [r["num"] for r in records]
     except Exception:
         pass
 
-    # ---------- NEW (шаг 1): точные значения из chart_data ----------
-    chart_lines: list[str] = []
-    covered: set[str] = set()
-    for num in nums:
-        row = _fetch_figure_row_by_num(uid, doc_id, num)
-        if not row:
-            continue
-        attrs_json = row["attrs"] if ("attrs" in row.keys()) else None
-        chart_data, chart_type, _attrs = _parse_chart_data(attrs_json)
-        if chart_data:
-            display = _compose_figure_display(
-                attrs_json,
-                row["section_path"],
-                row["text"] if ("text" in row.keys()) else None
-            ) or "Рисунок"
-            values_str = _format_chart_values(chart_data)
-            chart_lines.append(f"**{display}**\n\n{values_str}")
-            covered.add(num)
-
-    # ВАЖНО: печатаем найденные chart_data СРАЗУ, даже если покрыли не все номера
-    sent_chart_block = False
-    if chart_lines:
-        await _send(m, "\n\n".join(chart_lines))
-        sent_chart_block = True
-        try:
-            LAST_REF.setdefault(uid, {})["figure_nums"] = nums
-        except Exception:
-            pass
-
-    # остаются номера, по которым chart_data нет → дожимаем карточками/vision
-    pending_nums = [n for n in nums if n not in covered]
-
-
-    cards = []
-    if pending_nums:
-        # 1) основная попытка — retrieval-карточки (только для «непокрытых»)
-        try:
-            cards = describe_figures_by_numbers(
-                uid, doc_id, pending_nums, sample_chunks=2, use_vision=True, lang="ru", vision_first_image_only=True
-            ) or []
-        except Exception as e:
-            logging.exception("describe_figures_by_numbers failed: %s", e)
-            cards = []
-
-        sent_media_before = await _send_media_from_cards(m, cards or [])
-        # 2) фолбэк: если карточек нет вообще — vision-обёртка из summarizer
-        if not cards:
-            try:
-                fallback_text = vision_describe_figures(uid, doc_id, pending_nums)
-                if (fallback_text or "").strip():
-                    # если уже послали chart_data — шлём только фолбэк; иначе комбинируем
-                    combo = fallback_text.strip() if sent_chart_block else \
-                            ("\n\n".join(chart_lines + [fallback_text.strip()]) if chart_lines else fallback_text.strip())
-                    await _send(m, combo)
-                    try:
-                        LAST_REF.setdefault(uid, {})["figure_nums"] = nums
-                    except Exception:
-                        pass
-                    return True
-            except Exception as e:
-                logging.exception("vision fallback failed: %s", e)
-
-    # 2.5) значения из изображений — ВСЕГДА (если доступны), для карточек pending
-    if cards and FIG_VALUES_DEFAULT and (va_analyze_figure or vision_extract_values):
-        lines = []
-        for c in cards:
-            disp = c.get("display") or f"Рисунок {c.get('num') or ''}".strip()
-            imgs = c.get("images") or []
-            hint = (c.get("highlights") or [None])[0]
-            vis  = (c.get("vision") or {})
-            vis_desc = (vis.get("description") or "").strip()
-
-            values_str = ""
-            if imgs and va_analyze_figure:
-                try:
-                    res = va_analyze_figure(imgs[0], caption_hint=hint, lang="ru")
-                    if isinstance(res, dict):
-                        values_str = (res.get("text") or "").strip() or _pairs_to_bullets(res.get("data") or [])
-                    else:
-                        values_str = (str(res) or "").strip()
-                except Exception:
-                    values_str = ""
-
-            if not values_str and imgs and vision_extract_values:
-                try:
-                    res = vision_extract_values(imgs[:1], caption_hint=hint, lang="ru")
-                except Exception:
-                    res = None
-                rows = (res or {}).get("data") or []
-                if rows:
-                    values_str = "\n".join([
-                        f"— {r.get('label')}: {r.get('value')}" + (f" {r.get('unit')}" if r.get('unit') else "")
-                        for r in rows[:25]
-                    ])
-
-            if not values_str:
-                # нет результата с картинок → пробуем точные числа из chart_data
-                try:
-                    num_norm = _num_norm_fig(str(c.get("num") or ""))
-                    if num_norm:
-                        row = _fetch_figure_row_by_num(uid, doc_id, num_norm)
-                        if row:
-                            cd, _, _ = _parse_chart_data(row["attrs"] if ("attrs" in row.keys()) else None)
-                            if cd:
-                                values_str = _format_chart_values(cd)
-                except Exception:
-                    pass
-
-            body = [x for x in [values_str] if x]
-            if vis_desc:
-                body.append("Краткое описание: " + vis_desc)
-            elif hint:
-                body.append("Из подписи: " + (hint or ""))
-
-            lines.append(f"**{disp}**\n\n" + "\n".join([b for b in body if b]))
-
-        all_lines = lines if sent_chart_block else (chart_lines + lines)
-        if not sent_media_before:
-            try:
-                await _send_media_from_cards(m, cards or [])
-            except Exception:
-                pass
-        await _send(m, "\n\n".join(all_lines))
-        try:
-            LAST_REF.setdefault(uid, {})["figure_nums"] = nums
-        except Exception:
-            pass
-        return True
-
-
-    # 3) форматирование карточек (описания и сообщения об отсутствии), плюс chart_data сверху
-    found_norm = {_num_norm_fig(c.get("num")) for c in (cards or []) if c.get("num")}
-    missing = [n for n in pending_nums if _num_norm_fig(n) not in found_norm]
-
-    parts: list[str] = []
-    for c in cards or []:
-        disp = c.get("display") or f"Рисунок {c.get('num') or ''}".strip()
-        page = (c.get("where") or {}).get("page")
-        hl = [h.strip() for h in (c.get("highlights") or []) if (h or "").strip()]
-        vis = (c.get("vision") or {})
-        vis_desc = (vis.get("description") or "").strip()
-        has_images = bool(c.get("images"))
-
-        header = f"**{disp}**" + (f" (стр. {page})" if page else "")
-        body_lines: list[str] = []
-
-        if verbosity == "brief":
-            if has_images and vis_desc:
-                body_lines.append(f"Краткое описание: {vis_desc}")
-            elif has_images:
-                body_lines.append("Рисунок плохого качества, не могу проанализировать.")
-            else:
-                body_lines.append("В тексте указан рисунок без прикреплённого изображения.")
-            if hl:
-                body_lines.append("Подпись/рядом в тексте: " + hl[0])
-                if len(hl) > 1:
-                    body_lines.append("Ещё: " + hl[1])
-
-        elif verbosity == "detailed":
-            if has_images and vis_desc:
-                body_lines.append("Что изображено: " + vis_desc)
-            elif has_images:
-                body_lines.append("Картинка есть, но качество низкое — описание затруднено.")
-            else:
-                body_lines.append("В тексте указан рисунок, файла изображения нет.")
-            if hl:
-                body_lines.append("Контекст/подписи:")
-                for h in hl[:4]:
-                    body_lines.append("— " + h)
-
-        else:
-            if has_images and vis_desc:
-                body_lines.append("Описание: " + vis_desc)
-            elif has_images:
-                body_lines.append("Рисунок плохого качества, не могу проанализировать.")
-            else:
-                body_lines.append("В тексте указан рисунок без прикреплённого изображения.")
-            if hl:
-                body_lines.append("Из подписи: " + hl[0])
-
-        if not body_lines:
-            body_lines.append("Описание недоступно.")
-
-        parts.append(header + "\n\n" + "\n".join(body_lines))
-
-    for n in missing:
-        parts.append(f"Данного рисунка {n} нет в работе.")
-
-    # если хоть что-то есть — добавим chart_data-блоки сверху и отправим
-    if chart_lines or parts:
-        all_parts = parts if sent_chart_block else (chart_lines + parts)
-        # финальная попытка показать изображения, если выше не отправляли
-        try:
-            await _send_media_from_cards(m, cards or [])
-        except Exception:
-            pass
-        await _send(m, "\n\n".join(all_parts))
-        try:
-            LAST_REF.setdefault(uid, {})["figure_nums"] = nums
-        except Exception:
-            pass
-        return True
-
-    return False
-
-
+    return True
 
 
 # -------------------------- САМОВОССТАНОВЛЕНИЕ ИНДЕКСА --------------------------
@@ -2137,7 +2232,12 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
     """
     facts: dict[str, object] = {"doc_id": doc_id, "owner_id": uid}
     # флаг «точные числа как в документе»
-    facts["exact_numbers"] = bool(intents.get("exact_numbers"))
+    exact = bool(intents.get("exact_numbers"))
+    # если явно просят конкретную таблицу(ы) — всегда работаем в режиме ТОЧНЫХ чисел
+    if intents.get("tables", {}).get("describe"):
+        exact = True
+    facts["exact_numbers"] = exact
+
 
     # ----- Таблицы -----
     if intents["tables"]["want"]:
@@ -2346,10 +2446,15 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
                     lines = []
                     for c in cards:
                         disp = c.get("display") or "Рисунок"
-                        vis  = (c.get("vision") or {}).get("description", "")
+                        vis  = (c.get("vision") or {}).get("description", "") or ""
+                        vis_clean = vis.strip()
+                        low_vis = vis_clean.lower()
+                        if ("описание не распознано" in low_vis
+                                or "содержимое изображения" in low_vis):
+                            vis_clean = ""
                         hint = "; ".join([h for h in (c.get("highlights") or []) if h])
-                        if vis:
-                            lines.append(f"{disp}: {vis}")
+                        if vis_clean:
+                            lines.append(f"{disp}: {vis_clean}")
                         elif hint:
                             lines.append(f"{disp}: {hint}")
                         else:
@@ -2357,6 +2462,7 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
                     figs_block["describe_lines"] = lines[:25]
             except Exception as e:
                 figs_block["describe_lines"] = [f"Не удалось описать рисунки: {e}"]
+
 
         facts["figures"] = figs_block
 
@@ -2484,7 +2590,7 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
                             chart_lines.append(_format_chart_values(cd_list))
 
                 if chart_lines:
-                    vision_block = "\n".join(["[Из изображений/диаграмм: точные значения]"] + chart_lines[:3])
+                    vision_block = "\n".join(chart_lines[:3])
                 else:
                     # 2) иначе — отправляем 1–3 картинки в vision_extract_values
                     img_paths = _pick_images_from_hits(hits_v, limit=getattr(Cfg, "VISION_MAX_IMAGES_PER_REQUEST", 3))
@@ -2494,9 +2600,12 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
                         rows = (res or {}).get("data") or []
                         if rows:
                             vision_block = "\n".join(
-                                ["[Из изображений/диаграмм]"] +
+                                ["[Text on image]"] +
                                 _pairs_to_bullets(rows).splitlines()
                             )
+                        elif FIG_STRICT:
+                            # нет надёжных чисел с картинки — явно помечаем
+                            vision_block = "[No precise data]"
 
             if vision_block:
                 prev = facts.get("general_ctx") or ""
@@ -2792,11 +2901,13 @@ async def handle_doc(m: types.Message):
 
     # NEW: построить индекс рисунков из исходного файла и закэшировать (старый путь)
     try:
-        FIG_INDEX[doc_id] = fig_index_document(path)
+        if fig_index_document is not None:
+            FIG_INDEX[doc_id] = fig_index_document(path)
     except Exception as e:
         logging.exception("figures indexing failed: %s", e)
 
-    # NEW: построить ЕДИНЫЙ OOXML-индекс (главы/рисунки/таблицы/источники) без LibreOffice
+
+        # NEW: построить ЕДИНЫЙ OOXML-индекс (главы/рисунки/таблицы/источники) без LibreOffice
     # NEW: построить ЕДИНЫЙ OOXML-индекс (главы/рисунки/таблицы/источники) без LibreOffice
     try:
         idx_oox = oox_build_index(path)
@@ -2813,21 +2924,27 @@ async def handle_doc(m: types.Message):
 
 
     # 5) READY: сообщаем и обрабатываем ...
-    await _send(m, (f"Этот файл уже был загружен как документ #{doc_id}. " if result.get("reused") else "") + Cfg.MSG_READY)
-
+    await _send(
+        m,
+        (f"Этот файл уже был загружен как документ #{doc_id}. " if result.get("reused") else "") + Cfg.MSG_READY
+    )
 
     caption = (m.caption or "").strip()
     if caption:
         await respond_with_answer(m, uid, doc_id, caption)
 
-    # авто-дренаж очереди ожидания
+    # авто-дренаж очереди ожидания (без дублей одинаковых вопросов)
     try:
         queued = dequeue_all_pending_queries(uid)
         for item in queued:
             q = (item.get("text") or "").strip()
-            if q:
-                await respond_with_answer(m, uid, doc_id, q)
-                await asyncio.sleep(0)  # не блокируем цикл
+            if not q:
+                continue
+            # если вопрос из очереди совпадает с подписью к файлу — не отвечаем второй раз
+            if caption and q.strip() == caption:
+                continue
+            await respond_with_answer(m, uid, doc_id, q)
+            await asyncio.sleep(0)  # не блокируем цикл
     except Exception as e:
         logging.exception("drain pending queue failed: %s", e)
 
@@ -2849,11 +2966,6 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
 
     if await _maybe_run_gost(m, uid, doc_id, q_text):
         return
-
-    # РАНЬШЕ, чем detect_intents:
-    if FIG_NUM_RE.search(q_text or ""):
-        if await _answer_figure_query(m, uid, doc_id, q_text, verbosity=_detect_verbosity(q_text)):
-            return
 
 
     # РАНО в respond_with_answer, до detect_intents:
@@ -2900,7 +3012,13 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
                     # фолбэк — старый summarizer
                     text_block = ""
                 if text_block:
-                    lines.append(f"**{disp}**\n\n{text_block}")
+                    # это текст по изображению (OCR/описание)
+                    lines.append(f"[Text on image] **{disp}**\n\n{text_block}")
+                else:
+                    # строгий режим — явно говорим, что точных данных нет
+                    if FIG_STRICT:
+                        lines.append(f"[No precise data] **{disp}**")
+
 
         suffix = (f"\n\nПоказана первая партия из {len(batch)} / {total}." if total > len(batch) else "")
         if lines:
@@ -2981,15 +3099,30 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
         verbosity = _detect_verbosity(q_text)
         ctx = _section_context(uid, doc_id, sec, max_chars=9000)
         if ctx:
+            base_sys = (
+                "Ты репетитор по ВКР. Ниже — контекст ТОЛЬКО по одному пункту/главе диплома.\n"
+                "Отвечай строго по этому тексту: не добавляй внешних фактов, не придумывай новых положений "
+                "и не пересказывай то, чего в фрагменте нет. Если информации недостаточно, честно напиши, "
+                "что данных в этом пункте не хватает для полного ответа."
+            )
             if verbosity == "brief":
-                sys_prompt = ("Ты репетитор по ВКР. Ниже — контекст по указанному пункту. Нужна КРАТКАЯ выжимка.")
-                user_prompt = (f"Сделай краткую выжимку по пункту {sec}. {_verbosity_addendum('brief')}")
+                sys_prompt = base_sys + " Нужна КРАТКАЯ выжимка."
+                user_prompt = (
+                    f"Вопрос пользователя: {q_text}\n\n"
+                    f"Сделай краткую выжимку по пункту {sec}. {_verbosity_addendum('brief')}"
+                )
             elif verbosity == "detailed":
-                sys_prompt = ("Ты репетитор по ВКР. Ниже — контекст по указанному пункту. Нужен ПОДРОБНЫЙ разбор.")
-                user_prompt = (f"Сделай подробный разбор по пункту {sec}. {_verbosity_addendum('detailed')}")
+                sys_prompt = base_sys + " Нужен ПОДРОБНЫЙ разбор."
+                user_prompt = (
+                    f"Вопрос пользователя: {q_text}\n\n"
+                    f"Сделай подробный разбор по пункту {sec}. {_verbosity_addendum('detailed')}"
+                )
             else:
-                sys_prompt = ("Ты репетитор по ВКР. Ниже — контекст по указанному пункту. Ответь по делу, без внешних фактов.")
-                user_prompt = (f"Ответь по пункту {sec}. {_verbosity_addendum('normal')}")
+                sys_prompt = base_sys + " Ответь по делу, без лишних рассуждений."
+                user_prompt = (
+                    f"Вопрос пользователя: {q_text}\n\n"
+                    f"Ответь по пункту {sec}. {_verbosity_addendum('normal')}"
+                )
 
             messages = [
                 {"role": "system", "content": sys_prompt},
@@ -3158,7 +3291,7 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
     # NEW: прямой мультимодальный ответ, если есть релевантные картинки из документа
     # (не ломает старую логику: если не получилось/нет картинок — идём в generate_answer)
     try:
-        if intents.get("general_question") and Cfg.vision_active():
+        if intents.get("general_question") and getattr(Cfg, "vision_active", lambda: False)():
             # подтянем релевантные чанк-хиты и выберем 1–3 файла-изображения
             hits_v = retrieve(uid, doc_id, intents["general_question"], top_k=10) or []
             img_paths = _pick_images_from_hits(hits_v, limit=getattr(Cfg, "VISION_MAX_IMAGES_PER_REQUEST", 3))

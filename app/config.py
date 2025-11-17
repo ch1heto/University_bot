@@ -19,11 +19,13 @@ def _env_bool(name: str, default: bool = False) -> bool:
         return default
     return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
 
+
 def _env_int(name: str, default: int) -> int:
     try:
         return int(str(os.getenv(name, str(default))).strip())
     except Exception:
         return default
+
 
 def _env_float(name: str, default: float) -> float:
     try:
@@ -31,9 +33,21 @@ def _env_float(name: str, default: float) -> float:
     except Exception:
         return default
 
+
 def _env_str(name: str, default: str) -> str:
     v = os.getenv(name)
     return default if v is None else str(v).strip()
+
+
+def _env_list(name: str, default: list[str] | None = None) -> list[str]:
+    """
+    CSV → list[str], фильтрация пустых элементов и пробелов.
+    """
+    raw = os.getenv(name, "")
+    items = [x.strip() for x in str(raw).split(",") if x and x.strip()]
+    if items:
+        return items
+    return list(default or [])
 
 
 # --- FSM состояния обработки документа (для детерминированной оркестрации) ---
@@ -86,7 +100,13 @@ class Cfg:
     # =========================
     # Включает подачу изображений напрямую в чат-модель (b64/url/file).
     VISION_ENABLED: bool = _env_bool("VISION_ENABLED", True)
-    VISION_LANG: str = _env_str("VISION_LANG", "ru")  # язык ответов vision-пайплайна
+
+    # Базовый язык ответов vision-пайплайна (используется как запасной)
+    VISION_LANG: str = _env_str("VISION_LANG", "ru")
+
+    # Доп. список языков через запятую (для мультиязычных картинок).
+    # Если задан, используется преимущественно (склеивается в "ru,en" и т.п.).
+    VISION_LANGS: list[str] = _env_list("VISION_LANGS", default=[VISION_LANG, "en"])
 
     # Как передавать изображение в модель: "base64" | "url" | "file"
     VISION_IMAGE_TRANSPORT: str = _env_str("VISION_IMAGE_TRANSPORT", "base64").lower()
@@ -104,7 +124,7 @@ class Cfg:
     # Разрешённые расширения изображений (через запятую)
     _VISION_ACCEPT_EXT_RAW = _env_str(
         "VISION_ACCEPT_EXT",
-        "png,jpg,jpeg,gif,webp,bmp,tiff,tif"
+        "png,jpg,jpeg,gif,webp,bmp,tiff,tif,svg"
     )
     VISION_ACCEPT_EXT: set[str] = {e.strip().lower().lstrip(".") for e in _VISION_ACCEPT_EXT_RAW.split(",") if e.strip()}
 
@@ -117,6 +137,7 @@ class Cfg:
         "bmp": "image/bmp",
         "tif": "image/tiff",
         "tiff": "image/tiff",
+        "svg": "image/svg+xml",
     }
 
     # Таймаут запросов c изображениями больше, чем у обычного чата
@@ -138,12 +159,12 @@ class Cfg:
 
     # Шаг 2: извлечение значений (Extract)
     VISION_EXTRACT_VALUES_ENABLED: bool = _env_bool("VISION_EXTRACT_VALUES_ENABLED", True)
-    VISION_EXTRACT_CONF_MIN: float = _env_float("VISION_EXTRACT_CONF_MIN", 0.70)  # нижний порог уверенности
+    VISION_EXTRACT_CONF_MIN: float = _env_float("VISION_EXTRACT_CONF_MIN", 0.92)  # строгий порог уверенности
     VISION_EXTRACT_MAX_ITEMS: int = _env_int("VISION_EXTRACT_MAX_ITEMS", 30)
 
     # Пост-валидации и форматирование чисел
     VISION_PIE_SUM_TARGET: float = _env_float("VISION_PIE_SUM_TARGET", 100.0)
-    VISION_PIE_SUM_TOLERANCE_PP: float = _env_float("VISION_PIE_SUM_TOLERANCE_PP", 5.0)  # допуск в п.п.
+    VISION_PIE_SUM_TOLERANCE_PP: float = _env_float("VISION_PIE_SUM_TOLERANCE_PP", 1.5)  # строгий допуск в п.п.
     VISION_PERCENT_DECIMALS: int = _env_int("VISION_PERCENT_DECIMALS", 1)
     VISION_NUMBER_GROUPING: bool = _env_bool("VISION_NUMBER_GROUPING", True)  # 12 300 вместо 12300
 
@@ -164,22 +185,23 @@ class Cfg:
     FIG_DOCX_PDF_ALWAYS: bool = _env_bool("DOCX_PDF_ALWAYS", False)
 
     FIG_PDF_CAPTION_MAX_DISTANCE_PX: int = _env_int("PDF_CAPTION_MAX_DISTANCE_PX", 300)
-    FIG_PDF_MIN_IMAGE_AREA: int = _env_int("PDF_MIN_IMAGE_AREA", 20000)
+    FIG_PDF_MIN_IMAGE_AREA: int = _env_int("FIG_PDF_MIN_IMAGE_AREA", 20000)
 
     # Рендер векторов (PyMuPDF get_drawings → clip → PNG)
     FIG_PDF_VECTOR_RASTERIZE: bool = _env_bool("PDF_VECTOR_RASTERIZE", True)
     FIG_PDF_VECTOR_DPI: int = _env_int("PDF_VECTOR_DPI", 360)
-    FIG_PDF_VECTOR_MIN_WIDTH_PX: int = _env_int("PDF_VECTOR_MIN_WIDTH_PX", 1200)
-    FIG_PDF_VECTOR_PAD_PX: int = _env_int("PDF_VECTOR_PAD_PX", 16)
-    FIG_PDF_VECTOR_MAX_DPI: int = _env_int("PDF_VECTOR_MAX_DPI", 600)
+    FIG_PDF_VECTOR_MIN_WIDTH_PX: int = _env_int("FIG_PDF_VECTOR_MIN_WIDTH_PX", 1200)
+    FIG_PDF_VECTOR_PAD_PX: int = _env_int("FIG_PDF_VECTOR_PAD_PX", 16)
+    FIG_PDF_VECTOR_MAX_DPI: int = _env_int("FIG_PDF_VECTOR_MAX_DPI", 600)
 
     FIG_CLEANUP_ON_NEW_DOC: bool = _env_bool("FIG_CLEANUP_ON_NEW_DOC", True)
 
     # ВКЛЮЧЕНО ДЛЯ ШАГА «Структурированный парсинг + OCR + кеш по хэшу»
+    # Для работы без pytesseract по умолчанию OCR отключён.
     SAVE_STRUCT_INDEX: bool = _env_bool("SAVE_STRUCT_INDEX", True)
-    OCR_ENABLED: bool = _env_bool("OCR_ENABLED", True)
+    OCR_ENABLED: bool = _env_bool("OCR_ENABLED", False)
     OCR_LANGS: str = _env_str("OCR_LANGS", "rus+eng")
-    OCR_ENGINE: str = _env_str("OCR_ENGINE", "tesseract")
+    OCR_ENGINE: str = _env_str("OCR_ENGINE", "none")  # 'none' | 'tesseract' и др.
     OCR_TESSERACT_CMD: str = _env_str("OCR_TESSERACT_CMD", "")
 
     # --- FULLREAD режим ---
@@ -332,6 +354,54 @@ class Cfg:
     ANALYZER_ENABLE_CACHE: bool = _env_bool("ANALYZER_ENABLE_CACHE", True)
     ANALYZER_CACHE_TTL_SEC: int = _env_int("ANALYZER_CACHE_TTL_SEC", 7 * 24 * 60 * 60)
 
+    # «Строгий» режим сверки единиц/суммы процентов для круговых диаграмм (используется в vision_analyzer v4)
+    FIG_STRICT: bool = _env_bool("FIG_STRICT", True)
+
+    # --- Строгий режим exact-or-fail / источники истины / геометрические декодеры ---
+    ANALYZER_EXACT_OR_FAIL: bool = _env_bool("ANALYZER_EXACT_OR_FAIL", True)
+    CHART_XML_IS_GROUND_TRUTH: bool = _env_bool("CHART_XML_IS_GROUND_TRUTH", True)
+    VISION_PIE_NORMALIZE_ENABLE: bool = _env_bool("VISION_PIE_NORMALIZE_ENABLE", True)
+    VISION_EXTRACT_REQUIRE_UNITS: bool = _env_bool("VISION_EXTRACT_REQUIRE_UNITS", True)
+
+    VISION_GEOM_DECODERS_ENABLED: bool = _env_bool("VISION_GEOM_DECODERS_ENABLED", True)
+    VISION_GEOM_DECODERS: list[str] = _env_list(
+        "VISION_GEOM_DECODERS",
+        default=["stacked_bar", "pie", "bar", "line"]
+    )
+    VISION_UNCERTAINTY_DELTA_PP_MAX: float = _env_float("VISION_UNCERTAINTY_DELTA_PP_MAX", 2.0)
+    VISION_GEOM_COLOR_K: int = _env_int("VISION_GEOM_COLOR_K", 8)
+    VISION_GEOM_MIN_BAR_WIDTH_PX: int = _env_int("VISION_GEOM_MIN_BAR_WIDTH_PX", 6)
+
+    # --- Универсальный анализатор рисунков (без обязательного OCR) ---
+    FIG_ANALYZER_ENABLED: bool = _env_bool("FIG_ANALYZER_ENABLED", True)
+    FIG_ANALYZER_REQUIRE_EXACT_NUMBERS: bool = _env_bool("FIG_ANALYZER_REQUIRE_EXACT_NUMBERS", True)
+    FIG_ANALYZER_REQUIRE_EXACT_TEXT: bool = _env_bool("FIG_ANALYZER_REQUIRE_EXACT_TEXT", True)
+
+    # Допустимые типы рисунков (используются в vision_analyzer / figures)
+    FIG_ANALYZER_ALLOWED_KINDS: tuple[str, ...] = (
+        "bar",
+        "stacked_bar",
+        "pie",
+        "line",
+        "org_chart",
+        "flow_diagram",
+        "text_blocks",
+        "table_image",
+        "photo",
+        "other",
+    )
+    # Типы, для которых ожидаются точные числа
+    FIG_ANALYZER_NUMERIC_KINDS: tuple[str, ...] = (
+        "bar",
+        "stacked_bar",
+        "pie",
+        "line",
+    )
+    FIG_ANALYZER_KINDS: list[str] = _env_list(
+        "FIG_ANALYZER_KINDS",
+        default=list(FIG_ANALYZER_ALLOWED_KINDS),
+    )
+
     # ----------------------------- Helpers -----------------------------
 
     @classmethod
@@ -389,6 +459,28 @@ class Cfg:
                 raise RuntimeError("VISION_ACCEPT_EXT не должен быть пустым.")
             if not (0.0 <= cls.VISION_EXTRACT_CONF_MIN <= 1.0):
                 raise RuntimeError("VISION_EXTRACT_CONF_MIN должен быть в диапазоне [0.0, 1.0].")
+            if not (cls.VISION_LANGS and all(isinstance(x, str) and x for x in cls.VISION_LANGS)):
+                raise RuntimeError("VISION_LANGS не должен быть пустым.")
+
+        # Строгий режим: жёсткие пороги
+        if cls.ANALYZER_EXACT_OR_FAIL:
+            if not (0.9 <= cls.VISION_EXTRACT_CONF_MIN <= 1.0):
+                raise RuntimeError("В strict-режиме VISION_EXTRACT_CONF_MIN должен быть ≥ 0.90.")
+            if cls.VISION_PIE_SUM_TOLERANCE_PP > 2.0:
+                raise RuntimeError("В strict-режиме VISION_PIE_SUM_TОЛЕРАНСЕ_PP должен быть ≤ 2.0.")
+
+        # Геометрические декодеры
+        if cls.VISION_GEOM_DECODERS_ENABLED:
+            allowed_decoders = {"stacked_bar", "pie", "bar", "line"}
+            if not cls.VISION_GEOM_DECODERS:
+                raise RuntimeError("VISION_GEOM_DECODERS_ENABLED включён, но список VISION_GEOM_DECODERS пуст.")
+            invalid = [d for d in cls.VISION_GEOM_DECODERS if d not in allowed_decoders]
+            if invalid:
+                raise RuntimeError(f"VISION_GEOM_DECODERS содержит неподдерживаемые значения: {', '.join(invalid)}.")
+            if cls.VISION_GEOM_COLOR_K < 2:
+                raise RuntimeError("VISION_GEOM_COLOR_K должен быть ≥ 2.")
+            if cls.VISION_GEOM_MIN_BAR_WIDTH_PX < 1:
+                raise RuntimeError("VISION_GEOM_MIN_BAR_WIDTH_PX должен быть ≥ 1.")
 
         # Figures sanity
         if cls.FIG_MEDIA_LIMIT < 1:
@@ -398,9 +490,21 @@ class Cfg:
         if not Path(cls.FIG_CACHE_DIR).exists():
             raise RuntimeError(f"Директория FIG_CACHE_DIR='{cls.FIG_CACHE_DIR}' не существует (должна была создаться).")
 
+        # Универсальный анализатор рисунков
+        if cls.FIG_ANALYZER_ENABLED:
+            if not cls.FIG_ANALYZER_KINDS:
+                raise RuntimeError("FIG_ANALYZER_KINDS не должен быть пустым при FIG_ANALYZER_ENABLED.")
+            invalid_kinds = [k for k in cls.FIG_ANALYZER_KINDS if k not in cls.FIG_ANALYZER_ALLOWED_KINDS]
+            if invalid_kinds:
+                raise RuntimeError(
+                    "FIG_ANALYZER_KINDS содержит неподдерживаемые значения: "
+                    + ", ".join(sorted(invalid_kinds))
+                    + "."
+                )
+
         # Backward-compat alias (если где-то обращались к старому опечатанному имени)
         # MSG_NOT_READY_QUEУED — с русской буквой 'У'
-        setattr(cls, "MSG_NOT_READY_QUEУED", cls.MSG_NOT_READY_QUEUED)
+        setattr(cls, "MSG_NOT_READY_QUEУЕД", cls.MSG_NOT_READY_QUEUED)
 
     @classmethod
     def fullread_enabled(cls) -> bool:
@@ -426,3 +530,22 @@ class Cfg:
         if not ext:
             return False
         return ext.lower().lstrip(".") in cls.VISION_ACCEPT_EXT
+
+    # -------- helpers для универсального анализатора рисунков --------
+
+    @classmethod
+    def is_numeric_figure_kind(cls, kind: str | None) -> bool:
+        """True, если тип рисунка относится к диаграммам с точными числами."""
+        if not kind:
+            return False
+        return kind in cls.FIG_ANALYZER_NUMERIC_KINDS
+
+    @classmethod
+    def is_textual_figure_kind(cls, kind: str | None) -> bool:
+        """
+        True, если тип рисунка текстовый/структурный (оргструктура, схема, просто текст на картинке)
+        и от него не ожидаются точные числовые ряды.
+        """
+        if not kind:
+            return False
+        return kind in cls.FIG_ANALYZER_ALLOWED_KINDS and kind not in cls.FIG_ANALYZER_NUMERIC_KINDS

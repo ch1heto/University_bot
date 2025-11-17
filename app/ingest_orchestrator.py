@@ -3,16 +3,14 @@ from __future__ import annotations
 
 import os
 import re
-import io
 import uuid
 import json
-import time
 import hashlib
 from typing import List, Dict, Any, Optional, Tuple, Callable
 from copy import deepcopy
 from pathlib import Path
 
-from .config import Cfg, ProcessingState
+from .config import Cfg, ProcessingState  # ProcessingState импортирован для внешней совместимости
 from .db import (
     find_existing_document,
     insert_document,
@@ -53,14 +51,17 @@ _TABLE_CAP_RE = re.compile(
     r"(?i)\bтаблица\s+([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)\b(?:\s*[—\-–:]\s*(.+))?"
 )
 
-# Подписи к рисункам: «Рисунок 3», «Рис. 2.1 — ...», «Figure 1.2 ...»
+# Подписи к рисункам/диаграммам: «Рис. 2.1», «Диаграмма 3», «График 1.2», «Figure 1.2», «Chart 4» и т.п.
 _FIG_CAP_RE = re.compile(
-    r"(?i)\b(?:рис(?:\.|унок)?|figure|fig\.?)\s*(?:№\s*)?([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)\b(?:\s*[—\-–:]\s*(.+))?"
+    r"(?i)\b(?:рис(?:\.|унок)?|диаграмма|график|схема|figure|fig\.?|chart|graph|diagram|plot)\s*(?:№\s*)?"
+    r"([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)\b(?:\s*[—\-–:]\s*(.+))?"
 )
 
 # Строки библиографии: "[12] Текст..." или "12) Текст..." или "12. Текст..."
 _REF_LINE_RE = re.compile(r"^\s*(?:\[(\d+)\]|(\d{1,3})[.)])\s+(.+)$")
 
+# Версия логики подготовки секций (для инвалидации кеша)
+_PREPARED_SECTIONS_VERSION = 3
 
 # ----------------------------- УТИЛИТЫ ОРКЕСТРАЦИИ -----------------------------
 
@@ -71,10 +72,7 @@ class IngestError(Exception):
 def _file_sha256(path: str, chunk: int = 1024 * 1024) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
-        while True:
-            b = f.read(chunk)
-            if not b:
-                break
+        for b in iter(lambda: f.read(chunk), b""):
             h.update(b)
     return h.hexdigest()
 
@@ -87,12 +85,12 @@ def _detect_kind(path: str, fallback: str = "doc") -> str:
         return "pdf"
     if ext in {".txt", ".md"}:
         return "txt"
-    if ext in {".doc"}:
+    if ext in {".doc", ".rtf"}:
         return "doc"
     return fallback
 
 
-# ----------------------------- ОБОГАЩЕНИЕ (оставляем из вашего файла) -----------------------------
+# ----------------------------- ОБОГАЩЕНИЕ -----------------------------
 
 def _norm_num(s: Optional[str]) -> Optional[str]:
     if not s:
@@ -112,7 +110,7 @@ def _ensure_attrs(d: Dict[str, Any]) -> Dict[str, Any]:
 
 def _is_reference_section_name(section_path: str) -> bool:
     sp = (section_path or "").lower()
-    return any(k in sp for k in ("источник", "литератур", "библиограф", "reference", "references", "bibliograph"))
+    return any(k in sp for k in ("источник", "источники", "литератур", "библиограф", "reference", "references", "bibliograph"))
 
 def _base_table_name(section_path: str) -> str:
     """
@@ -133,6 +131,27 @@ def _parse_figure_caption_from(path_or_text: str) -> Tuple[Optional[str], Option
     if not m:
         return (None, None)
     return _norm_num(m.group(1)), (m.group(2) or "").strip() or None
+
+def _classify_chart_from_tail(tail: str) -> Tuple[str, Optional[str]]:
+    """
+    Возвращает (figure_kind, chart_type_hint) по тексту хвоста подписи.
+    figure_kind: 'chart' | 'figure'
+    chart_type_hint: 'pie'|'bar'|'line'|'stacked_bar'|'histogram'|None
+    """
+    t = (tail or "").lower()
+    if any(k in t for k in ("кругов", "кольцев", "pie", "donut", "ring")):
+        return "chart", "pie"
+    if any(k in t for k in ("столбч", "bar", "column", "колонн", "diagram bar", "bar chart")):
+        return "chart", "bar"
+    if any(k in t for k in ("линейн", "line", "trend", "time series")):
+        return "chart", "line"
+    if any(k in t for k in ("stacked", "составн", "100%", "100 %", "накоп", "stacked bar")):
+        return "chart", "stacked_bar"
+    if any(k in t for k in ("гистограм", "histogram", "freq", "распределен")):
+        return "chart", "histogram"
+    if any(w in t for w in ("диаграм", "график", "chart", "graph", "diagram", "plot")):
+        return "chart", None
+    return "figure", None
 
 
 def _enrich_tables(sections: List[Dict[str, Any]]) -> None:
@@ -187,15 +206,18 @@ def _enrich_tables(sections: List[Dict[str, Any]]) -> None:
 
 def _enrich_figures(sections: List[Dict[str, Any]]) -> None:
     """
-    Проставляет для фигуры attrs:
+    Проставляет для figure/diagram атрибуты:
       - caption_num
       - caption_tail
+      - figure_kind: 'chart' | 'figure'
+      - chart_type_hint: 'pie'|'bar'|'line'|'stacked_bar'|'histogram'|None
+      - flags: включает 'table_like_image' по эвристике
     """
     for sec in sections:
         et = (sec.get("element_type") or "").lower()
         txt = sec.get("text") or ""
         sp = sec.get("section_path") or ""
-        if et != "figure" and not (txt.startswith("[Рисунок]") or re.search(r"(?i)\bрис\.", sp)):
+        if et != "figure" and not (txt.startswith("[Рисунок]") or re.search(r"(?i)\bрис\.", sp) or re.search(r"(?i)\b(диаграмма|график|chart|figure|diagram|plot)\b", sp)):
             continue
 
         num, tail = _parse_figure_caption_from(sp or txt)
@@ -204,6 +226,11 @@ def _enrich_figures(sections: List[Dict[str, Any]]) -> None:
             attrs["caption_num"] = num
         if tail and not attrs.get("caption_tail"):
             attrs["caption_tail"] = tail
+
+        fk, hint = _classify_chart_from_tail(tail or "")
+        attrs.setdefault("figure_kind", fk)
+        if hint and not attrs.get("chart_type_hint"):
+            attrs["chart_type_hint"] = hint
 
         if is_table_image_section(sec):
             attrs.setdefault("flags", [])
@@ -214,7 +241,7 @@ def _enrich_figures(sections: List[Dict[str, Any]]) -> None:
 def _split_references_block(sections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Если обнаружен «сплошной» блок списка литературы (один-два больших абзаца),
-    разрезаем его на отдельные элементы element_type='reference'.
+    разрезаем его на отдельные элементы element_type='reference' (поддержка многострочных источников).
     Если в документе уже есть отдельные reference – ничего не делаем.
     Возвращаем НОВЫЙ список секций (оригинал не мутируем).
     """
@@ -233,24 +260,39 @@ def _split_references_block(sections: List[Dict[str, Any]]) -> List[Dict[str, An
 
         lines = [ln for ln in txt.splitlines() if ln.strip()]
         found_any = False
+        current = None  # {"idx": "...", "body": ["..."]}
 
-        for ln in lines:
-            m = _REF_LINE_RE.match(ln)
-            if not m:
-                continue
-            found_any = True
-            idx = m.group(1) or m.group(2)
-            body = m.group(3).strip()
+        def _flush():
+            nonlocal current, out, changed
+            if not current:
+                return
             item = deepcopy(sec)
-            item["text"] = body
+            item["text"] = " ".join(current["body"]).strip()
             item["element_type"] = "reference"
             attrs = _ensure_attrs(item)
             try:
-                attrs["ref_index"] = int(idx)
+                attrs["ref_index"] = int(current["idx"])
             except Exception:
-                attrs["ref_index"] = idx
+                attrs["ref_index"] = current["idx"]
+            attrs.setdefault("source", "split_block")
             out.append(item)
+            current = None
 
+        for ln in lines:
+            m = _REF_LINE_RE.match(ln)
+            if m:
+                # новая запись
+                _flush()
+                found_any = True
+                idx = (m.group(1) or m.group(2) or "").strip()
+                body = (m.group(3) or "").strip()
+                current = {"idx": idx, "body": [body] if body else []}
+            else:
+                # продолжение предыдущей записи
+                if current:
+                    current["body"].append(ln.strip())
+
+        _flush()
         if found_any:
             changed = True
         else:
@@ -296,7 +338,7 @@ def _cache_dir() -> Path:
     return d
 
 def _cache_path_for_sha(sha256: str) -> Path:
-    return _cache_dir() / f"{sha256}.json"
+    return _cache_dir() / f"{sha256}.v{_PREPARED_SECTIONS_VERSION}.json"
 
 def _load_cached_sections(sha256: str) -> Optional[List[Dict[str, Any]]]:
     p = _cache_path_for_sha(sha256)
@@ -461,11 +503,21 @@ def ingest_document(
             _save_cached_sections(sha256, sections)
 
         # 5) Запускаем индексатор пользователя (опционально)
+                # 5) Запускаем индексатор пользователя (опционально)
+        has_chart_data = any(
+            isinstance(sec.get("attrs"), dict) and (
+                "chart_data" in sec["attrs"] or "chart_matrix" in sec["attrs"]
+            )
+            for sec in (sections or [])
+        )
+
         index_result: Dict[str, Any] = {
             "sections_count": len(sections or []),
             "chunks_count": None,
             "prepared_sections_cache": str(cache_path),
             "cache_used": cache_used,
+            # новый флаг: в подготовленных секциях есть данные диаграмм
+            "has_chart_data": has_chart_data,
         }
 
         if indexer_fn:
@@ -473,6 +525,7 @@ def ingest_document(
             user_idx_res = indexer_fn(doc_id, file_path, resolved_kind) or {}
             # негрубо смёржим мета
             index_result.update({k: v for k, v in user_idx_res.items() if k not in index_result or v is not None})
+
 
         # 6) Фиксируем версию индексатора и помечаем READY
         set_document_indexer_version(doc_id)

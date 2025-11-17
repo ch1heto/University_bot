@@ -621,6 +621,28 @@ def _vision_messages(
             return ""
 
 
+def _norm_unit(u: Optional[str]) -> str:
+    t = (u or "").strip().lower()
+    if t in {"%", "percent", "perc", "pct"}:
+        return "%"
+    if t in {"‰", "permil", "per mille"}:
+        return "‰"
+    if t in {"pp", "п.п.", "пп"}:
+        return "п.п."
+    if t in {"pcs", "шт", "штук", "ед", "units", "unit"}:
+        return "шт"
+    if t in {"rub", "₽", "руб", "руб.", "р", "р."}:
+        return "₽"
+    if t in {"eur", "€", "евро"}:
+        return "€"
+    if t in {"usd", "$", "доллар", "долл."}:
+        return "$"
+    if t in {"тыс", "тыс.", "k"}:
+        return "тыс."
+    if t in {"млн", "млн.", "mln", "m"}:
+        return "млн"
+    return t
+
 
 def vision_describe(
     image_or_images: Union[str, List[str]],
@@ -669,10 +691,9 @@ def vision_describe(
         _VISION_CACHE[cache_key] = disk
         return disk
 
-    # Языковая подсказка
-    # Шаблон промпта (RU/EN auto)
+    # Шаблон промпта (RU/EN)
     tmpl = build_describe_prompt(
-        caption=None,                 # здесь подпись/контекст при желании можно передать снаружи
+        caption=None,
         context=None,
         lang=lang,
         sentences_min=Cfg.VISION_DESCRIBE_SENTENCES_MIN,
@@ -691,9 +712,8 @@ def vision_describe(
         system_hint=(system_hint or tmpl["system"]),
         temperature=temperature,
         max_tokens=max_tokens,
-        want_tags=Cfg.VISION_JSON_STRICT,  # принудительно просим JSON
+        want_tags=Cfg.VISION_JSON_STRICT,  # просим JSON
     )
-
 
     # Стараемся распарсить JSON; если не получилось — используем как есть (текст модели)
     desc: str = ""
@@ -720,6 +740,7 @@ def vision_describe(
     _VISION_CACHE[cache_key] = res
     _vcache_put(cache_key, res)
     return res
+
 
 def vision_describe_many(
     images: List[str],
@@ -768,7 +789,7 @@ def vision_extract_values(
         "units": {"x":"...","y":"..."},
         "axes": {"x_labels":["..."],"y_labels":["..."]},
         "legend": ["..."],
-        "data": [{"label":"...","series":"optional","value":"...","unit":"optional"}],
+        "data": [{"label":"...","series":"optional","value":"...","unit":"optional","conf":0.0..1.0}],
         "raw_text": ["..."],
         "warnings": ["..."]
       }
@@ -854,8 +875,7 @@ def vision_extract_values(
         want_tags=Cfg.VISION_JSON_STRICT,  # всегда требуем JSON-объект
     )
 
-
-    # Парсинг JSON
+    # Парсинг JSON (устойчивый)
     def _parse_first_json(text: str) -> Optional[Dict[str, Any]]:
         if not text:
             return None
@@ -879,7 +899,7 @@ def vision_extract_values(
         _vcache_put(cache_key, res)
         return res
 
-    # Мини-очистка: приводим поля к ожидаемым типам
+    # ----------------- НОРМАЛИЗАЦИЯ И ГАРАНТИИ ПОЛЕЙ -----------------
     try:
         obj.setdefault("type", "other")
         obj.setdefault("units", {})
@@ -888,23 +908,79 @@ def vision_extract_values(
         obj.setdefault("data", [])
         obj.setdefault("raw_text", [])
         obj.setdefault("warnings", [])
-        # нормализуем строки
+
+        # Легенда — просто список строк
         if isinstance(obj.get("legend"), list):
             obj["legend"] = [str(x).strip() for x in obj["legend"] if str(x).strip()]
-        if isinstance(obj.get("data"), list):
-            norm = []
-            for it in obj["data"]:
-                if not isinstance(it, dict):
-                    continue
-                norm.append({
-                    "label": str(it.get("label") or "").strip(),
-                    "series": (str(it.get("series")).strip() if it.get("series") is not None else ""),
-                    "value": str(it.get("value") or "").strip(),
-                    "unit": (str(it.get("unit")).strip() if it.get("unit") is not None else ""),
-                })
-            obj["data"] = norm
-    except Exception:
-        pass
+
+        # Нормализуем элементы данных: label/series/value/unit/conf
+        norm_rows: List[Dict[str, Any]] = []
+        rows = obj.get("data") if isinstance(obj.get("data"), list) else []
+        for it in rows:
+            if not isinstance(it, dict):
+                continue
+            label = str(it.get("label") or "").strip()
+            series = str(it.get("series")).strip() if it.get("series") is not None else ""
+            value_raw = it.get("value")
+            unit_raw = it.get("unit")
+            conf_raw = it.get("conf", it.get("confidence", it.get("score", None)))
+
+            # value всегда строкой (анализатор сам парсит float/%, 0..1 и пр.)
+            value = str(value_raw if value_raw is not None else "").strip()
+
+            # unit: если пусто, но в value есть %/‰/п.п. — извлечём
+            unit = str(unit_raw or "").strip()
+            if not unit:
+                if re.search(r"%\s*$", value):
+                    unit = "%"
+                elif re.search(r"‰\s*$", value):
+                    unit = "‰"
+                elif re.search(r"(?:п\.п\.|пп)\s*$", value, flags=re.IGNORECASE):
+                    unit = "п.п."
+            unit = _norm_unit(unit)
+
+            # conf → float в [0,1]; если нет — 1.0
+            try:
+                conf = float(conf_raw) if conf_raw is not None else 1.0
+            except Exception:
+                conf = 1.0
+            # клип
+            if conf < 0.0:
+                conf = 0.0
+            if conf > 1.0:
+                conf = 1.0
+
+            norm_rows.append({
+                "label": label,
+                "series": series,
+                "value": value,
+                "unit": unit,
+                "conf": conf,
+            })
+        obj["data"] = norm_rows
+
+        # Очистим axes (если есть)
+        axes = obj.get("axes", {})
+        if isinstance(axes, dict):
+            if "x_labels" in axes and isinstance(axes["x_labels"], list):
+                axes["x_labels"] = [str(x).strip() for x in axes["x_labels"] if str(x).strip()]
+            if "y_labels" in axes and isinstance(axes["y_labels"], list):
+                axes["y_labels"] = [str(x).strip() for x in axes["y_labels"] if str(x).strip()]
+            obj["axes"] = axes
+
+        # Доп. поле units можно мягко нормализовать (если модель его заполнила)
+        units = obj.get("units", {})
+        if isinstance(units, dict):
+            for k in list(units.keys()):
+                units[k] = _norm_unit(str(units[k]))
+            obj["units"] = units
+
+        # Тип — в нижний регистр для предсказуемости
+        t = str(obj.get("type") or "other").strip().lower()
+        obj["type"] = t
+
+    except Exception as e:
+        logging.warning("vision_extract_values: normalization failed: %s", e)
 
     _VISION_CACHE[cache_key] = obj
     _vcache_put(cache_key, obj)

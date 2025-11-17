@@ -15,45 +15,164 @@ def _table_has_columns(con, table: str, cols: List[str]) -> bool:
     have = {row[1] for row in cur.fetchall()}
     return all(c in have for c in cols)
 
-_NUM_RE = re.compile(r"^[+-]?\d{1,3}(?:[\s\u00A0]\d{3})*(?:[.,]\d+)?%?$|^[+-]?\d+(?:[.,]\d+)?%?$")
+
+# Разделители тысяч и пробелы (обычный, неразрывный, узкий неразрывный, тонкий)
+_THIN_SPACES = "\u00A0\u202F\u2009"
+# Негатив в бухгалтерском стиле: (1 234,56)
+_PARENS_RE = re.compile(r"^\(\s*(.+?)\s*\)$")
+# Хвостовые/встроенные единицы и валюты
+_UNIT_PCT_RE = re.compile(r"%")
+_UNIT_PERMILLE_RE = re.compile(r"‰")
+_UNIT_PP_RE = re.compile(r"(?i)\bп\.?п\.?|\bpp\b")
+_CURRENCY_RE = re.compile(r"(?i)(?:\s*(?:₽|руб\.?|rur|rub|€|eur|\$|usd))\b")
+# Мультипликаторы (тыс/млн/млрд, k/m/b/bn)
+_MULTIPLIER_PATTERNS = [
+    (re.compile(r"(?i)\b(тыс\.?|thous\.?|k)\b"), 1_000.0),
+    (re.compile(r"(?i)\b(млн\.?|mln|million|m)\b"), 1_000_000.0),
+    (re.compile(r"(?i)\b(млрд\.?|bln|bn|billion|b)\b"), 1_000_000_000.0),
+]
+
+# Число: допускаем пробелы/апострофы как разделители тысяч, запятую/точку как десятичный.
+# Проценты/‰/п.п./валюта/мультипликаторы могут присутствовать, но будут сняты.
+_NUM_CORE_RE = re.compile(
+    rf"""
+    ^\s*
+    [+-]?
+    (?:
+        (?:\d{{1,3}}(?:[ \'{_THIN_SPACES}]\d{{3}})+|\d+)
+        (?:[.,]\d+)?     # дробная часть
+    |
+        \d*(?:[.,]\d+)
+    )
+    \s*$
+    """,
+    re.X,
+)
+
+
+def _strip_spaces(s: str) -> str:
+    return (s or "").replace("\u00A0", " ").replace("\u202F", " ").replace("\u2009", " ").strip()
+
+
+def _detect_multiplier(text: str) -> Tuple[str, float]:
+    """Возвращает (text_без_мультипликатора, множитель)."""
+    t = text
+    mul = 1.0
+    for pat, k in _MULTIPLIER_PATTERNS:
+        m = pat.search(t)
+        if m:
+            t = pat.sub("", t).strip()
+            mul = k
+            break
+    return t, mul
+
+
+def _canon_decimal(raw: str) -> Optional[float]:
+    """
+    Преобразуем текстовое число к float без потери величины:
+    - удаляем пробелы/апострофы как разделители тысяч
+    - определяем десятичный разделитель как последний из {'.', ','}
+    """
+    s = _strip_spaces(raw)
+    # Бухгалтерские скобки
+    negative = False
+    pm = _PARENS_RE.match(s)
+    if pm:
+        s = pm.group(1)
+        negative = True
+
+    # Оставляем только знаки, цифры, . , и апостроф/пробел как разделители тысяч
+    s = re.sub(_CURRENCY_RE, "", s).strip()
+
+    # Выделяем «числовую» часть (если вокруг есть лишние слова)
+    # Например: "1 234,56 тыс." → оставляем "1 234,56"
+    num_match = re.search(r"[+-]?\s*(?:\d+[ '\u00A0\u202F\u2009]?)*\d(?:[.,]\d+)?", s)
+    if not num_match:
+        return None
+    s_num = num_match.group(0)
+
+    # Если и точка, и запятая — последняя из них считается десятичной
+    if "," in s_num and "." in s_num:
+        if s_num.rfind(",") > s_num.rfind("."):
+            s_num = s_num.replace(".", "").replace(",", ".")
+        else:
+            s_num = s_num.replace(",", "")
+    else:
+        s_num = s_num.replace(",", ".")
+
+    # Убираем разделители тысяч (пробелы/апострофы)
+    s_num = s_num.replace(" ", "").replace("'", "")
+    if not _NUM_CORE_RE.match(s_num):
+        return None
+    try:
+        v = float(s_num)
+    except Exception:
+        return None
+    return -v if negative else v
+
+
+def _parse_number_with_unit(s: str) -> Tuple[Optional[float], str, bool]:
+    """
+    Возвращает (value, unit, had_unit_flag).
+    unit ∈ {"%", "permille", "pp", ""}.
+    value:
+      - для "%" приводим к доле (0..1) — это важно для консистентности;
+      - для permille/pp/"" возвращаем «как есть» (после учёта множителей).
+    """
+    if s is None:
+        return (None, "", False)
+    text = _strip_spaces(str(s))
+
+    # Фиксируем наличие единиц
+    had_percent = bool(_UNIT_PCT_RE.search(text))
+    had_permille = bool(_UNIT_PERMILLE_RE.search(text))
+    had_pp = bool(_UNIT_PP_RE.search(text))
+
+    # Снимаем валюту/обозначения
+    text = _CURRENCY_RE.sub("", text)
+
+    # Мультипликатор (тыс/млн/млрд/k/m/b/bn)
+    text, mul = _detect_multiplier(text)
+
+    # Снимаем явные единицы из текста (для корректного парса числа)
+    text = _UNIT_PCT_RE.sub("", text)
+    text = _UNIT_PERMILLE_RE.sub("", text)
+    text = _UNIT_PP_RE.sub("", text)
+
+    base = _canon_decimal(text)
+    if base is None:
+        return (None, "", False)
+
+    base *= mul
+
+    if had_percent:
+        # Для % приводим к доле
+        return (base / 100.0, "%", True)
+    if had_permille:
+        # Оставляем в промилле «как есть», но помечаем тип
+        return (base, "permille", True)
+    if had_pp:
+        return (base, "pp", True)
+    return (base, "", False)
+
 
 def _to_float(s: str) -> Tuple[Optional[float], bool]:
     """
-    Пробуем распарсить число. Возвращаем (value, is_percent).
-    Понимаем пробелы-разделители тысяч и запятую как десятичный разделитель.
+    Back-compat враппер: (value, is_percent_column_unit_sign_present).
+    Для процентов — возвращает долю (0..1).
     """
-    if s is None:
-        return (None, False)
-    raw = str(s).strip().replace("\u00A0", " ")
-    if not _NUM_RE.match(raw):
-        return (None, False)
-    is_percent = raw.endswith("%")
-    raw = raw.rstrip("%").strip()
-    raw = raw.replace(" ", "")
-    # если есть и точка, и запятая, оставляем последнюю как десятичный разделитель
-    if "," in raw and "." in raw:
-        if raw.rfind(",") > raw.rfind("."):
-            raw = raw.replace(".", "")
-            raw = raw.replace(",", ".")
-        else:
-            raw = raw.replace(",", "")
-    else:
-        raw = raw.replace(",", ".")
-    try:
-        val = float(raw)
-        if is_percent:
-            # Для согласованности приводим к 0..1 (а в отчёте показываем как %)
-            return (val / 100.0, True)
-        return (val, False)
-    except Exception:
-        return (None, False)
+    v, unit, had = _parse_number_with_unit(s)
+    return (v, unit == "%")
+
 
 def _normalize_num(s: str) -> str:
     return (s or "").replace(",", ".").replace(" ", "").strip()
 
+
 def _shorten(s: str, limit: int = 140) -> str:
     s = (s or "").strip()
     return s if len(s) <= limit else (s[:limit - 1].rstrip() + "…")
+
 
 def _last_segment(name: str) -> str:
     s = (name or "").strip()
@@ -63,6 +182,7 @@ def _last_segment(name: str) -> str:
     s = re.sub(r"\s*[-–—]\s*", " — ", s)
     s = re.sub(r"\s+", " ", s).strip(" .")
     return s
+
 
 _CAP_RE = re.compile(
     r"(?i)\bтаблица\s+([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)\b(?:\s*[—\-–:\u2013\u2014]\s*(.+))?"
@@ -74,6 +194,7 @@ def _parse_table_title(text: str) -> Tuple[Optional[str], Optional[str]]:
         return (None, None)
     raw_num = (m.group(1) or "").replace(" ", "")
     return (_normalize_num(raw_num), (m.group(2) or "").strip() or None)
+
 
 def _compose_display_from_attrs(attrs_json: Optional[str], base: str, first_row_text: Optional[str]) -> str:
     """
@@ -116,6 +237,7 @@ def _compose_display_from_attrs(attrs_json: Optional[str], base: str, first_row_
     s = _last_segment(base)
     s = re.sub(r"(?i)^\s*таблица\s+\d+(?:\.\d+)*\s*", "", s).strip(" —–-")
     return _shorten(s or "Таблица", 160)
+
 
 def _find_table_anchor(uid: int, doc_id: int, num: str) -> Optional[Dict[str, Any]]:
     """
@@ -177,10 +299,12 @@ def _find_table_anchor(uid: int, doc_id: int, num: str) -> Optional[Dict[str, An
     con.close()
     return dict(row) if row else None
 
+
 def _base_from_section(section_path: str) -> str:
     s = section_path or ""
     i = s.find(" [row ")
     return s if i < 0 else s[:i]
+
 
 def _fetch_table_rows(uid: int, doc_id: int, base: str, sample_rows_limit: Optional[int] = None) -> List[Dict[str, Any]]:
     """
@@ -210,6 +334,7 @@ def _fetch_table_rows(uid: int, doc_id: int, base: str, sample_rows_limit: Optio
     out = [{"text": (r["text"] or ""), "page": r["page"]} for r in rows]
     return out[:sample_rows_limit] if (sample_rows_limit is not None) else out
 
+
 def _split_cells(line: str) -> List[str]:
     """
     Парсим строку в ячейки. В индексе строки таблицы обычно в формате 'c1 | c2 | c3'.
@@ -225,6 +350,7 @@ def _split_cells(line: str) -> List[str]:
         cells = [c.strip() for c in re.split(r"\s{2,}", s)]
     return [c for c in cells if c != ""]
 
+
 def _detect_header_and_make_matrix(rows_texts: List[str]) -> Tuple[List[str], List[List[str]]]:
     """
     Возвращает (headers, matrix_rows). Если явного заголовка нет — генерируем 'Колонка i'.
@@ -238,7 +364,11 @@ def _detect_header_and_make_matrix(rows_texts: List[str]) -> Tuple[List[str], Li
     def frac_numeric(cells: List[str]) -> float:
         if not cells:
             return 0.0
-        n = sum(1 for c in cells if _to_float(c)[0] is not None)
+        n = 0
+        for c in cells:
+            v, _ = _to_float(c)
+            if v is not None:
+                n += 1
         return n / max(1, len(cells))
 
     header_candidates = raw_rows[0]
@@ -268,45 +398,49 @@ def _detect_header_and_make_matrix(rows_texts: List[str]) -> Tuple[List[str], Li
     headers = [_shorten(h, 80) for h in headers]
     return (headers, normalized)
 
+
+def _normalize_percent_column(values: List[Optional[float]], had_pct_flags: List[bool]) -> List[Optional[float]]:
+    """
+    Делает значения в колонке консистентными для %:
+    - если ячейка содержала '%' — в values уже доля (0..1)
+    - если без '%', но число > 1 → считаем, что это "15" (%), делим на 100
+    - если без '%', и число в [0..1] → уже доля
+    """
+    out: List[Optional[float]] = []
+    for v, had in zip(values, had_pct_flags):
+        if v is None:
+            out.append(None)
+            continue
+        if had:
+            out.append(v)  # уже доля
+        else:
+            out.append(v / 100.0 if v > 1.0 else v)
+    return out
+
+
 def _numeric_columns(headers: List[str], rows: List[List[str]]) -> List[Dict[str, Any]]:
     """
     Для каждого столбца решаем, числовой ли он; если да — собираем числа и базовую статистику.
     Возвращает список словарей по столбцам (включая нечисловые с флагом is_numeric=False).
+    Обеспечивает 100% консистентность значений для процентных колонок.
     """
     cols: List[Dict[str, Any]] = []
     W = len(headers)
+    H = len(rows)
+
     for j in range(W):
-        col_vals: List[Optional[float]] = []
-        col_is_percent = 0
-        for r in rows:
-            v, is_percent = _to_float(r[j])
-            if is_percent:
-                col_is_percent += 1
-            col_vals.append(v)
+        raw_vals: List[Optional[float]] = []
+        had_pct: List[bool] = []
+        for i in range(H):
+            v, is_pct = _to_float(rows[i][j])
+            raw_vals.append(v)
+            had_pct.append(is_pct)
 
         # критерий «числовой»: >=60% значимых чисел в колонке
-        numeric_vals = [x for x in col_vals if x is not None]
+        numeric_vals = [x for x in raw_vals if x is not None]
         is_numeric = (len(numeric_vals) >= max(1, int(0.6 * len(rows))))
 
-        if is_numeric and numeric_vals:
-            n = len(numeric_vals)
-            s = sum(numeric_vals)
-            mn = min(numeric_vals)
-            mx = max(numeric_vals)
-            mean = s / n if n else None
-            cols.append({
-                "index": j,
-                "name": headers[j],
-                "is_numeric": True,
-                "is_percent": (col_is_percent > len(rows) / 2),
-                "count": n,
-                "sum": s,
-                "mean": mean,
-                "min": mn,
-                "max": mx,
-                "values": numeric_vals,  # оставим для топов
-            })
-        else:
+        if not is_numeric or not numeric_vals:
             cols.append({
                 "index": j,
                 "name": headers[j],
@@ -318,26 +452,72 @@ def _numeric_columns(headers: List[str], rows: List[List[str]]) -> List[Dict[str
                 "min": None,
                 "max": None,
                 "values": [],
+                "values_norm": [None] * H,
             })
+            continue
+
+        # Решаем, что это колонка процентов:
+        #  - явные '%' в >= половины числовых ячеек
+        #  - либо нет '%', но >=80% значений находятся в [0..1] и max<=1.0
+        pct_count = sum(1 for i, v in enumerate(raw_vals) if v is not None and had_pct[i])
+        frac_count = sum(1 for v in numeric_vals if 0.0 <= v <= 1.0)
+        nnum = len(numeric_vals)
+        max_v = max(numeric_vals) if numeric_vals else 0.0
+
+        is_percent_col = (pct_count >= (nnum + 1) // 2) or (pct_count == 0 and nnum >= 3 and frac_count >= int(0.8 * nnum) and max_v <= 1.0)
+
+        # Нормализуем значения, если процентовая колонка
+        if is_percent_col:
+            norm_vals = _normalize_percent_column([v if v is not None else None for v in raw_vals], had_pct)
+            use_vals = [v for v in norm_vals if v is not None]
+        else:
+            norm_vals = [v if v is not None else None for v in raw_vals]
+            use_vals = numeric_vals
+
+        n = len(use_vals)
+        s = sum(use_vals) if use_vals else None
+        mn = min(use_vals) if use_vals else None
+        mx = max(use_vals) if use_vals else None
+        mean = (s / n) if use_vals else None
+
+        cols.append({
+            "index": j,
+            "name": headers[j],
+            "is_numeric": True,
+            "is_percent": bool(is_percent_col),
+            "count": n,
+            "sum": s,
+            "mean": mean,
+            "min": mn,
+            "max": mx,
+            "values": use_vals,        # агрегированные (без None), оставлено для совместимости
+            "values_norm": norm_vals,  # массив по строкам (None там, где пусто)
+        })
     return cols
 
-def _top_rows_by_column(rows: List[List[str]], col_idx: int, values: List[float], row_label_idx: int, top_k: int) -> List[Dict[str, Any]]:
+
+def _top_rows_by_column(rows: List[List[str]],
+                        col_idx: int,
+                        values_norm_by_row: List[Optional[float]],
+                        row_label_idx: int,
+                        top_k: int) -> List[Dict[str, Any]]:
     """
-    Возвращает топ-строки по значению столбца col_idx.
-    В качестве подписи строки берём первую колонку (row_label_idx) или '#строка i'.
+    Возвращает топ-строки по нормализованному значению столбца col_idx.
+    В качестве подписи строки берём row_label_idx (обычно 0) или '#строка i'.
     """
     pairs: List[Tuple[int, float]] = []
-    for i, r in enumerate(rows):
-        v, _ = _to_float(r[col_idx])
+    for i, v in enumerate(values_norm_by_row):
         if v is None:
             continue
-        pairs.append((i, v))
+        pairs.append((i, float(v)))
     pairs.sort(key=lambda x: -x[1])
+
     out: List[Dict[str, Any]] = []
     for i, v in pairs[:max(1, top_k)]:
         label = (rows[i][row_label_idx].strip() if row_label_idx < len(rows[i]) and rows[i][row_label_idx].strip() else f"Строка {i+1}")
         out.append({"row": _shorten(label, 80), "value": float(v)})
     return out
+
 
 def _format_number(x: Optional[float], is_percent: bool, lang: str) -> str:
     if x is None:
@@ -349,6 +529,7 @@ def _format_number(x: Optional[float], is_percent: bool, lang: str) -> str:
     s = f"{val:,.2f}"
     s = s.replace(",", " ").replace(".", ",")
     return s + ("%" if is_percent else "")
+
 
 def _render_text_report(display: str,
                         headers: List[str],
@@ -385,8 +566,8 @@ def _render_text_report(display: str,
         else:
             lines.append(f"• Колонка «{name}»: n={c_count}, минимум={c_min}, максимум={c_max}, среднее={c_mean}, сумма={c_sum}.")
 
-        # Топ строки
-        top_rows = _top_rows_by_column(rows, col["index"], col["values"], row_label_idx, top_k)
+        # Топ строки (по нормализованным значениям)
+        top_rows = _top_rows_by_column(rows, col["index"], col["values_norm"], row_label_idx, top_k)
         if top_rows:
             if lang == "en":
                 lines.append("  Top rows:")
@@ -402,6 +583,7 @@ def _render_text_report(display: str,
             return f"{lines[0]}\nThere are no numeric columns to analyze."
         return f"{lines[0]}\nЧисловые столбцы для анализа не обнаружены."
     return "\n".join(lines)
+
 
 # ---------------------------- Публичный API ----------------------------
 
@@ -464,18 +646,18 @@ def analyze_table_by_num(uid: int,
     rows_texts = [r["text"] for r in row_objs]
     headers, matrix = _detect_header_and_make_matrix(rows_texts)
 
-    # Числовые столбцы
+    # Числовые столбцы (с консистентной нормализацией процентов)
     cols = _numeric_columns(headers, matrix)
 
     # Готовим краткий текстовый отчёт
     text = _render_text_report(display, headers, matrix, cols, top_k=top_k, lang=lang)
 
-    # Сериализуем numeric_summary (без «values»)
+    # Сериализуем numeric_summary
     numeric_summary: List[Dict[str, Any]] = []
     for c in cols:
         if not c["is_numeric"]:
             continue
-        top_rows = _top_rows_by_column(matrix, c["index"], c["values"], 0, top_k)
+        top_rows = _top_rows_by_column(matrix, c["index"], c["values_norm"], 0, top_k)
         numeric_summary.append({
             "col": c["name"],
             "is_percent": bool(c["is_percent"]),

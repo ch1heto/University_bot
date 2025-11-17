@@ -4,6 +4,7 @@ import json
 import hashlib
 import numpy as np
 from typing import List, Dict, Any, Iterable, Optional
+from decimal import Decimal
 
 from .db import get_conn
 from .polza_client import embeddings
@@ -38,7 +39,7 @@ def _norm(s: str | None) -> str:
 
 
 def _make_anchor_id(section_path: str, page: int | None, title: str | None) -> str:
-    base = f"{_norm(section_path)}|p={{}}|t={_norm(title)}".format(page or "")
+    base = f"{_norm(section_path)}|p={page or ''}|t={_norm(title)}"
     h = hashlib.sha1(base.encode("utf-8")).hexdigest()
     return f"anch-{h[:16]}"
 
@@ -95,6 +96,23 @@ def _limit_table_row_columns(row: str, max_cols: int) -> str:
     return " | ".join([p for p in parts[:max_cols] if p])
 
 
+def _json_safe(obj: Any) -> Any:
+    """
+    Рекурсивно приводим attrs к JSON-совместимому виду:
+    - Decimal -> float
+    - dict/list/tuple -> обходим по элементам
+    Остальное возвращаем как есть.
+    """
+    if isinstance(obj, Decimal):
+        return float(obj)
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
+
 # ---------- OCR & CHART synthesis ----------
 
 def _run_ocr_on_images_if_needed(base_attrs: dict) -> Optional[str]:
@@ -144,11 +162,20 @@ def _run_ocr_on_images_if_needed(base_attrs: dict) -> Optional[str]:
 
 def _synth_chart_text(base_attrs: dict, section: Dict[str, Any]) -> Optional[str]:
     """
-    Из attrs.chart_data собираем читабельный текст.
-    Формат: «метка — значение» построчно + лёгкая сводка (мин/макс/сумма, если числовые).
+    Строим текст/табличку по данным диаграммы.
+
+    Приоритет:
+    1) Если есть attrs.chart_matrix (нормализованный вид из OOXML) —
+       формируем табличный текст по categories/series/values.
+    2) Если chart_matrix нет, но есть attrs.chart_data (старый формат) —
+       формируем простые строки «метка — значение».
+
+    chart_matrix не модифицируем, только читаем.
     """
-    rows = base_attrs.get("chart_data")
-    if not isinstance(rows, list) or not rows:
+    chart_matrix = base_attrs.get("chart_matrix")
+    chart_rows = base_attrs.get("chart_data")
+
+    if not chart_matrix and (not isinstance(chart_rows, list) or not chart_rows):
         return None
 
     lines: List[str] = []
@@ -168,24 +195,99 @@ def _synth_chart_text(base_attrs: dict, section: Dict[str, Any]) -> Optional[str
     if head:
         lines.append(head)
 
-    for r in rows:
-        label = _norm(str(r.get("label", "")))
-        val = r.get("value", None)
-        if label == "" and val is None:
-            continue
-        if isinstance(val, float) or isinstance(val, int):
-            numeric_vals.append(float(val))
-            vstr = f"{val}".rstrip("0").rstrip(".") if isinstance(val, float) else str(val)
-        else:
-            vstr = str(val) if val is not None else ""
-        if label and vstr:
-            lines.append(f"{label} — {vstr}")
-        elif label:
-            lines.append(label)
-        elif vstr:
-            lines.append(vstr)
+    def _fmt_percent(v: float) -> str:
+        # 70.0 -> "70%", 70.35 -> "70.35%"
+        if abs(v - round(v)) < 0.05:
+            return f"{int(round(v))}%"
+        s = f"{v:.2f}".rstrip("0").rstrip(".")
+        return f"{s}%"
 
-    # простая сводка
+    def _fmt_number(v: float) -> str:
+        return f"{v:.6g}"
+
+    # --- 1) Нормализованный matrix → табличка ---
+    if isinstance(chart_matrix, dict):
+        cats = chart_matrix.get("categories") or []
+        series_list = chart_matrix.get("series") or []
+        if isinstance(cats, list) and cats and isinstance(series_list, list) and series_list:
+            # имена серий
+            ser_names: List[str] = []
+            for i, s in enumerate(series_list):
+                nm = (s or {}).get("name")
+                nm = _norm(nm) if isinstance(nm, str) else ""
+                ser_names.append(nm or f"Серия {i + 1}")
+
+            # заголовок таблицы
+            header_cells = ["Категория"] + ser_names
+            lines.append(" | ".join(header_cells))
+
+            # строки по категориям
+            for ri, cat in enumerate(cats):
+                cat_name = _norm(cat) or f"Категория {ri + 1}"
+                row_cells = [cat_name]
+                for s in series_list:
+                    vals = (s or {}).get("values") or []
+                    unit_s = (s or {}).get("unit") or chart_matrix.get("unit")
+                    v = vals[ri] if ri < len(vals) else None
+
+                    if isinstance(v, (int, float)):
+                        fv = float(v)
+                        numeric_vals.append(fv)
+                        if unit_s == "%":
+                            cell = _fmt_percent(fv)
+                        else:
+                            cell = _fmt_number(fv)
+                    else:
+                        cell = "-"
+                    row_cells.append(cell)
+                lines.append(" | ".join(row_cells))
+
+            # короткое пояснение по ориентации/типу (если есть)
+            meta = chart_matrix.get("meta") or {}
+            bar_dir = meta.get("bar_dir")
+            if bar_dir:
+                lines.append(f"Направление столбцов диаграммы: {bar_dir}.")
+
+    # --- 2) Фолбэк: старый формат chart_data ---
+    if (not lines or len(lines) == (1 if head else 0)) and isinstance(chart_rows, list) and chart_rows:
+        for r in chart_rows:
+            if not isinstance(r, dict):
+                continue
+
+            label = _norm(str(r.get("label", "")))
+
+            raw = (r.get("value_raw") or "").strip()
+            unit = r.get("unit")
+            val = r.get("value", None)
+
+            num_val: Optional[float] = None
+            if isinstance(val, (int, float)):
+                num_val = float(val)
+                numeric_vals.append(num_val)
+
+            vstr = ""
+            if raw:
+                if (unit == "%") and ("%" not in raw) and isinstance(num_val, float):
+                    vstr = _fmt_percent(num_val)
+                else:
+                    vstr = raw
+            elif isinstance(num_val, float):
+                if unit == "%":
+                    vstr = _fmt_percent(num_val)
+                else:
+                    vstr = _fmt_number(num_val)
+            else:
+                if r.get("value") is not None:
+                    vstr = str(r.get("value"))
+
+            if label and vstr:
+                lines.append(f"{label} — {vstr}")
+            elif label:
+                lines.append(label)
+            elif vstr:
+                lines.append(vstr)
+
+    # Простая числовая сводка (для любых источников чисел)
     if numeric_vals:
         s = sum(numeric_vals)
         mn = min(numeric_vals)
@@ -194,7 +296,7 @@ def _synth_chart_text(base_attrs: dict, section: Dict[str, Any]) -> Optional[str
 
     txt = "\n".join([ln for ln in lines if ln.strip()]).strip()
     if txt:
-        base_attrs["chart_text"] = txt  # сохраним для дебага/повтора
+        base_attrs["chart_text"] = txt  # сохраним, matrix не трогаем
         return txt
     return None
 
@@ -207,10 +309,20 @@ def _yield_ocr_chunks_if_any(
     Если у секции есть ocr_text — режем и отдаём.
     Если ocr_text нет, но есть images — пробуем сделать OCR и также отдаём.
     subtype = "ocr".
+
+    ВАЖНО:
+    - Для фигур с chart_data (диаграммы из OOXML/докx) OCR НЕ выполняем,
+      чтобы не подмешивать «шумные» числа из картинки.
     """
     et = (section.get("element_type") or "").lower()
     if not isinstance(base_attrs, dict):
         return
+
+    # фигура с chart_data -> не делаем OCR-чанки
+    if et == "figure":
+        chart_rows = base_attrs.get("chart_data")
+        if isinstance(chart_rows, list) and chart_rows:
+            return
 
     # OCR при необходимости
     ocr_text_existing = (base_attrs.get("ocr_text") or "").strip()
@@ -229,7 +341,9 @@ def _yield_ocr_chunks_if_any(
             continue
         attrs = dict(base_attrs)
         attrs["subtype"] = "ocr"
-        yield ch, {"page": page, "section_path": section_path}, (et or "figure"), attrs
+        # для OCR оставляем исходный тип секции (table/figure/...), а если его нет — считаем текстом
+        out_et = et or "text"
+        yield ch, {"page": page, "section_path": section_path}, out_et, attrs
 
 
 def _yield_chart_chunks_if_any(
@@ -237,8 +351,11 @@ def _yield_chart_chunks_if_any(
     base_attrs: dict,
 ) -> Iterable[tuple[str, Dict[str, Any], str, dict]]:
     """
-    Если у секции есть chart_data — синтезируем текст и отдаём отдельные чанки.
+    Если у секции есть данные диаграммы (chart_matrix или chart_data) —
+    синтезируем текст и отдаём отдельные чанки.
     subtype = "chart".
+
+    chart_matrix целиком прокидываем дальше в attrs чанков.
     """
     et = (section.get("element_type") or "").lower()
     if not isinstance(base_attrs, dict):
@@ -256,14 +373,15 @@ def _yield_chart_chunks_if_any(
     for ch in split_into_chunks(chart_txt):
         if not ch.strip():
             continue
-        attrs = dict(base_attrs)
+        attrs = dict(base_attrs)  # chart_matrix / chart_data сохраняются как есть
         attrs["subtype"] = "chart"
-        yield ch, {"page": page, "section_path": section_path}, (et or "figure"), attrs
+        out_et = et or "figure"
+        yield ch, {"page": page, "section_path": section_path}, out_et, attrs
 
 
 def _yield_chunks_for_section(
     section: Dict[str, Any],
-    *,
+    * ,
     max_table_rows: Optional[int] = None,
     max_table_cols: Optional[int] = None,
 ) -> Iterable[tuple[str, Dict[str, Any], str, dict]]:
@@ -291,9 +409,11 @@ def _yield_chunks_for_section(
         return
 
     # таблица
+        # таблица
     if et == "table":
         cap_tail = base_attrs.get("caption_tail") or base_attrs.get("title")
         header_preview = base_attrs.get("header_preview")
+
         tail_from_title = None
         m = re.search(
             r"(?i)\bтабл(?:ица)?\.?\s*(?:№\s*)?(?:[A-Za-zА-Яа-я]\.?[\s-]*\d+(?:[.,]\d+)*|\d+(?:[.,]\d+)*)\s*[—\-–:\u2013\u2014]\s*(.+)",
@@ -309,12 +429,12 @@ def _yield_chunks_for_section(
         if not lines:
             # даже если нет текстовых строк — попробуем OCR по картинкам в attrs.images
             yield from _yield_ocr_chunks_if_any(section, base_attrs)
-            # и текст из диаграммы внутри таблицы (если парсер положил chart_data)
+            # и текст из диаграммы внутри таблицы (если парсер положил chart_matrix/chart_data)
             yield from _yield_chart_chunks_if_any(section, base_attrs)
             return
 
-        n_max_rows = Cfg.FULL_TABLE_MAX_ROWS if max_table_rows is None else max_table_rows
-        n_max_cols = Cfg.FULL_TABLE_MAX_COLS if max_table_cols is None else max_table_cols
+        n_max_rows = max_table_rows if max_table_rows is not None else Cfg.FULL_TABLE_MAX_ROWS
+        n_max_cols = max_table_cols if max_table_cols is not None else Cfg.FULL_TABLE_MAX_COLS
 
         for i, row in enumerate(lines[: max(1, n_max_rows)], 1):
             trimmed = _limit_table_row_columns(row, max(0, n_max_cols or 0))
@@ -328,6 +448,7 @@ def _yield_chunks_for_section(
         yield from _yield_ocr_chunks_if_any(section, base_attrs)
         yield from _yield_chart_chunks_if_any(section, base_attrs)
         return
+
 
     # фигуры / страницы / обычные параграфы
     base = text if isinstance(text, str) else str(text)
@@ -347,7 +468,13 @@ def _yield_chunks_for_section(
     for ch in split_into_chunks(base):
         if not ch.strip():
             continue
-        out_et = et if et in {"page", "figure", "paragraph"} else ("paragraph" if et == "" else et)
+        # нормализуем тип: дефолт — text
+        if et in {"page", "figure", "table", "heading", "reference", "text"}:
+            out_et = et
+        elif not et:
+            out_et = "text"
+        else:
+            out_et = et
         yield f"{prefix}\n{ch}", {"page": page, "section_path": section_path}, out_et, base_attrs
 
     # добавим OCR-чанки и данные диаграмм
@@ -361,7 +488,7 @@ def index_document(
     owner_id: int,
     doc_id: int,
     sections: List[Dict[str, Any]],
-    *,
+    * ,
     batch_size: int = 128
 ) -> None:
     """
@@ -370,8 +497,8 @@ def index_document(
     - Таблицы -> корневой чанк + построчно с ограничениями Cfg.FULL_TABLE_MAX_ROWS/COLS.
     - Заголовки -> отдельные короткие чанки.
     - Фигуры/страницы/текст -> обычные чанки с контекстным префиксом.
-    - **НОВОЕ**: OCR картинок (attrs.images) прямо здесь (subtype="ocr"), если нет attrs.ocr_text.
-    - **НОВОЕ**: Текст из диаграмм (attrs.chart_data) превращается в чанки (subtype="chart").
+    - OCR картинок (attrs.images) => subtype="ocr", если нет attrs.ocr_text.
+    - Текст из диаграмм (attrs.chart_matrix / attrs.chart_data, в т.ч. из OOXML-индекса) => чанки subtype="chart".
     - Эмбеддинги считаются батчами.
     """
     rows_text: List[str] = []
@@ -403,13 +530,14 @@ def index_document(
     for batch in _batched(rows_text, batch_size):
         vecs = embeddings(batch)
         if not vecs or len(vecs) != len(batch):
-            raise RuntimeError("embeddings() вернул неожиданный размер результата.")
+            raise RuntimeError("embeddings() вернул неожиданное количество векторов.")
         for j, vec in enumerate(vecs):
             k = idx + j
             meta = rows_meta[k]
             blob = np.asarray(vec, dtype=np.float32).tobytes()
 
             if has_extended_cols:
+                safe_attrs = _json_safe(rows_attrs[k])
                 cur.execute(
                     "INSERT INTO chunks(doc_id, owner_id, page, section_path, text, element_type, attrs, embedding) "
                     "VALUES(?,?,?,?,?,?,?,?)",
@@ -420,10 +548,11 @@ def index_document(
                         meta.get("section_path"),
                         batch[j],
                         rows_type[k],
-                        json.dumps(rows_attrs[k], ensure_ascii=False),
+                        json.dumps(safe_attrs, ensure_ascii=False),
                         blob,
                     ),
                 )
+
             else:
                 cur.execute(
                     "INSERT INTO chunks(doc_id, owner_id, page, section_path, text, embedding) "

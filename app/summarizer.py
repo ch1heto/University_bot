@@ -2,13 +2,12 @@
 from __future__ import annotations
 import re
 import json
-import base64
-import mimetypes
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 
 from .db import get_conn
-from .polza_client import chat_with_gpt  # одна и та же Chat API умеет и vision через image_url
+from .polza_client import chat_with_gpt, vision_describe  # текст + vision-описания
+from .vision_analyzer import analyze_figure as va_analyze_figure  # единый анализатор диаграмм
 
 # ----------------------- СИСТЕМНЫЙ ПРОМТ ДЛЯ РЕЗЮМЕ -----------------------
 
@@ -192,10 +191,10 @@ def _collect_tables(owner_id: int, doc_id: int, max_tables: int = 8, sample_rows
 def _collect_figures(owner_id: int, doc_id: int, max_figs: int = 8) -> List[Dict[str, Any]]:
     """Список «рисунков»: сначала element_type='figure', затем подписи, затем JSON-attrs (caption_num/label)."""
     con = get_conn()
-    has_type = _has_columns(con, "chunks", ["element_type", "attrs"])
+    has_type_and_attrs = _has_columns(con, "chunks", ["element_type", "attrs"])
 
     rows: List[Dict[str, Any]] = []
-    if has_type:
+    if has_type_and_attrs:
         # 1) normal figure
         rows = _fetchall(
             con,
@@ -227,7 +226,6 @@ def _collect_figures(owner_id: int, doc_id: int, max_figs: int = 8) -> List[Dict
                 (owner_id, doc_id, max_figs),
             )
 
-
         # 3) JSON-attrs: если есть только номер/лейбл
         if not rows:
             rows = _fetchall(
@@ -239,10 +237,10 @@ def _collect_figures(owner_id: int, doc_id: int, max_figs: int = 8) -> List[Dict
                 (owner_id, doc_id, max_figs),
             )
     else:
-        # старые индексы: только по подписям
+        # старые индексы: только по подписям, attrs может НЕ существовать
         rows = _fetchall(
             con,
-            "SELECT DISTINCT page, section_path, text, attrs FROM chunks "
+            "SELECT DISTINCT page, section_path, text, NULL AS attrs FROM chunks "
             "WHERE owner_id=? AND doc_id=? AND ("
             "  replace(section_path, char(160),' ') LIKE '%Рис%'     COLLATE NOCASE OR "
             "  replace(text,        char(160),' ') LIKE '%Рис%'     COLLATE NOCASE OR "
@@ -260,10 +258,8 @@ def _collect_figures(owner_id: int, doc_id: int, max_figs: int = 8) -> List[Dict
             (owner_id, doc_id, max_figs),
         )
 
-
     con.close()
     return rows
-
 
 
 def _select_first_paragraphs(owner_id: int, doc_id: int, limit: int = 12) -> List[Dict[str, Any]]:
@@ -417,22 +413,6 @@ def _parse_figure_title_line(s: str) -> Tuple[Optional[str], Optional[str]]:
         return (None, None)
     return (_norm_num(m.group(1)), (m.group(2) or "").strip() or None)
 
-def _guess_mime(path: str) -> str:
-    mt, _ = mimetypes.guess_type(path)
-    return mt or "image/png"
-
-def _file_to_data_url(path: str) -> Optional[str]:
-    """Локальный файл -> data URL (base64) для image_url."""
-    try:
-        p = Path(path)
-        if not p.exists() or not p.is_file():
-            return None
-        b = p.read_bytes()
-        b64 = base64.b64encode(b).decode("ascii")
-        mime = _guess_mime(path)
-        return f"data:{mime};base64,{b64}"
-    except Exception:
-        return None
 
 def _figure_row_by_number(owner_id: int, doc_id: int, num: str) -> Optional[Dict[str, Any]]:
     """Ищем чанк рисунка по номеру: учитываем NBSP и случаи, когда номер лежит только в attrs (caption_num/label)."""
@@ -467,7 +447,6 @@ def _figure_row_by_number(owner_id: int, doc_id: int, num: str) -> Optional[Dict
         (f"%Pic{want}%",      f"%Pic{want}%"),
     ]
 
-
     has_new = _has_columns(con, "chunks", ["element_type", "attrs"])
 
     # 1) «Настоящий» figure: сравнение через REPLACE(char(160),' ')
@@ -500,14 +479,22 @@ def _figure_row_by_number(owner_id: int, doc_id: int, num: str) -> Optional[Dict
     # 2) Фолбэк: любая секция с подходящей подписью
     if not row:
         for p1, p2 in pats:
+            base_sql = (
+                "SELECT id, page, section_path, text, " +
+                ("attrs" if has_new else "NULL AS attrs") +
+                " FROM chunks WHERE owner_id=? AND doc_id=? "
+                "AND (replace(section_path, char(160),' ') LIKE ? COLLATE NOCASE "
+                "     OR replace(text,        char(160),' ') LIKE ? COLLATE NOCASE) "
+            )
+            # В старых схемах element_type может отсутствовать — не используем его в ORDER BY
+            order_sql = (
+                "ORDER BY CASE WHEN element_type='figure' THEN 0 ELSE 1 END, id ASC LIMIT 1"
+                if has_new else
+                "ORDER BY id ASC LIMIT 1"
+            )
             row = _fetchone(
                 con,
-                ("SELECT id, page, section_path, text, " +
-                 ("attrs" if has_new else "NULL AS attrs") +
-                 " FROM chunks WHERE owner_id=? AND doc_id=? "
-                 "AND (replace(section_path, char(160),' ') LIKE ? COLLATE NOCASE "
-                 "     OR replace(text,        char(160),' ') LIKE ? COLLATE NOCASE) "
-                 "ORDER BY CASE WHEN element_type='figure' THEN 0 ELSE 1 END, id ASC LIMIT 1"),
+                base_sql + order_sql,
                 (owner_id, doc_id, p1, p2),
             )
             if row:
@@ -515,7 +502,6 @@ def _figure_row_by_number(owner_id: int, doc_id: int, num: str) -> Optional[Dict
 
     con.close()
     return row
-
 
 
 def _extract_images_from_attrs(attrs_raw: Any) -> List[str]:
@@ -545,8 +531,12 @@ def _collect_images_for_section(owner_id: int, doc_id: int, section_path: str) -
     Нужен для случаев, когда картинки лежат не в других чанках.
     """
     con = get_conn()
-    cur = con.cursor()
     try:
+        # В старых схемах колонки attrs может не быть — тогда просто возвращаем пусто
+        if not _has_columns(con, "chunks", ["attrs"]):
+            return []
+
+        cur = con.cursor()
         cur.execute(
             """
             SELECT attrs FROM chunks
@@ -570,38 +560,6 @@ def _collect_images_for_section(owner_id: int, doc_id: int, section_path: str) -
                 images.append(str(p))
     return images
 
-def _vision_describe(paths: List[str], caption_hint: Optional[str]) -> str:
-    """
-    1–2 предложения описания изображения(й) через chat_with_gpt с image_url (data URL).
-    Если передано несколько картинок, используем первую-вторую.
-    """
-    chosen = [p for p in paths if p][:2]
-    image_contents = []
-    for p in chosen:
-        data_url = _file_to_data_url(p)
-        if data_url:
-            image_contents.append({"type": "image_url", "image_url": {"url": data_url}})
-
-    if not image_contents:
-        return ""
-
-    user_text = (
-        "Опиши содержимое изображения кратко и академично (1–2 предложения), "
-        "без выдумок и оценочных суждений. Если на схеме есть подписи/оси — упомяни их родовые названия, "
-        "но не переписывай длинные тексты целиком. Избегай слов «на фото видно» — сразу пиши, что изображено."
-    )
-    if caption_hint:
-        user_text += f"\nКонтекст подписи: «{caption_hint}»."
-
-    messages = [
-    {"role": "system", "content": "Ты репетитор по ВКР. Пиши по-русски, академично и кратко."},
-    {"role": "user", "content": [{"type": "text", "text": user_text}] + image_contents}
-]
-    try:
-        resp = chat_with_gpt(messages, temperature=0.1, max_tokens=180)
-        return (resp or "").strip()
-    except Exception:
-        return ""
 
 def _format_figure_sentence(num: Optional[str], vision_text: str, tail: Optional[str]) -> str:
     """
@@ -623,7 +581,7 @@ def _format_figure_sentence(num: Optional[str], vision_text: str, tail: Optional
 def describe_figures(owner_id: int, doc_id: int, numbers: List[str]) -> str:
     """
     Принимает список номеров рисунков ['2.1', '3', ...] и возвращает по каждому
-    короткое академичное описание (vision + подпись, если картинка не извлечена).
+    короткое академичное описание. Использует общий vision-клиент (polza_client.vision_describe).
     """
     if not numbers:
         return "Не указаны номера рисунков. Например: 2.1, 3.2, 5."
@@ -643,7 +601,7 @@ def describe_figures(owner_id: int, doc_id: int, numbers: List[str]) -> str:
         n_txt, tail_txt = _parse_figure_title_line(txt)
         tail = tail_sec or tail_txt
 
-        # Картинки: из attrs найденного чанка + по всей секции (на случай, если картинки лежат в других чанках)
+        # Картинки: из attrs найденного чанка + по всей секции
         img_paths = _extract_images_from_attrs(row.get("attrs"))
         if sec:
             extra = _collect_images_for_section(owner_id, doc_id, sec)
@@ -651,8 +609,14 @@ def describe_figures(owner_id: int, doc_id: int, numbers: List[str]) -> str:
                 if p not in img_paths:
                     img_paths.append(p)
 
-        # Описание через vision (если есть что отправить)
-        vision_text = _vision_describe(img_paths, tail)
+        # Описание через общий vision-клиент
+        vision_text = ""
+        if img_paths:
+            try:
+                desc = vision_describe(image_or_images=img_paths, lang="ru")
+                vision_text = (desc.get("description") or "").strip()
+            except Exception:
+                vision_text = ""
 
         # Ответная строка
         out = _format_figure_sentence(num or n_sec or n_txt, vision_text, tail)
@@ -672,210 +636,107 @@ def describe_figure(owner_id: int, doc_id: int, number: str) -> str:
 #         НОВОЕ: ВЫТАСКИВАЕМ ТОЧНЫЕ ЗНАЧЕНИЯ С КАРТИНОК (FIG_VALUES)
 # ======================================================================
 
-# — безопасный вызов Chat API с попыткой потребовать JSON, но без жёсткой зависимости
-def _chat_json(messages: List[Dict[str, Any]], temperature: float = 0.0, max_tokens: int = 1300) -> Optional[Dict[str, Any]]:
-    """
-    Пытаемся получить JSON-объект от модели. Если SDK не поддерживает response_format,
-    делаем мягкий фолбэк: просим JSON текстом и парсим.
-    """
-    # 1) Попытка с response_format (если поддерживается вашей обёрткой)
-    try:
-        resp = chat_with_gpt(
-            messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            response_format={"type": "json_object"},  # если не поддерживается — словим TypeError
-        )
-        if not resp:
-            return None
-        # многие обёртки возвращают уже строку-JSON
-        try:
-            return json.loads(resp)
-        except Exception:
-            pass
-    except TypeError:
-        # ваша обёртка не приняла response_format — идём дальше
-        pass
-    except Exception:
-        # неожиданные ошибки/таймауты
-        return None
 
-    # 2) Фолбэк: без response_format, но просим JSON в явном виде
-    try:
-        resp2 = chat_with_gpt(messages, temperature=temperature, max_tokens=max_tokens)
-        if not resp2:
-            return None
-        # пробуем прямой json.loads
-        try:
-            return json.loads(resp2)
-        except Exception:
-            # извлечь первый JSON-объект из ответа
-            s = str(resp2)
-            start = s.find("{")
-            end = s.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                candidate = s[start:end + 1]
-                return json.loads(candidate)
-    except Exception:
-        return None
+# ======================================================================
+#         НОВОЕ: ВЫТАСКИВАЕМ ТОЧНЫЕ ЗНАЧЕНИЯ С КАРТИНОК (FIG_VALUES)
+# ======================================================================
 
-    return None
-
-# — необязательный лёгкий OCR для усиления (не требует изменения зависимостей, работает «если установлен»)
-def _run_light_ocr(image_path: str) -> str:
-    """Пробуем прочитать текст с изображения с помощью pytesseract (если установлен). Иначе возвращаем пустую строку."""
-    try:
-        from PIL import Image, ImageFilter, ImageOps
-        import pytesseract  # type: ignore
-    except Exception:
-        return ""
-
-    try:
-        img = Image.open(image_path)
-        # простая предобработка: серый, контраст, ресайз
-        img = ImageOps.grayscale(img)
-        # увеличим до ~1.5x, но без гигантских размеров
-        w, h = img.size
-        factor = 1.5 if max(w, h) < 1800 else 1.0
-        if factor != 1.0:
-            img = img.resize((int(w * factor), int(h * factor)))
-        img = img.filter(ImageFilter.SHARPEN)
-        text = pytesseract.image_to_string(img, lang="rus+eng")
-        return text.strip()
-    except Exception:
-        return ""
-
-def _vision_extract_values(paths: List[str], caption_hint: Optional[str], ocr_hint: str = "") -> Optional[Dict[str, Any]]:
-    """
-    Основной режим извлечения значений с диаграмм/графиков/снимков.
-    Возвращает JSON-словарь со структурированными данными или None.
-    """
-    chosen = [p for p in paths if p][:2]  # 1–2 картинки максимум
-    image_contents: List[Dict[str, Any]] = []
-    for p in chosen:
-        data_url = _file_to_data_url(p)
-        if data_url:
-            image_contents.append({"type": "image_url", "image_url": {"url": data_url}})
-
-    if not image_contents:
-        return None
-
-    sys = (
-        "Ты извлекаешь данные с изображений дипломной работы. "
-        "Твоя задача — ПЕРЕПИСАТЬ видимые числа/проценты/подписи/единицы без домыслов, "
-        "сохранять пунктуацию (точки/запятые, знак %). Если символ неразборчив — записывай null или \"?\". "
-        "Верни строго JSON-объект одной из форм:\n"
-        "{"
-        "\"type\":\"pie|bar|line|diagram|table|other\","
-        "\"units\":{\"x\":\"...\",\"y\":\"...\"},"
-        "\"axes\":{\"x_labels\":[\"...\"],\"y_labels\":[\"...\"]},"
-        "\"legend\":[\"...\"],"
-        "\"data\":[{\"label\":\"...\",\"series\":\"optional\",\"value\":\"...\",\"unit\":\"optional\"}],"
-        "\"raw_text\":[\"...\"],"
-        "\"warnings\":[\"...\"]"
-        "}"
-    )
-
-    user_text = (
-        "Извлеки ВСЕ видимые значения с изображения: проценты/числа на сегментах/точках/подписях, "
-        "легенду, единицы измерения и подписи осей. Ничего не придумывай. "
-        "Если значения не подписаны, верни структуры без поля data и добавь предупреждение."
-    )
-    if caption_hint:
-        user_text += f"\nКонтекст подписи к рисунку: «{caption_hint}»."
-    if ocr_hint:
-        # ограничим размер подсказки, чтобы не раздуть промпт
-        cut = (ocr_hint[:2000] + "…") if len(ocr_hint) > 2000 else ocr_hint
-        user_text += f"\nRAW_OCR (может содержать ошибки, используй для сопоставления):\n{cut}"
-
-    messages = [
-        {"role": "system", "content": sys},
-        {"role": "user", "content": [{"type": "text", "text": user_text}] + image_contents}
-    ]
-
-    obj = _chat_json(messages, temperature=0.0, max_tokens=1400)
-    return obj
 
 def _format_values_markdown(obj: Dict[str, Any]) -> str:
     """
-    Превращаем JSON-объект в удобный текст для Telegram: таблица + CSV + метаданные.
+    Простой формат вывода числовых значений диаграммы:
+    - Markdown-таблица «Категория | Серия | Значение | Ед.»;
+    - CSV для копирования/экспорта.
+    Без текстовой интерпретации и без пересказа графика.
+    Используем в первую очередь поле exact_numbers (если есть), затем data.
     """
-    parts: List[str] = []
-
-    vtype = (obj.get("type") or "other").strip()
-    units = obj.get("units") or {}
-    axes  = obj.get("axes") or {}
-    legend = obj.get("legend") or []
-    data = obj.get("data") or []
+    rows = obj.get("exact_numbers") or obj.get("data") or []
     warnings = obj.get("warnings") or []
-    raw_text = obj.get("raw_text") or []
 
-    # краткий заголовок
-    meta_bits = []
-    if vtype:
-        meta_bits.append(f"тип: {vtype}")
-    if units.get("x"):
-        meta_bits.append(f"ед. по X: {units.get('x')}")
-    if units.get("y"):
-        meta_bits.append(f"ед. по Y: {units.get('y')}")
-    if meta_bits:
-        parts.append("Метаданные: " + ", ".join(meta_bits))
+    if not rows:
+        return "_Нет структурированных числовых данных; возможно, это не диаграмма с числами._"
 
-    # легенда / оси
-    if legend:
-        parts.append("Легенда: " + "; ".join(str(x) for x in legend))
-    if axes.get("x_labels") or axes.get("y_labels"):
-        xl = ", ".join(axes.get("x_labels") or [])
-        yl = ", ".join(axes.get("y_labels") or [])
-        parts.append("Оси: " + ("X: " + xl if xl else "") + ("; Y: " + yl if yl else ""))
+    lines: List[str] = []
+    lines.append("**Точные значения (как в документе):**")
+    lines.append("| Категория | Серия | Значение | Ед. |")
+    lines.append("|---|---|---|---|")
 
-    # таблица значений
-    if data:
-        parts.append("**Значения (как на изображении):**")
-        parts.append("| Метка | Серия | Значение | Ед. |\n|---|---|---|---|")
-        csv_lines = ["label,series,value,unit"]
-        for row in data:
-            label = str(row.get("label") or "").strip()
-            series = str(row.get("series") or "").strip()
-            value = str(row.get("value") or "").strip()
-            unit  = str(row.get("unit") or "").strip()
-            parts.append(f"| {label or '—'} | {series or '—'} | {value or '—'} | {unit or '—'} |")
-            # CSV — без пайпов/markdown
-            def _csv_escape(s: str) -> str:
-                return '"' + s.replace('"', '""') + '"'
-            csv_lines.append(",".join([_csv_escape(label), _csv_escape(series), _csv_escape(value), _csv_escape(unit)]))
-        parts.append("\nCSV:\n```\n" + "\n".join(csv_lines) + "\n```")
-    else:
-        parts.append("_На изображении нет явных подписанных значений; читаемы только оси/легенда._")
+    csv_lines: List[str] = ["label,series,value,unit"]
+
+    for r in rows:
+        label = str(
+            r.get("label")
+            or r.get("category")
+            or r.get("name")
+            or r.get("x")
+            or ""
+        ).strip()
+        series = str(
+            r.get("series")
+            or r.get("group")
+            or r.get("legend")
+            or ""
+        ).strip()
+
+        val = r.get("value")
+        if val is None:
+            val = r.get("y") or r.get("x") or r.get("count")
+        value_str = "" if val is None else str(val)
+
+        unit = str(r.get("unit") or r.get("units") or "").strip()
+
+        lines.append(
+            f"| {label or '—'} | {series or '—'} | {value_str or '—'} | {unit or '—'} |"
+        )
+
+        def _csv_escape(s: str) -> str:
+            return '"' + s.replace('"', '""') + '"'
+
+        csv_lines.append(
+            ",".join(
+                [
+                    _csv_escape(label),
+                    _csv_escape(series),
+                    _csv_escape(value_str),
+                    _csv_escape(unit),
+                ]
+            )
+        )
+
+    lines.append("")
+    lines.append("CSV (для экспорта):")
+    lines.append("```")
+    lines.extend(csv_lines)
+    lines.append("```")
 
     if warnings:
-        parts.append("Предупреждения: " + "; ".join(str(w) for w in warnings))
-    if raw_text:
-        # это полезно для отладки и ручной проверки
-        minified = [str(t).strip() for t in raw_text if str(t).strip()]
-        if minified:
-            parts.append("Фрагменты текста (OCR/видимые подписи): " + " | ".join(minified[:6]))
+        lines.append("")
+        lines.append("Предупреждения: " + "; ".join(str(w) for w in warnings))
 
-    return "\n".join(parts).strip()
+    return "\n".join(lines).strip()
 
-def _ocr_for_images(paths: List[str]) -> str:
-    """Собираем лёгкий OCR по всем изображениям (если доступен pytesseract)."""
-    chunks: List[str] = []
-    for p in paths:
-        t = _run_light_ocr(p)
-        if t:
-            chunks.append(t)
-    return "\n".join(chunks).strip()
 
 def extract_figure_values(owner_id: int, doc_id: int, numbers: List[str]) -> str:
     """
-    Публичная функция: извлечь ТОЧНЫЕ значения с указанных рисунков.
-    Не ломает старую логику: это отдельный режим, выдаёт таблицы/CSV.
+    Публичная функция: извлечь ЧИСЛОВЫЕ значения с указанных рисунков.
+
+    Она НЕ даёт интерпретацию, а возвращает по каждому рисунку блок вида:
+
+    **Рисунок N.** Подпись (если есть)
+    **Точные значения (как в документе):**
+    | Категория | Серия | Значение | Ед. |
+    ...
+
+    Приоритет источников данных:
+    1) attrs.chart_matrix / attrs.chart_data (OOXML-данные диаграммы из индекса);
+    2) если их нет — va_analyze_figure (vision_analyzer.analyze_figure).
+    Никакой генерации GPT здесь нет.
     """
     if not numbers:
         return "Не указаны номера рисунков. Например: 2.1, 3.2, 5."
 
     outputs: List[str] = []
+
     for raw in numbers:
         num = _norm_num(raw)
         row = _figure_row_by_number(owner_id, doc_id, num or "")
@@ -891,8 +752,83 @@ def extract_figure_values(owner_id: int, doc_id: int, numbers: List[str]) -> str
         title_tail = tail_sec or tail_txt
         shown_num = num or n_sec or n_txt or "—"
 
+        # ---------- 1. Пытаемся вытащить числовые данные напрямую из attrs.chart_matrix / attrs.chart_data ----------
+        attrs_raw = row.get("attrs")
+        try:
+            attrs_obj = attrs_raw if isinstance(attrs_raw, dict) else (json.loads(attrs_raw) if attrs_raw else {})
+        except Exception:
+            attrs_obj = {}
+
+        chart_matrix = attrs_obj.get("chart_matrix")
+        chart_rows = attrs_obj.get("chart_data")
+
+        analysis: Optional[Dict[str, Any]] = None
+
+        # 1.a) Нормализованный matrix → список числовых строк
+        if isinstance(chart_matrix, dict):
+            cats = chart_matrix.get("categories") or []
+            series_list = chart_matrix.get("series") or []
+            unit_common = chart_matrix.get("unit")
+            exact_rows: List[Dict[str, Any]] = []
+
+            for ri, cat in enumerate(cats):
+                cat_label = str(cat).strip() if cat is not None else ""
+                for s in series_list or []:
+                    vals = (s or {}).get("values") or []
+                    unit = (s or {}).get("unit") or unit_common
+                    ser_name = (s or {}).get("name")
+                    v = vals[ri] if ri < len(vals) else None
+                    if v is None:
+                        continue
+                    exact_rows.append(
+                        {
+                            "label": cat_label,
+                            "series": (ser_name or "").strip(),
+                            "value": v,
+                            "unit": unit,
+                        }
+                    )
+
+            if exact_rows:
+                analysis = {"exact_numbers": exact_rows}
+
+        # 1.b) Фолбэк: плоский список chart_data (старый/универсальный формат),
+        # только если по matrix ничего не собрали
+        if not analysis and isinstance(chart_rows, list) and chart_rows:
+            exact_rows: List[Dict[str, Any]] = []
+            for r in chart_rows:
+                if not isinstance(r, dict):
+                    continue
+                label = (r.get("category") or r.get("label") or "").strip()
+                series_name = (r.get("series_name") or r.get("series") or "").strip()
+                val = r.get("value")
+                unit = r.get("unit")
+                if label or (val is not None):
+                    exact_rows.append(
+                        {
+                            "label": label,
+                            "series": series_name,
+                            "value": val,
+                            "unit": unit,
+                        }
+                    )
+            if exact_rows:
+                analysis = {"exact_numbers": exact_rows}
+
+        # Если удалось собрать числовые данные из OOXML — сразу формируем таблицу, без vision
+        if isinstance(analysis, dict) and (analysis.get("exact_numbers") or analysis.get("data")):
+            header = (
+                f"**Рисунок {shown_num}.** {title_tail}"
+                if title_tail
+                else f"**Рисунок {shown_num}.**"
+            )
+            values_block = _format_values_markdown(analysis)
+            outputs.append(header + "\n" + values_block)
+            continue
+
+        # ---------- 2. Если в attrs нет структурированных данных — переходим к vision-анализу по картинкам ----------
         # собираем файлы изображений
-        img_paths = _extract_images_from_attrs(row.get("attrs"))
+        img_paths = _extract_images_from_attrs(attrs_obj)
         if sec:
             extra = _collect_images_for_section(owner_id, doc_id, sec)
             for p in extra:
@@ -900,25 +836,53 @@ def extract_figure_values(owner_id: int, doc_id: int, numbers: List[str]) -> str
                     img_paths.append(p)
 
         if not img_paths:
-            outputs.append(f"Рисунок {shown_num}: не удалось извлечь файл изображения (покажу только подпись: {title_tail or '—'}).")
+            outputs.append(
+                f"Рисунок {shown_num}: не удалось извлечь файл изображения "
+                f"(могу опираться только на подпись: {title_tail or '—'})."
+            )
             continue
 
-        # вспомогательный OCR (если установлен pytesseract)
-        ocr_hint = _ocr_for_images(img_paths)
+        # Берём первую картинку как основную для анализа
+                # Берём первую картинку как основную для анализа
+        image_path = img_paths[0]
 
-        # запрос к vision в «режиме значений»
-        obj = _vision_extract_values(img_paths, caption_hint=title_tail, ocr_hint=ocr_hint)
+        try:
+            # Используем тот же стиль вызова, что и в bot.py,
+            # чтобы не ловить TypeError по неправильным именам параметров.
+            analysis = va_analyze_figure(
+                image_path,
+                caption_hint=title_tail,
+                lang="ru",
+            )
+        except Exception:
+            analysis = None
 
-        if not obj:
-            # жёсткий фолбэк: хотя бы сообщим, что не распознали
-            outputs.append(f"Рисунок {shown_num}: не удалось структурировать значения автоматически.")
+        rows = None
+        if isinstance(analysis, dict):
+            rows = analysis.get("exact_numbers") or analysis.get("data")
+
+        if not rows:
+            outputs.append(
+                f"Рисунок {shown_num}: не удалось структурировать числовые значения автоматически."
+            )
             continue
 
-        header = f"**Рисунок {shown_num}.** {title_tail}" if title_tail else f"**Рисунок {shown_num}.**"
-        outputs.append(header + "\n" + _format_values_markdown(obj))
+        header = (
+            f"**Рисунок {shown_num}.** {title_tail}"
+            if title_tail
+            else f"**Рисунок {shown_num}.**"
+        )
+        values_block = _format_values_markdown(analysis)
+        outputs.append(header + "\n" + values_block)
 
     return "\n\n".join(outputs).strip()
 
+
 def extract_figure_value(owner_id: int, doc_id: int, number: str) -> str:
-    """Удобная обёртка для одного номера рисунка."""
+    """
+    Обёртка для одного номера рисунка.
+
+    ВАЖНО: первый ряд ответа всегда начинается с строки
+    '**Рисунок N.** ...', чтобы bot.py мог отделить заголовок от таблицы.
+    """
     return extract_figure_values(owner_id, doc_id, [number])
