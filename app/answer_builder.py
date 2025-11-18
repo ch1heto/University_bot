@@ -35,9 +35,11 @@ from .db import get_conn
 
 # Хелперы распознавания номеров/флагов/подсказок из intents (чтобы не дублировать регексы)
 try:
-    from .intents import extract_table_numbers, extract_section_hints  # type: ignore
+    from .intents import extract_table_numbers, extract_section_hints, extract_figure_numbers  # type: ignore
 except Exception:
     extract_table_numbers = None  # type: ignore
+    extract_figure_numbers = None  # type: ignore
+
 
     # Фолбэк: примитивный парсер подсказок разделов «глава/раздел/§/section 2.2»
     _SECTION_HINT_RE = re.compile(
@@ -139,6 +141,8 @@ _DEFAULT_RULES = (
     "7) Если пользователь просит точные значения «как в документе/без нормализации» — сохраняй исходный вид чисел (разделители тысяч, запятая/точка, дефисы).\n"
     "8) Если вопрос про рисунки/диаграммы/графики — опирайся на раздел [Figures] (включая describe, describe_cards и значения диаграмм), "
     "не придумывай числа, которых там нет.\n"
+    "9) Для диаграмм и графиков сначала коротко поясни, что показывают оси, легенда и единицы измерения, как устроен масштаб (шаг шкалы, начало отсчёта). "
+    "Если в [Figures]/values нет явного описания масштаба, не придумывай его: прямо указывай, что масштаб можно только приблизительно оценить по подписям.\n"
 )
 
 
@@ -156,6 +160,112 @@ _CAP_RE = re.compile(
 def _normalize_num(s: str) -> str:
     s = (s or "").replace(" ", "").replace(",", ".")
     return s.strip()
+
+# --- НОВОЕ: нормализация номеров рисунков / фокус по одному рисунку ---
+
+def _normalize_fig_num_local(s: str) -> str:
+    """
+    Локальная нормализация номера рисунка для сравнения:
+      - убираем пробелы;
+      - запятую → точку;
+      - склеиваем литеру и цифру: 'A.1'/'A-1' → 'A1'.
+    """
+    s = (s or "").strip()
+    s = s.replace(" ", "").replace(",", ".")
+    s = re.sub(r"([A-Za-zА-Яа-я])[\.\-]?(?=\d)", r"\1", s)
+    return s
+
+def _figure_focus_from_facts(facts: Dict[str, Any]) -> List[str]:
+    """
+    Возвращает нормализованный список номеров рисунков, на которых нужно сфокусироваться.
+    Основные сценарии:
+      - intents['figures']['single_only'] == True и есть describe с номерами;
+      - facts['figures']['single_only'] == True и есть describe_nums;
+      - fallback: единственная карточка в describe_cards → её num.
+    """
+    nums: List[str] = []
+
+    # 1) Из intents, если они проброшены в facts
+    try:
+        intents = (facts or {}).get("intents") or {}
+        fig_i = (intents.get("figures") or {})
+        if fig_i.get("single_only") and fig_i.get("describe"):
+            for n in fig_i.get("describe") or []:
+                v = _normalize_fig_num_local(str(n))
+                if v:
+                    nums.append(v)
+    except Exception:
+        pass
+
+    # 2) Из facts['figures'], если туда явно положили флаг/номера
+    if not nums:
+        try:
+            fig_f = (facts or {}).get("figures") or {}
+            if fig_f.get("single_only"):
+                for n in (fig_f.get("describe_nums") or []):
+                    v = _normalize_fig_num_local(str(n))
+                    if v:
+                        nums.append(v)
+        except Exception:
+            pass
+
+    # 3) Fallback: только одна карточка рисунка → считаем, что вопрос про неё
+    if not nums:
+        try:
+            fig_f = (facts or {}).get("figures") or {}
+            cards = fig_f.get("describe_cards") or []
+            if isinstance(cards, list) and len(cards) == 1:
+                n = cards[0].get("num")
+                if n:
+                    v = _normalize_fig_num_local(str(n))
+                    if v:
+                        nums.append(v)
+        except Exception:
+            pass
+
+    # дедуп с сохранением порядка
+    seen = set()
+    out: List[str] = []
+    for v in nums:
+        if v and v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+def _filter_lines_for_figure_focus(lines: List[str], focus_nums: List[str]) -> List[str]:
+    """
+    Оставляем только те строки, которые явно ссылаются на нужный(е) номер(а) рисунка:
+      - парсим номера через extract_figure_numbers, нормализуем;
+      - если в строке нет номеров → в single-режиме выбрасываем (чтобы не протащить чужой рисунок);
+      - если есть номера, но среди них есть чужие → строку выкидываем.
+    """
+    if not focus_nums:
+        return [str(x).strip() for x in (lines or []) if str(x).strip()]
+
+    focus_set = {n for n in focus_nums if n}
+    out: List[str] = []
+
+    for x in (lines or []):
+        s = str(x or "").strip()
+        if not s:
+            continue
+
+        nums: List[str] = []
+        if extract_figure_numbers:
+            try:
+                nums = extract_figure_numbers(s) or []  # type: ignore
+            except Exception:
+                nums = []
+
+        if not nums:
+            # в режиме «только Рисунок N» не тащим строки без явного номера
+            continue
+
+        norm_in_line = {_normalize_fig_num_local(n) for n in nums}
+        if norm_in_line.issubset(focus_set):
+            out.append(s)
+
+    return out
 
 def _parse_table_title(text: str) -> tuple[Optional[str], Optional[str]]:
     m = _CAP_RE.search(text or "")
@@ -442,7 +552,6 @@ def _tables_raw_by_bases(uid: int, doc_id: int, bases: List[str], rows_limit_eff
                 first_line = " — ".join([c.strip() for c in _split_cells(txt0) if c.strip()])
 
             # попробуем достать attrs из первой подходящей записи table/table_row
-                        # попробуем достать attrs из первой подходящей записи table/table_row (если колонка есть)
             con = get_conn()
             cur = con.cursor()
             has_attrs = _table_has_columns(con, "chunks", ["attrs"])
@@ -727,56 +836,31 @@ def facts_to_prompt(
         parts.append("- Tables:\n  " + "\n  ".join(block))
 
     # ----- Рисунки -----
-        # ----- Рисунки -----
     figures = (facts or {}).get("figures") or {}
-    if figures:
-        block = [f"count: {int(figures.get('count') or 0)}"]
-        if figures.get("list"):
-            block.append("list:\n" + _md_list(figures["list"], 25, figures.get("more", 0), norm_numbers=norm_numbers))
+    cards = figures.get("describe_cards") if figures else None
 
-        # 3.1) Линейные описания (как было)
-        desc_lines = [str(x).strip() for x in (figures.get("describe_lines") or []) if str(x).strip()]
-        if desc_lines:
-            block.append(
-                "describe:\n"
-                + "\n".join(
-                    [f"- {(_normalize_numbers(x) if norm_numbers else x)}" for x in desc_lines[:25]]
-                )
-            )
+    if cards:
+        block: List[str] = []
 
-        # 3.2) Новое: карточки с полями (num, display, where, images, highlights, vision, values_str, chart_matrix, …)
-        describe_cards = figures.get("describe_cards") or []
-        if describe_cards:
-            try:
-                block.append("describe_cards:\n" + json.dumps(describe_cards, ensure_ascii=False, indent=2))
-            except Exception:
-                pass
+        for c in cards[:25]:
+            title = c.get("title") or c.get("display") or "Рисунок"
+            desc = c.get("description") or ""
+            values = c.get("values") or []  # ← Новый формат vision_analyzer
 
-            # 3.3) Дополнительно вытаскиваем values_str из карточек диаграмм в плоский текст,
-            # чтобы модели было проще использовать численные значения.
-            values_lines: List[str] = []
-            for c in describe_cards:
-                try:
-                    vs = (c.get("values_str") or "").strip()
-                except Exception:
-                    vs = ""
-                if not vs:
-                    continue
-                # values_str может быть многострочным — режем по строкам
-                for line in vs.splitlines():
-                    line = line.strip()
-                    if line:
-                        values_lines.append(line)
+            # Заголовок
+            block.append(f"- **{title}**")
 
-            if values_lines:
-                if norm_numbers:
-                    values_lines = [_normalize_numbers(v) for v in values_lines]
-                block.append(
-                    "values:\n"
-                    + "\n".join([f"- {v}" for v in values_lines[:25]])
-                )
+            # Значения
+            if values:
+                vals = ", ".join(values)
+                block.append(f"  Значения: {vals}")
+
+            # Описание
+            if desc:
+                block.append(f"  Описание: {desc}")
 
         parts.append("- Figures:\n  " + "\n  ".join(block))
+
 
     # ----- Источники -----
     sources = (facts or {}).get("sources") or {}
@@ -793,7 +877,8 @@ def facts_to_prompt(
     # ----- Краткое содержание -----
     if (facts or {}).get("summary_text"):
         st = str(facts["summary_text"])
-        parts.append("- Summary:\n  " + (( _normalize_numbers(_shorten(st, 1200)) ) if norm_numbers else _shorten(st, 1200)).replace("\n", "\n  "))
+        # Оставляем полный структурированный вывод от summarizer
+        parts.append("- Summary:\n  " + st.replace("\n", "\n  "))
 
     # ----- Вербатим-цитаты (шинглы) -----
     if (facts or {}).get("verbatim_hits"):
@@ -1044,6 +1129,7 @@ async def generate_answer_stream(
             pass
 
     # 2) Фолбэк — прямой стрим в модель
+        # 2) Фолбэк — прямой стрим в модель
     if chat_with_gpt_stream is not None:
         try:
             system_prompt = (
@@ -1055,8 +1141,17 @@ async def generate_answer_stream(
                 {"role": "assistant", "content": ctx},
                 {"role": "user", "content": q},
             ]
-            stream_obj = chat_with_gpt_stream(messages, temperature=temperature, max_tokens=max_tokens)  # type: ignore
-            return _aiter_any(stream_obj)
+            stream_obj = chat_with_gpt_stream(
+                messages, temperature=temperature, max_tokens=max_tokens  # type: ignore
+            )
+
+            async def _fmt2():
+                async for chunk in _aiter_any(stream_obj):
+                    # Приводим заголовки "# ..." к "**...**", как и в ace_stream-пути
+                    yield _headings_to_bold(chunk)
+
+            return _fmt2()
+
         except Exception:
             pass
 

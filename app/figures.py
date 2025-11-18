@@ -55,7 +55,6 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from .config import Cfg
 from . import db as db_mod
-from .vision_analyzer import analyze_figure as va_analyze_figure
 
 # --- Логер ---
 log = logging.getLogger("figures")
@@ -171,8 +170,11 @@ def parse_caption_line(text: str) -> Tuple[Optional[str], Optional[str]]:
     # "А 1.2" → "А1.2", "A 2,3" → "A2.3"
     raw_num = raw_num.replace(" ", "")
     num = raw_num.replace(",", ".")
+    # убираем хвостовые точки/скобки: "6." / "6)." → "6"
+    num = re.sub(r"[.)]+$", "", num)
     title = _normalize_text(m.group("title"))
     return (num or None), (title or None)
+
 
 
 def looks_like_caption(text: str) -> bool:
@@ -895,9 +897,7 @@ def _sync_figures_to_db(db_doc_id: int, out_dir: Path, records: List[FigureRecor
             image_path=image_rel,
             caption=rec.caption,
             kind=None,
-            # новое поле: структурированные данные диаграммы (если есть)
-            chart_data=rec.chart_data,
-            attrs=attrs,
+            attrs=attrs,  # chart_data уже внутри attrs
         )
         rec.db_id = fid
 
@@ -939,19 +939,35 @@ def index_document(path: str | Path, *, db_doc_id: Optional[int] = None) -> Dict
             log.info("DOCX_EXTRACT_IMAGES=false — пропускаю %s", path.name)
         else:
             log.info("Извлекаю изображения из DOCX: %s", path.name)
-            # Берём только готовые картинки, которые Word уже положил в документ.
-            # Это гарантирует, что диаграммы в боте выглядят так же, как в DOCX,
-            # и ничего не перерисовывается через matplotlib.
-            records += extract_docx(path, out_dir, neighbor_window=NEIGH)
-            # ВАЖНО: _extract_docx_charts_to_png больше не вызываем.
+            # 1) обычные встроенные картинки (в том числе fallback для диаграмм)
+            docx_figs = extract_docx(path, out_dir, neighbor_window=NEIGH)
+            records += docx_figs
 
+            # 2) дополнительно пробуем вытащить собственно диаграммы из OOXML (chartX.xml)
+            chart_records = _extract_docx_charts_to_png(
+                path,
+                out_dir,
+                neighbor_window=NEIGH,
+                order_base=len(records),
+            )
+            if chart_records:
+                log.info(
+                    "DOCX: найдено %d диаграмм(ы) с данными (chartXML).",
+                    len(chart_records),
+                )
+                records += chart_records
+
+            if not docx_figs and not chart_records:
+                log.info(
+                    "DOCX не дал ни одной встроенной картинки/диаграммы — буду ориентироваться на DOCX→PDF (если включён)."
+                )
 
         # DOCX→PDF — только если совсем ничего не нашли, либо если явно включён ALWAYS
         if PDF_ON and DOCX_PDF_BACKEND != "off" and (DOCX_PDF_ALWAYS or (DOCX_FALLBACK and len(records) == 0)):
             if DOCX_PDF_ALWAYS and len(records) > 0:
                 log.info("DOCX_PDF_ALWAYS=true — дополнительно запускаю PDF-вытяжку для векторных диаграмм.")
             elif len(records) == 0:
-                log.info("DOCX дал 0 изображений — пробую конвертацию в PDF…")
+                log.info("DOCX дал 0 изображений/диаграмм — пробую конвертацию в PDF…")
             pdf_path = _docx_to_pdf_persistent(path, out_dir)
             if pdf_path and pdf_path.exists():
                 log.info("Извлекаю изображения из PDF: %s", pdf_path.name)
@@ -959,6 +975,7 @@ def index_document(path: str | Path, *, db_doc_id: Optional[int] = None) -> Dict
                 records += extract_pdf(pdf_path, out_dir, order_base=len(records))
             else:
                 log.info("Не удалось выполнить DOCX→PDF.")
+
 
     elif path.suffix.lower() == ".pdf":
         if not PDF_ON:
@@ -1138,105 +1155,6 @@ def figure_display_name(fig: Dict[str, Any]) -> str:
     if num:
         return f"Рисунок {num}"
     return Path(fig["rel_path"]).name
-
-
-# --- Vision-анализ с привязкой к БД ---
-
-
-def analyze_figure_for_db(
-    doc_id: int,
-    figure_id: int,
-    *,
-    intent: str = "describe-with-numbers",
-    chart_xml: Optional[bytes] = None,
-    force: bool = False,
-) -> Dict[str, Any]:
-    """
-    Обёртка над vision_analyzer.analyze_figure с привязкой к SQLite.
-
-    - Берёт путь к картинке и подпись из таблицы figures;
-    - если в figure_analysis уже есть результат и force=False — возвращает его;
-    - иначе запускает vision-анализ, сохраняет payload в figure_analysis и возвращает его.
-    """
-    # 1) если уже есть анализ и не просили пересчитать — возвращаем его
-    if not force:
-        row = db_mod.get_figure_analysis(figure_id)
-        if row and row.get("data") is not None:
-            # data здесь — то, что мы ранее положили в data_json (полный payload)
-            return row["data"]
-
-    # 2) достаём сам рисунок
-    figs = db_mod.get_figures_for_doc(doc_id)
-    frow = next((f for f in figs if f["figure_id"] == figure_id), None)
-    if not frow:
-        raise ValueError(f"Figure {figure_id} for doc {doc_id} not found")
-
-    image_rel = frow["image_path"]
-    img_path = Path(Cfg.FIG_CACHE_DIR) / image_rel
-    caption = frow.get("caption")
-    # при желании сюда можно прокинуть заголовок секции/окрестный текст из attrs
-    context = None
-
-    # 3) анализ через универсальный мозг vision_analyzer
-    payload = va_analyze_figure(
-        image_path=str(img_path),
-        caption=caption,
-        context=context,
-        intent=intent,
-        chart_xml=chart_xml,
-    )
-
-    meta = payload.get("meta") or {}
-    source = meta.get("source")
-    strict_passed = meta.get("strict_passed")
-
-    # простая эвристика confidence
-    if source == "ooxml" and strict_passed:
-        confidence = 1.0
-    elif strict_passed:
-        confidence = 0.9
-    else:
-        confidence = 0.7
-
-    # 4) сохранить в figure_analysis
-    db_mod.upsert_figure_analysis(
-        figure_id=figure_id,
-        kind=payload.get("kind") or meta.get("chart_type"),
-        data=payload,  # сохраняем весь payload как JSON
-        exact_numbers=payload.get("exact_numbers"),
-        exact_text=payload.get("exact_text"),
-        confidence=confidence,
-    )
-
-    return payload
-
-
-def analyze_figure_by_label(
-    doc_id: int,
-    figure_label: str,
-    *,
-    intent: str = "describe-with-numbers",
-    chart_xml: Optional[bytes] = None,
-    force: bool = False,
-) -> Dict[str, Any]:
-    """
-    Удобный хелпер: найти рисунок по номеру (label, напр. '2.3') и проанализировать его.
-
-    Если анализ уже есть в figure_analysis и force=False — вернётся он;
-    иначе будет запущен vision-анализ и результат попадёт в БД.
-    """
-    figs = db_mod.get_figures_for_doc(doc_id)
-    frow = next((f for f in figs if (f.get("label") or "") == figure_label), None)
-    if not frow:
-        raise ValueError(f"Figure with label '{figure_label}' for doc {doc_id} not found")
-
-    return analyze_figure_for_db(
-        doc_id=doc_id,
-        figure_id=frow["figure_id"],
-        intent=intent,
-        chart_xml=chart_xml,
-        force=force,
-    )
 
 
 # --- CLI для локальной отладки ---
@@ -1451,6 +1369,19 @@ def _extract_docx_charts_to_png(
                 if not img_path:
                     continue
 
+                # структурированные данные диаграммы для бота/answer_builder
+                chart_rows = []
+                for ser in info.get("series") or []:
+                    sname = ser.get("name")
+                    for label, val in (ser.get("items") or []):
+                        chart_rows.append(
+                            {
+                                "label": label or "",
+                                "value": val,
+                                "series_name": sname,
+                            }
+                        )
+
                 order += 1
                 rec = FigureRecord(
                     id=f"{fig_number or order}-{_short_hash(png_name.encode(), 8)}",
@@ -1462,8 +1393,10 @@ def _extract_docx_charts_to_png(
                     title=fig_title,
                     caption=caption_text,
                     section=section_path_by_idx.get(i) or None,
+                    chart_data=chart_rows or None,
                 )
                 rec.anchors = rec.build_anchors()
                 records.append(rec)
+
 
     return records

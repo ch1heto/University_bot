@@ -28,12 +28,19 @@ TABLE_NUM_RE = re.compile(
 
 # Рисунки: упоминания и номера
 FIG_ANY_RE = re.compile(
-    r"\b(рисун\w*|рис(?:\.|унок)?|figure|fig\.?|картин\w*|изображен\w*|диаграмм\w*|график\w*|схем\w*|иллюстрац\w*)\b",
+    r"\b(рисун\w*|рис(?:\.|унок)?|figure|fig(?:\.|ure)?|картин\w*|изображен\w*|диаграмм\w*|график\w*|схем\w*|иллюстрац\w*)\b",
     re.IGNORECASE
 )
+# теперь поддерживаем:
+# - "Рисунок 6", "Рис. 6", "Рис.6", "Figure 6", "Fig. 6"
+# - "Рисунок 2.3", "Рисунок 2,3"
+# - буквенный префикс: "Рисунок А.1", "Figure A1"
 FIG_NUM_RE = re.compile(
-    r"(?i)\b(?:рис(?:\.|унок)?|figure|fig\.?|картин\w*)\s*(?:№\s*|no\.?\s*|номер\s*)?(\d+(?:[.,]\d+)*)\b"
+    r"(?i)\b(?:рис(?:\.|унок)?|figure|fig(?:\.|ure)?|картин\w*)"
+    r"\s*(?:№\s*|no\.?\s*|номер\s*)?"
+    r"([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)\.?"
 )
+
 
 # Секции/главы — подсказки, где искать («глава 2.2», «раздел 3», «§ 1.4», «section 4.1», «appendix A.1»)
 SECTION_HINT_RE = re.compile(
@@ -181,11 +188,17 @@ def extract_table_numbers(text: str) -> List[str]:
     return sorted(normed, key=_sort_key_for_dotted)
 
 def extract_figure_numbers(text: str) -> List[str]:
+    """
+    Ищет «Рисунок/Рис./Figure/Fig. 6/2.3/A.1» и возвращает нормализованные номера:
+    - литеры склеиваются с цифрой: 'A.1' -> 'A1'
+    - дробные части через точку: '2,3' -> '2.3'
+    """
     raw = [m for m in FIG_NUM_RE.findall(text or "")]
     if not raw:
         return []
     normed = {_normalize_num(n) for n in raw if n and str(n).strip()}
     return sorted(normed, key=_sort_key_for_dotted)
+
 
 def extract_section_hints(text: str) -> List[str]:
     """
@@ -293,13 +306,22 @@ def _classify_item(text: str) -> Dict[str, any]:
 
     rows_limit, include_all = _extract_rows_limit_and_full(item)
 
+    # Один конкретный рисунок (опиши рисунок 6 / что на рисунке 2.3 / figure 4)
+    single_fig = False
+    if figures_want:
+        if len(figure_nums) == 1 and not (COUNT_HINT_RE.search(item) or WHICH_HINT_RE.search(item)):
+            single_fig = True
+
     return {
         "ask": item,
         "tables": {
             "want": tables_want,
             "describe": table_nums,
             "section_hints": sect_hints if tables_want else [],
-            "from_section": (tables_want and not table_nums and (bool(sect_hints) and (bool(SECTION_HAS_TABLE_RE.search(item)) or bool(TABLE_IN_SECTION_RE.search(item))))),
+            "from_section": (
+                tables_want and not table_nums and
+                (bool(sect_hints) and (bool(SECTION_HAS_TABLE_RE.search(item)) or bool(TABLE_IN_SECTION_RE.search(item))))
+            ),
             "include_all_values": bool(include_all) if tables_want else False,
             "rows_limit": rows_limit if tables_want else None,
         },
@@ -307,8 +329,13 @@ def _classify_item(text: str) -> Dict[str, any]:
             "want": figures_want,
             "describe": figure_nums,
             "section_hints": sect_hints if figures_want else [],
-            "from_section": (figures_want and not figure_nums and (bool(sect_hints) and (bool(SECTION_HAS_FIG_RE.search(item)) or bool(FIG_IN_SECTION_RE.search(item))))),
+            "from_section": (
+                figures_want and not figure_nums and
+                (bool(sect_hints) and (bool(SECTION_HAS_FIG_RE.search(item)) or bool(FIG_IN_SECTION_RE.search(item))))
+            ),
             "want_vision": bool(FIG_VISION_HINT_RE.search(item)) if figures_want else False,
+            "single_only": single_fig,
+            "exact_numbers": bool(EXACT_NUMBERS_RE.search(item)) if figures_want else False,
         },
         "sources": {
             "want": sources_want,
@@ -376,6 +403,8 @@ def detect_intents(text: str, *, list_limit: int = 25) -> Dict:
             "want_vision": False,
             "section_hints": [],
             "from_section": False,
+            "single_only": False,   # NEW: фокус на одном рисунке
+            "exact_numbers": False, # NEW: нужны исходные числа для него
         },
         "sources": {"want": False, "count": False, "list": False, "limit": int(list_limit)},
         "summary": is_summary_intent(q),
@@ -387,6 +416,7 @@ def detect_intents(text: str, *, list_limit: int = 25) -> Dict:
         "subitems": [],
         "multi_want": False,
     }
+
 
     # ---- Многочастные запросы (план подпунктов — на будущее для пайплайна)
     subparts = _split_into_subitems(q)
@@ -446,8 +476,17 @@ def detect_intents(text: str, *, list_limit: int = 25) -> Dict:
         nums_f = extract_figure_numbers(q)
         if nums_f:
             intents["figures"]["describe"] = nums_f
+
+        # Определяем, нацелен ли вопрос на один конкретный рисунок
+        if nums_f and len(nums_f) == 1 and not intents["figures"]["list"] and not intents["figures"]["count"]:
+            intents["figures"]["single_only"] = True
+
         if FIG_VISION_HINT_RE.search(q):
             intents["figures"]["want_vision"] = True
+
+        # «точные числа» для фигур (например: "дай точные значения по рисунку 6")
+        if EXACT_NUMBERS_RE.search(q):
+            intents["figures"]["exact_numbers"] = True
 
         # Секционные подсказки
         sects_f = extract_section_hints(q)
@@ -457,6 +496,7 @@ def detect_intents(text: str, *, list_limit: int = 25) -> Dict:
         # «В (этой) главе есть рисунки …» ИЛИ «рисунок(и) в главе …» — без номера
         if (not nums_f) and sects_f and (SECTION_HAS_FIG_RE.search(q) or FIG_IN_SECTION_RE.search(q)):
             intents["figures"]["from_section"] = True
+
 
     logging.debug("INTENTS: %s", json.dumps(intents, ensure_ascii=False))
     return intents

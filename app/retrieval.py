@@ -703,141 +703,6 @@ def keyword_find(owner_id: int, doc_id: int, pattern: str, max_hits: int = 3) ->
                 break
     return hits
 
-def get_figure_record(
-    doc_id: int,
-    *,
-    figure_label: Optional[str] = None,
-    figure_id: Optional[int] = None,
-    ensure_analysis: bool = True,
-) -> Optional[Dict[str, Any]]:
-    """
-    Возвращает одну запись о рисунке из таблицы figures + результат анализа (vision_analyzer).
-
-    Можно передать либо figure_id, либо номер рисунка (figure_label, напр. '2.3').
-    Если ensure_analysis=True — при отсутствии анализа он будет посчитан и сохранён.
-    """
-    if figure_id is None and not figure_label:
-        return None
-
-    figs = get_figures_for_doc(doc_id)
-    row: Optional[Dict[str, Any]] = None
-
-    if figure_id is not None:
-        for f in figs:
-            if int(f.get("figure_id")) == int(figure_id):
-                row = f
-                break
-    else:
-        wanted = _num_norm(str(figure_label))
-        for f in figs:
-            lab = _num_norm(str(f.get("label") or f.get("figure_label") or ""))
-            if lab and lab == wanted:
-                row = f
-                break
-
-    if not row:
-        return None
-
-    analysis: Optional[Dict[str, Any]] = None
-    if ensure_analysis:
-        try:
-            from .figures import analyze_figure_for_db
-            analysis = analyze_figure_for_db(
-                doc_id=doc_id,
-                figure_id=int(row["figure_id"]),
-                intent="describe-with-numbers",
-            )
-        except Exception:
-            analysis = None
-
-    return {
-        "figure": row,
-        "analysis": analysis,
-    }
-
-
-def _build_figure_context_text(rec: Dict[str, Any]) -> str:
-    """
-    Собираем человекочитаемый текст для включения в RAG-контекст из записи figure+analysis.
-    """
-    fig = rec.get("figure") or {}
-    analysis = rec.get("analysis") or {}
-
-    num = _num_norm(str(fig.get("label") or fig.get("figure_label") or "")) or None
-    caption = (fig.get("caption") or "").strip()
-    base_text = (analysis.get("text") or "").strip()
-
-    prefix = f"Рисунок {num}" if num else "Рисунок"
-
-    if not base_text and caption:
-        base_text = caption
-    if not base_text:
-        return ""
-
-    if caption and caption not in base_text:
-        head = f"{prefix} — {caption}"
-        if not base_text.startswith(head):
-            text = f"{head}. {base_text}"
-        else:
-            text = base_text
-    else:
-        if not base_text.lower().startswith(prefix.lower()):
-            text = f"{prefix}: {base_text}"
-        else:
-            text = base_text
-
-    meta = (analysis.get("meta") or {}) if isinstance(analysis, dict) else {}
-    caveat = (meta.get("caveat") or "").strip()
-    if caveat and caveat not in text:
-        text = f"{text} {caveat}".strip()
-
-    return text
-
-
-def _figure_context_snippets_for_query(doc_id: int, query: str, max_items: int = 2) -> List[Dict[str, Any]]:
-    """
-    Если вопрос явно ссылается на «Рисунок N», подмешиваем в контекст 1–2
-    синтетических сниппета с кратким описанием соответствующих рисунков.
-    """
-    nums = _extract_figure_numbers_from_query(query)
-    if not nums:
-        return []
-
-    out: List[Dict[str, Any]] = []
-    seen: set[str] = set()
-
-    for raw in nums:
-        num = _num_norm(raw)
-        if not num or num in seen:
-            continue
-        seen.add(num)
-
-        rec = get_figure_record(doc_id, figure_label=num, ensure_analysis=True)
-        if not rec or not rec.get("analysis"):
-            continue
-
-        text = _build_figure_context_text(rec)
-        if not text:
-            continue
-
-        fig = rec["figure"]
-        fid = int(fig.get("figure_id"))
-        synthetic_id = -int(1_000_000 + fid)
-
-        out.append(
-            {
-                "id": synthetic_id,
-                "page": fig.get("page"),
-                "section_path": (fig.get("section") or ""),
-                "text": text,
-                "score": 0.99,
-            }
-        )
-        if len(out) >= max_items:
-            break
-
-    return out
-
 # =======================================================================
 #                НОВОЕ: «РИСУНКИ» — СЧЁТЧИК, СПИСОК, КАРТОЧКИ
 # =======================================================================
@@ -847,238 +712,6 @@ def _figure_context_snippets_for_query(doc_id: int, query: str, max_items: int =
 _FIG_TITLE_RE = re.compile(
     r"(?i)\b(?:рис(?:\.|унок)?|fig(?:\.|ure)?)\s*([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*\.?)\s*(?:[—\-–:\u2013\u2014]\s*(.+))?"
 )
-
-# --- NEW: chart_data → rows/values_str (для диаграмм в DOCX)
-# --- NEW: chart_matrix/chart_data → rows/values_str (для диаграмм в DOCX)
-def _chart_rows_from_attrs(attrs: str | dict | None) -> list[dict] | None:
-    """
-    Достаём rows из attrs и приводим к каноническому виду:
-      {
-        "label": str,        # подпись категории (возможен префикс серии)
-        "value": float|Any,  # числовое значение (если есть)
-        "unit": str|None,    # "%", "шт", и т.п.
-        "value_raw": str|None,   # как в исходном XML/таблице
-        "series_name": str|None,
-        "category": str|None,
-      }
-
-    Поддерживаем:
-      - нормализованный OOXML-вид: attrs["chart_matrix"] =
-            {"categories":[...],
-             "series":[{"name":..., "values":[...], "unit":"%"/None, ...}],
-             "unit": "...", "meta": {...}}
-      - новый формат: attrs["chart_data"] = [ {...}, {...} ]
-      - старый формат: attrs["chart_data"] = [ {"label": ..., "value": ...}, ... ]
-      - dict вида {"categories":[...], "series":[{"values":[...], "unit":"%"}]}
-    """
-    # attrs может быть и строкой JSON, и уже dict'ом
-    if isinstance(attrs, str):
-        try:
-            a = json.loads(attrs or "{}")
-        except Exception:
-            return None
-    elif isinstance(attrs, dict):
-        a = attrs
-    else:
-        return None
-
-    rows_norm: list[dict] = []
-
-    # ---- случай 0: нормализованный chart_matrix ----
-    cm = a.get("chart_matrix")
-    if isinstance(cm, dict):
-        cats = cm.get("categories") or []
-        series_list = cm.get("series") or []
-        if isinstance(cats, list) and isinstance(series_list, list) and cats and series_list:
-            cats = [str(c) for c in cats]
-            multi = len(series_list) > 1
-            default_unit = cm.get("unit")
-            for s in series_list:
-                if not isinstance(s, dict):
-                    continue
-                s_name = (s.get("name") or s.get("series_name") or "").strip() or None
-                vals = s.get("values") or s.get("data") or []
-                unit = s.get("unit") or default_unit
-                for idx, v in enumerate(vals):
-                    cat = cats[idx] if idx < len(cats) else f"Категория {idx + 1}"
-                    if multi and s_name:
-                        label = f"{s_name}: {cat}"
-                    else:
-                        label = cat
-                    rows_norm.append(
-                        {
-                            "label": label,
-                            "value": v,
-                            "unit": unit,
-                            "value_raw": None,
-                            "series_name": s_name,
-                            "category": cat,
-                        }
-                    )
-        if rows_norm:
-            return rows_norm
-
-    # ---- случай 1: уже список (новый/старый формат chart_data) ----
-    raw = (
-        a.get("chart_data")
-        or (a.get("chart") or {}).get("data")
-        or a.get("data")
-        or a.get("series")
-    )
-
-    if isinstance(raw, list) and raw:
-        for item in raw:
-            if isinstance(item, dict):
-                label = (
-                    item.get("label")
-                    or item.get("category")
-                    or item.get("name")
-                    or ""
-                )
-                series_name = item.get("series_name") or item.get("series") or None
-                category = item.get("category") or item.get("cat") or None
-
-                value = item.get("value")
-                value_raw = item.get("value_raw")
-                unit = item.get("unit")
-
-                if value_raw is None and isinstance(value, str):
-                    value_raw = value
-
-                rows_norm.append(
-                    {
-                        "label": str(label).strip(),
-                        "value": value,
-                        "unit": unit,
-                        "value_raw": value_raw,
-                        "series_name": series_name,
-                        "category": category,
-                    }
-                )
-            elif isinstance(item, (list, tuple)) and len(item) >= 2:
-                rows_norm.append(
-                    {
-                        "label": str(item[0]),
-                        "value": item[1],
-                        "unit": None,
-                        "value_raw": None,
-                        "series_name": None,
-                        "category": None,
-                    }
-                )
-
-        return rows_norm or None
-
-    # ---- случай 2: dict с categories/series ----
-    # {"categories":[...], "series":[{"values":[...], "unit":"%"}]}
-    if isinstance(raw, dict) and raw.get("categories") and raw.get("series"):
-        cats = list(raw.get("categories") or [])
-        s0 = (raw.get("series") or [{}])[0] or {}
-        vals = list(s0.get("values") or s0.get("data") or [])
-        unit = s0.get("unit")
-        series_name = s0.get("name") or s0.get("series_name")
-
-        for i in range(min(len(cats), len(vals))):
-            rows_norm.append(
-                {
-                    "label": str(cats[i]),
-                    "value": vals[i],
-                    "unit": unit,
-                    "value_raw": None,
-                    "series_name": series_name,
-                    "category": str(cats[i]),
-                }
-            )
-
-        return rows_norm or None
-
-    return None
-
-def _format_chart_values(rows: list[dict]) -> str:
-    """
-    Формирует человекочитаемые строки значений диаграммы из нормализованных rows
-    (см. _chart_rows_from_attrs).
-
-    Логика приоритета:
-      1) если есть value_raw + unit="%" и есть числовой value → форматируем процент из value (70.0 -> "70%");
-      2) если есть value_raw → печатаем его как есть;
-      3) если есть только value (float/int) → аккуратно форматируем число;
-      4) если всё совсем плохо — просто str(value).
-    """
-    def _fmt_percent(v: float) -> str:
-        # 70.0 -> "70%", 70.35 -> "70.35%"
-        if abs(v - round(v)) < 0.05:
-            return f"{int(round(v))}%"
-        s = f"{v:.2f}".rstrip("0").rstrip(".")
-        return f"{s}%"
-
-    def _fmt_number(v: float) -> str:
-        # компактное представление, без лишних нулей
-        return f"{v:.6g}"
-
-    lines: list[str] = []
-
-    for r in rows or []:
-        lab = (
-            str(
-                r.get("label")
-                or r.get("name")
-                or r.get("category")
-                or ""
-            ).strip()
-        )
-
-        raw = r.get("value_raw")
-        if isinstance(raw, (int, float)):
-            raw = str(raw)
-        raw = (raw or "").strip()
-
-        unit = r.get("unit")
-        value = r.get("value")
-        num_val: float | None = None
-        if isinstance(value, (int, float)):
-            num_val = float(value)
-
-        # --- формируем строку значения ---
-        vstr = ""
-        if raw:
-            # если unit="%" и raw без %, а есть числовое значение -> форматируем по числу
-            if unit == "%" and "%" not in raw and isinstance(num_val, float):
-                vstr = _fmt_percent(num_val)
-            else:
-                vstr = raw
-        elif isinstance(num_val, float):
-            if unit == "%":
-                vstr = _fmt_percent(num_val)
-            else:
-                vstr = _fmt_number(num_val)
-        else:
-            other = r.get("value")
-            if other is not None:
-                vstr = str(other)
-            else:
-                vstr = ""
-
-        if not lab and not vstr:
-            continue
-
-        # unit уже учтён в vstr для процентов, поэтому добавляем только,
-        # если это НЕ "%" и строка непустая
-        unit_suffix = ""
-        if isinstance(unit, str) and unit.strip() and unit.strip() != "%":
-            unit_suffix = f" {unit.strip()}"
-
-        # Финальная строка
-        if lab and vstr:
-            line = f"— {lab}: {vstr}{unit_suffix}"
-        elif lab:
-            line = f"— {lab}"
-        else:
-            line = f"— {vstr}{unit_suffix}"
-
-        lines.append(line.strip())
-
-    return "\n".join(lines)
 
 
 def _shorten(s: str, limit: int = 120) -> str:
@@ -1107,66 +740,43 @@ def _parse_figure_title(text: str) -> Tuple[Optional[str], Optional[str]]:
     title = (m.group(2) or "").strip() or None
     return (num or None, title)
 
-def _distinct_figure_basenames(uid: int, doc_id: int) -> List[str]:
-    """
-    Собираем уникальные имена «рисунков» по section_path (совместимо со старыми индексами,
-    где использовался префикс '[Рисунок]' в тексте).
-    """
-    con = get_conn()
-    cur = con.cursor()
-    if _table_has_columns(con, "chunks", ["element_type"]):
-        cur.execute(
-            """
-            SELECT DISTINCT section_path
-            FROM chunks
-            WHERE owner_id=? AND doc_id=? AND element_type='figure'
-            ORDER BY section_path ASC
-            """,
-            (uid, doc_id),
-        )
-    else:
-        cur.execute(
-            """
-            SELECT DISTINCT section_path
-            FROM chunks
-            WHERE owner_id=? AND doc_id=? AND (text LIKE '[Рисунок]%%' OR text LIKE '[Figure]%%')
-            ORDER BY section_path ASC
-            """,
-            (uid, doc_id),
-        )
-
-    rows = cur.fetchall()
-    con.close()
-    return [r["section_path"] for r in rows if r["section_path"]]
-
 def count_figures(uid: int, doc_id: int) -> int:
-    """Сколько всего «рисунков» в документе (по уникальным section_path)."""
-    return len(_distinct_figure_basenames(uid, doc_id))
+    """
+    Сколько всего «рисунков» в документе.
+    Теперь считаем по таблице figures, а не по chunks/regex.
+    """
+    figs = get_figures_for_doc(doc_id)
+    return len(figs or [])
+
 
 def list_figures(uid: int, doc_id: int, limit: int = 25) -> Dict[str, object]:
     """
-    Возвращает короткий список «рисунков»:
+    Короткий список «рисунков» на основе таблицы figures:
       { "count": N, "list": [ 'Рисунок 2.1 — Схема …', ... ], "more": M }
     """
-    bases = _distinct_figure_basenames(uid, doc_id)
+    figs = get_figures_for_doc(doc_id) or []
+
     items: List[str] = []
-    for base in bases:
-        tail = _last_segment(base)
-        num, title = _parse_figure_title(tail)
-        if num and title:
-            items.append(f"Рисунок {num} — {_shorten(title)}")
+    for f in figs:
+        num = _num_norm(str(f.get("label") or f.get("figure_label") or f.get("number") or ""))
+        caption = (f.get("caption") or "").strip()
+        if num and caption:
+            items.append(f"Рисунок {num} — {_shorten(caption)}")
         elif num:
             items.append(f"Рисунок {num}")
-        elif tail:
-            items.append(_shorten(tail))
+        elif caption:
+            items.append(_shorten(caption))
         else:
             items.append("Рисунок")
+
     items = [x for x in items if x]
+    count = len(items)
     return {
-        "count": len(bases),
+        "count": count,
         "list": items[:limit],
-        "more": max(0, len(items) - limit),
+        "more": max(0, count - limit),
     }
+
 
 def get_figure_record(
     doc_id: int,
@@ -1223,10 +833,36 @@ def get_figure_record(
         "analysis": analysis,
     }
 
+def _figure_values_str_from_row(fig_row: Dict[str, Any]) -> Optional[str]:
+    """
+    Достаём values_str для диаграммы из attrs фигуры (таблица figures):
+      - attrs.chart_data
+      - или attrs.chart_matrix / data / series.
+    Используем общие _chart_rows_from_attrs + _format_chart_values.
+    """
+    attrs = fig_row.get("attrs")
+    if isinstance(attrs, str):
+        try:
+            attrs_obj = json.loads(attrs or "{}")
+        except Exception:
+            attrs_obj = {}
+    elif isinstance(attrs, dict):
+        attrs_obj = attrs
+    else:
+        attrs_obj = {}
+
+    if not isinstance(attrs_obj, dict):
+        return None
+
+    rows = _chart_rows_from_attrs(attrs_obj)
+    if not rows:
+        return None
+    return _format_chart_values(rows)
 
 def _build_figure_context_text(rec: Dict[str, Any]) -> str:
     """
     Собираем человекочитаемый текст для включения в RAG-контекст из записи figure+analysis.
+    Дополнительно подмешиваем values_str для диаграммы из attrs.chart_data/chart_matrix.
     """
     fig = rec.get("figure") or {}
     analysis = rec.get("analysis") or {}
@@ -1254,6 +890,13 @@ def _build_figure_context_text(rec: Dict[str, Any]) -> str:
             text = f"{prefix}: {base_text}"
         else:
             text = base_text
+
+    # Подмешиваем структурные значения диаграммы (если есть в attrs фигуры)
+    vals_str = _figure_values_str_from_row(fig)
+    if vals_str:
+        # чтобы не задублировать, только если этих строк ещё нет в тексте
+        if vals_str not in text:
+            text = f"{text}\n\n{vals_str}".strip()
 
     meta = (analysis.get("meta") or {}) if isinstance(analysis, dict) else {}
     caveat = (meta.get("caveat") or "").strip()
@@ -1346,24 +989,15 @@ def describe_figures_by_numbers(
     """
     Строит RAG-карточки по номерам рисунков.
 
-    Находит соответствующие figure-чанки в chunks, подтягивает:
-      - страницу и section_path;
-      - пути до картинок из attrs + соседних чанков той же секции;
-      - 1–2 текстовых фрагмента рядом;
-      - (NEW) структурные значения диаграмм из attrs.chart_matrix / chart_data;
-      - (опционально) краткое vision-описание.
-
-    Формат карточки:
-      {
-        "num": "2.3",
-        "display": "Рисунок 2.3 — Название…",
-        "where": {"page": 5, "section_path": "..."},
-        "images": [...],
-        "highlights": [...],
-        "chart_matrix": {...},      # если есть
-        "values_str": "— категория: значение\n...",  # если есть
-        "vision": {...},            # если use_vision и есть картинки
-      }
+    ЕДИНЫЙ путь:
+      1) нормализуем номера ('6', '2.3', 'Рисунок 2.3' → '6' / '2.3');
+      2) по каждому номеру берём запись из таблицы figures через get_figure_record();
+      3) из figures:
+          - page / section,
+          - image_path,
+          - attrs (chart_data / chart_matrix → values_str);
+      4) соседний текст поднимаем из chunks по section_path или page;
+      5) (опционально) vision-описание по image_path.
     """
     if not numbers:
         return []
@@ -1371,157 +1005,64 @@ def describe_figures_by_numbers(
     # нормализуем и дедупим номера
     want = sorted(
         {
-            str(n).replace(",", ".").strip()
+            _num_norm(str(n))
             for n in numbers
             if n and str(n).strip()
         }
     )
+    want = [n for n in want if n]
 
     con = get_conn()
     cur = con.cursor()
     cards: List[Dict[str, Any]] = []
 
-    has_ext = _table_has_columns(con, "chunks", ["element_type", "attrs"])
-
     for num in want:
-        found = None
-
-        # 1) точное совпадение номера в attrs (caption_num/label)
-        if has_ext:
-            like1 = f'%\"caption_num\": \"{num}\"%'
-            like2 = f'%\"label\": \"{num}\"%'
-            cur.execute(
-                """
-                SELECT page, section_path, text, attrs
-                FROM chunks
-                WHERE owner_id=? AND doc_id=? AND element_type='figure'
-                  AND (attrs LIKE ? OR attrs LIKE ?)
-                ORDER BY id ASC LIMIT 1
-                """,
-                (uid, doc_id, like1, like2),
-            )
-            found = cur.fetchone()
-
-        # 2) fallback: по подписям/пути (RU/EN, «Рис.», без пробела и с пробелом)
-        if not found and has_ext:
-            pat_ru_full   = f"%Рисунок {num}%"
-            pat_ru_abbr_s = f"%Рис. {num}%"
-            pat_ru_abbr_n = f"%Рис.{num}%"
-            pat_en_full   = f"%Figure {num}%"
-            pat_en_abbr_s = f"%Fig. {num}%"
-            pat_en_abbr_n = f"%Fig.{num}%"
-            cur.execute(
-                """
-                SELECT page, section_path, text, attrs
-                FROM chunks
-                WHERE owner_id=? AND doc_id=? AND element_type='figure'
-                  AND (
-                        section_path LIKE ? COLLATE NOCASE OR text LIKE ? COLLATE NOCASE OR
-                        section_path LIKE ? COLLATE NOCASE OR text LIKE ? COLLATE NOCASE OR
-                        section_path LIKE ? COLLATE NOCASE OR text LIKE ? COLLATE NOCASE OR
-                        section_path LIKE ? COLLATE NOCASE OR text LIKE ? COLLATE NOCASE OR
-                        section_path LIKE ? COLLATE NOCASE OR text LIKE ? COLLATE NOCASE
-                      )
-                ORDER BY id ASC LIMIT 1
-                """,
-                (
-                    uid,
-                    doc_id,
-                    pat_ru_full,
-                    pat_ru_full,
-                    pat_ru_abbr_s,
-                    pat_ru_abbr_s,
-                    pat_ru_abbr_n,
-                    pat_ru_abbr_n,
-                    pat_en_full,
-                    pat_en_full,
-                    pat_en_abbr_s,
-                    pat_en_abbr_s,
-                ),
-            )
-            found = cur.fetchone()
-
-        # 3) самый старый fallback для индексов без element_type='figure'
-        if not found:
-            sel = "SELECT page, section_path, text" + (", attrs" if has_ext else "")
-            cur.execute(
-                f"""
-                {sel}
-                FROM chunks
-                WHERE owner_id=? AND doc_id=? AND (
-                    text LIKE '[Рисунок]%%' OR text LIKE '[Figure]%%'
-                    OR lower(section_path) LIKE '%%рисунок %%' OR lower(section_path) LIKE '%%figure %%'
-                    OR lower(section_path) LIKE '%%рис.%%'     OR lower(section_path) LIKE '%%fig.%%'
-                )
-                AND (
-                    section_path LIKE ? COLLATE NOCASE OR text LIKE ? COLLATE NOCASE OR
-                    section_path LIKE ? COLLATE NOCASE OR text LIKE ? COLLATE NOCASE OR
-                    section_path LIKE ? COLLATE NOCASE OR text LIKE ? COLLATE NOCASE
-                )
-                ORDER BY id ASC LIMIT 1
-                """,
-                (
-                    uid,
-                    doc_id,
-                    f"%Рисунок {num}%",
-                    f"%Рисунок {num}%",
-                    f"%Рис.{num}%",
-                    f"%Рис.{num}%",
-                    f"%Figure {num}%",
-                    f"%Figure {num}%",
-                ),
-            )
-            found = cur.fetchone()
-
-        if not found:
+        # 1) достаём фигуру + анализ из таблицы figures / figure_analysis
+        rec = get_figure_record(doc_id, figure_label=num, ensure_analysis=use_vision)
+        if not rec or not rec.get("figure"):
             continue
 
-        page = found["page"]
-        sec = found["section_path"]
-        tail = _last_segment(sec)
-        n_p, title_p = _parse_figure_title(tail)
-        display = f"Рисунок {n_p or num}" + (f" — {title_p}" if title_p else "")
+        fig = rec["figure"]
+        analysis = rec.get("analysis") or {}
 
-        # --- изображения из attrs + добор по секции ---
+        # номер / подпись
+        label = _num_norm(str(fig.get("label") or fig.get("figure_label") or num))
+        caption = (fig.get("caption") or "").strip()
+
+        display = f"Рисунок {label}"
+        if caption:
+            display += f" — {caption}"
+
+        page = fig.get("page")
+        sec = fig.get("section") or ""
+
+        # 2) путь(и) до картинки — из таблицы figures (image_path)
         images: List[str] = []
-        attrs_obj: Dict[str, Any] = {}
+        img = fig.get("image_path")
+        if img:
+            images.append(img)
 
-        if has_ext and "attrs" in found.keys() and found["attrs"]:
-            try:
-                attrs_obj = json.loads(found["attrs"] or "{}") or {}
-            except Exception:
-                attrs_obj = {}
-
-        # пути к картинкам из attrs
-        if attrs_obj:
-            imgs = attrs_obj.get("images") or []
-            for p in imgs:
-                if p and p not in images:
-                    images.append(p)
-
-        # + добор картинок по всей секции
-        for p in _collect_images_for_section(cur, uid, doc_id, sec):
-            if p not in images:
-                images.append(p)
-
-        # --- 1–2 ближайших текстовых кусочка ---
-        cur.execute(
-            """
-            SELECT text FROM chunks
-            WHERE owner_id=? AND doc_id=? AND section_path=?
-            ORDER BY id ASC LIMIT ?
-            """,
-            (uid, doc_id, sec, max(1, sample_chunks)),
-        )
-        rows = cur.fetchall() or []
+        # 3) 1–2 соседних текстовых фрагмента
         highlights: List[str] = []
-        for rr in rows:
-            t = (rr["text"] or "").strip()
-            t = re.sub(r"^\[\s*Рисунок\s*\]\s*", "", t, flags=re.IGNORECASE)
-            if t:
+
+        if sec:
+            cur.execute(
+                """
+                SELECT text FROM chunks
+                WHERE owner_id=? AND doc_id=? AND section_path=?
+                ORDER BY id ASC LIMIT ?
+                """,
+                (uid, doc_id, sec, max(1, sample_chunks)),
+            )
+            rows = cur.fetchall() or []
+            for rr in rows:
+                t = (rr["text"] or "").strip()
+                if not t:
+                    continue
+                t = re.sub(r"^\[\s*Рисунок\s*\]\s*", "", t, flags=re.IGNORECASE)
                 highlights.append(_shorten(t, 200))
 
-        if not highlights:
+        if not highlights and page is not None:
             cur.execute(
                 """
                 SELECT text FROM chunks
@@ -1534,38 +1075,52 @@ def describe_figures_by_numbers(
             if rr and rr["text"]:
                 highlights.append(_shorten(rr["text"], 200))
 
+        # 4) chart_matrix/values_str — из attrs фигуры
+        chart_matrix = None
+        try:
+            attrs = fig.get("attrs")
+            if isinstance(attrs, str):
+                attrs_obj = json.loads(attrs or "{}") or {}
+            elif isinstance(attrs, dict):
+                attrs_obj = attrs
+            else:
+                attrs_obj = {}
+        except Exception:
+            attrs_obj = {}
+
+        if isinstance(attrs_obj, dict) and attrs_obj.get("chart_matrix") is not None:
+            chart_matrix = attrs_obj.get("chart_matrix")
+
+        values_str = _figure_values_str_from_row(fig)
+
+        # 5) vision-описание (опционально)
+        vision_payload = None
+        if use_vision and images:
+            try:
+                img_for_vision = images[0] if vision_first_image_only else images
+                vision_payload = vision_describe(img_for_vision, lang=lang)
+            except Exception:
+                vision_payload = {
+                    "description": "описание изображения недоступно.",
+                    "tags": [],
+                }
+
         card: Dict[str, Any] = {
-            "num": num,
+            "num": label,
             "display": display,
             "where": {"page": page, "section_path": sec},
             "images": images,
             "highlights": highlights[:2],
         }
 
-        # прокидываем chart_matrix целиком в карточку, если есть
-        if attrs_obj.get("chart_matrix") is not None:
-            card["chart_matrix"] = attrs_obj.get("chart_matrix")
-
-        # 4) NEW: chart_matrix / chart_data → values_str (без Vision)
-        if attrs_obj:
-            try:
-                rows_norm = _chart_rows_from_attrs(attrs_obj)
-                if rows_norm:
-                    card["values_str"] = _format_chart_values(rows_norm)
-            except Exception:
-                pass
-
-        # 5) vision-описание (опционально)
-        if use_vision and images:
-            try:
-                img_for_vision = images[0] if vision_first_image_only else images
-                vision = vision_describe(img_for_vision, lang=lang)
-                card["vision"] = vision
-            except Exception:
-                card["vision"] = {
-                    "description": "описание изображения недоступно.",
-                    "tags": [],
-                }
+        if chart_matrix is not None:
+            card["chart_matrix"] = chart_matrix
+        if values_str:
+            card["values_str"] = values_str
+        if vision_payload is not None:
+            card["vision"] = vision_payload
+        if analysis:
+            card["analysis"] = analysis
 
         cards.append(card)
 
@@ -1741,80 +1296,67 @@ def _inject_special_sources_for_item(pack: dict, ask: str, used_ids: set[int], *
 
     # Рисунки: берём все чанки этой секции (обычно один-три), чтобы было описание + подпись
         # Рисунки: берём все чанки этой секции (обычно один-три), чтобы было описание + подпись
+        # Рисунки: работаем только через таблицу figures (без regex-поиска по chunks)
     fig_nums = _extract_figure_numbers_from_query(ask)
     if fig_nums:
-        for num in fig_nums:
-            # num тут уже нормализован _extract_figure_numbers_from_query,
-            # но ещё раз нормализуем для надёжности
-            needle = _num_norm(num)
-            if not needle:
+        for raw_num in fig_nums:
+            num = _num_norm(raw_num)
+            if not num:
                 continue
 
-            # допускаем «Рис. 3.2», «Рис. 3,2», «Рис. 3.2.» / «Fig. 3,2» / «Figure 3.2.»
-            core = re.escape(needle).replace(r"\.", r"[.,]")
-            num_pat = rf"{core}\s*[.)]?"
-            ru_pat = re.compile(rf"(?i)\bрис(?:\.|унок)?\s+{num_pat}")
-            en_pat = re.compile(rf"(?i)\bfig(?:\.|ure)?\s+{num_pat}")
-
-            for m in pack["meta"]:
-                if _chunk_type(m) != "figure":
-                    continue
-
-                sp = m.get("section_path") or ""
-                tx = m.get("text") or ""
-                tail = _last_segment(sp)
-                n_p, _ = _parse_figure_title(tail)
-                n_local = _num_norm(n_p)
-
-                # 1) сначала пробуем точное совпадение номера из заголовка
-                if n_local == needle:
-                    ok = True
-                else:
-                    # 2) fallback: ищем по тексту «Рис./Рисунок/Fig./Figure N» с терпимым номером
-                    ok = bool(ru_pat.search(tx) or en_pat.search(tx))
-
-                if not ok:
-                    continue
-
-                sec = sp
-                for mm in pack["meta"]:
-                    if (mm.get("section_path") or "") == sec:
-                        ch = {
-                            "id": mm["id"],
-                            "page": mm["page"],
-                            "section_path": mm["section_path"],
-                            "text": (mm["text"] or "").strip(),
-                            "score": 0.88,
-                        }
-                        if ch["id"] in used_ids:
-                            continue
-                        ch["for_item"] = None
-                        added.append(ch)
-                        used_ids.add(ch["id"])
-
-            # NEW: отдельный сниппет с анализом диаграммы из figures/figure_analysis
             try:
                 rec = get_figure_record(doc_id, figure_label=num, ensure_analysis=True)
             except Exception:
                 rec = None
-            if rec and rec.get("analysis"):
-                text = _build_figure_context_text(rec)
-                if text:
-                    fig = rec["figure"]
-                    fid = int(fig.get("figure_id"))
-                    synthetic_id = -int(10_000_000 + fid)
-                    if synthetic_id not in used_ids:
-                        added.append(
-                            {
-                                "id": synthetic_id,
-                                "page": fig.get("page"),
-                                "section_path": (fig.get("section") or ""),
-                                "text": text,
-                                "score": 0.96,
-                                "for_item": None,
-                            }
-                        )
-                        used_ids.add(synthetic_id)
+            if not rec or not rec.get("figure"):
+                continue
+
+            fig = rec["figure"]
+            text = _build_figure_context_text(rec)
+            if not text:
+                continue
+
+            fid = int(fig.get("figure_id"))
+            synthetic_id = -int(10_000_000 + fid)
+            if synthetic_id in used_ids:
+                continue
+
+            # основной сниппет — фигура + анализ + values_str
+            added.append(
+                {
+                    "id": synthetic_id,
+                    "page": fig.get("page"),
+                    "section_path": (fig.get("section") or ""),
+                    "text": text,
+                    "score": 0.96,
+                    "for_item": None,
+                }
+            )
+            used_ids.add(synthetic_id)
+
+            # при возможности добавим 1 небольшой текстовый фрагмент из той же секции
+            sec = fig.get("section") or ""
+            if sec:
+                for m in pack["meta"]:
+                    if (m.get("section_path") or "") != sec:
+                        continue
+                    if m["id"] in used_ids:
+                        continue
+                    t = (m.get("text") or "").strip()
+                    if not t:
+                        continue
+                    added.append(
+                        {
+                            "id": m["id"],
+                            "page": m["page"],
+                            "section_path": m["section_path"],
+                            "text": _shorten(t, 200),
+                            "score": 0.9,
+                            "for_item": None,
+                        }
+                    )
+                    used_ids.add(m["id"])
+                    break  # одного соседнего чанка достаточно
 
     return added
 

@@ -45,6 +45,7 @@ __all__ = [
     "vision_describe",
     "vision_describe_many",
     "vision_extract_values",
+    "vision_describe_with_values",  # новый режим: описание + попытка вытащить числа
 ]
 
 
@@ -510,10 +511,30 @@ def _make_image_parts(paths: Optional[List[str]]) -> List[Dict[str, Any]]:
     for p in (paths or [])[:max_n]:
         if not p:
             continue
-        if _path_is_url(p) or os.path.exists(p):
+        if not p:
+            logging.warning("vision: empty image path received")
+            continue
+
+        if _path_is_url(p):
             part = _image_part_for(p)
             if part:
                 parts.append(part)
+            else:
+                logging.error("vision: failed to attach image from URL: %r", p)
+            continue
+
+        if os.path.exists(p):
+            try:
+                part = _image_part_for(p)
+                if part:
+                    parts.append(part)
+                else:
+                    logging.error("vision: _image_part_for returned None for path=%r", p)
+            except Exception as e:
+                logging.exception("vision: error while processing image %r: %s", p, e)
+        else:
+            logging.warning("vision: local image path not found: %r", p)
+
     return parts
 
 def chat_with_gpt_multimodal(
@@ -661,6 +682,8 @@ def vision_describe(
         return {"description": "модуль анализа изображений отключён (VISION_ENABLED=False).", "tags": []}
 
     paths: List[str] = [image_or_images] if isinstance(image_or_images, str) else list(image_or_images or [])
+    orig_paths = list(paths)
+
     # фильтруем по существованию, но оставляем http(s)
     norm_paths: List[str] = []
     for p in paths:
@@ -668,9 +691,21 @@ def vision_describe(
             continue
         if _path_is_url(p) or os.path.exists(p):
             norm_paths.append(p)
+        else:
+            # Ключевой чек: сюда должны приходить реальные пути до файлов/URL из figures.py
+            logging.warning(
+                "vision_describe: image path is not accessible: %r "
+                "(возможен баг в figures/indexer — путь None или файл не существует)",
+                p,
+            )
 
     if not norm_paths:
-        return {"description": "изображение отсутствует или не доступно.", "tags": []}
+        logging.error(
+            "vision_describe: no accessible images. original_paths=%r (likely indexer bug)",
+            orig_paths,
+        )
+        return {"description": "изображение отсутствует или недоступно.", "tags": []}
+
 
     # Лимит по количеству изображений
     norm_paths = norm_paths[: max(1, int(getattr(Cfg, "VISION_MAX_IMAGES_PER_REQUEST", 4) or 4))]
@@ -741,6 +776,61 @@ def vision_describe(
     _vcache_put(cache_key, res)
     return res
 
+def vision_describe_with_values(
+    image_or_images: Union[str, List[str]],
+    *,
+    caption_hint: Optional[str] = None,
+    ocr_hint: Optional[str] = None,
+    lang: str = "ru",
+    temperature: float = 0.0,
+    max_tokens: int = 180,
+) -> Dict[str, Any]:
+    """
+    Специализированный режим для рисунков ВКР:
+      1) даёт человеческое описание (как vision_describe);
+      2) дополнительно делает попытку вытащить числа/подписи с картинки.
+
+    ВАЖНО: значения из vision_extract_values считаются ВСПОМОГАТЕЛЬНЫМИ.
+    Основная «истина» по цифрам должна приходить из chart_data/таблиц.
+    Вызывающая сторона решает, доверять ли этим числам и как их использовать.
+    """
+    # 1) сначала краткое описание
+    desc = vision_describe(
+        image_or_images,
+        lang=lang,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        system_hint=None,
+    )
+
+    # 2) затем — попытка извлечь структурированные значения
+    eff_caption = caption_hint or desc.get("description") or None
+    values: Dict[str, Any] = {}
+    try:
+        values = vision_extract_values(
+            image_or_images,
+            caption_hint=eff_caption,
+            ocr_hint=ocr_hint,
+            temperature=0.0,  # для чисел держим по максимуму детерминированно
+            max_tokens=1400,
+            lang=lang,
+        )
+    except Exception as e:
+        logging.exception("vision_describe_with_values: vision_extract_values failed: %s", e)
+        values = {
+            "type": "other",
+            "warnings": [
+                "vision_extract_values failed; для точных цифр используйте данные из chart_data/таблиц."
+            ],
+        }
+
+    # Возвращаем объединённую структуру: описание + «vision-числа» (в отдельном блоке)
+    return {
+        "description": desc.get("description"),
+        "tags": desc.get("tags") or [],
+        "vision_values": values,
+    }
+
 
 def vision_describe_many(
     images: List[str],
@@ -748,6 +838,7 @@ def vision_describe_many(
     *,
     per_image_limit: int = 4,  # параметр сохранён для обратной совместимости
 ) -> List[Dict[str, Any]]:
+
     """
     One-in → one-out: на каждый путь — один словарь результата.
     Повторяющиеся изображения кешируются (по SHA256 для локальных и по URL-строке для http/https).
@@ -800,14 +891,26 @@ def vision_extract_values(
 
     # Нормализуем список путей
     paths: List[str] = [image_or_images] if isinstance(image_or_images, str) else list(image_or_images or [])
+    orig_paths = list(paths)
+
     norm_paths: List[str] = []
     for p in paths:
         if not p:
             continue
         if _path_is_url(p) or os.path.exists(p):
             norm_paths.append(p)
+        else:
+            logging.warning(
+                "vision_extract_values: image path is not accessible: %r "
+                "(возможен баг в figures/indexer — путь None или файл не существует)",
+                p,
+            )
 
     if not norm_paths:
+        logging.error(
+            "vision_extract_values: no accessible images. original_paths=%r",
+            orig_paths,
+        )
         return {"type": "other", "warnings": ["изображение отсутствует или недоступно."]}
 
     # Ограничим количество изображений

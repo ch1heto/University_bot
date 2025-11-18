@@ -7,6 +7,7 @@ import logging
 import asyncio
 import time
 import math
+from decimal import Decimal 
 from typing import Iterable, AsyncIterable, Optional, List, Tuple
 
 from aiogram import Bot, Dispatcher, F, types
@@ -475,14 +476,61 @@ def _pick_images_from_hits(hits: list[dict], limit: int = 3) -> list[str]:
     return acc
 
 def _pairs_to_bullets(pairs: list[dict]) -> str:
-    lines = []
+    """
+    Аккуратно форматируем пары (label, value, unit):
+    - 0.25 при unit='%’ → 25%;
+    - числа округляем до целых или 2 знаков;
+    - убираем хвосты вида 0.42000000000000004.
+    """
+    def _fmt(value, unit: str) -> str:
+        unit = (unit or "").strip()
+        sval = ""
+        v_num: float | None = None
+
+        # пробуем привести к числу
+        if isinstance(value, (int, float, Decimal)):
+            v_num = float(value)
+        else:
+            try:
+                v_num = float(str(value).replace(",", "."))
+            except Exception:
+                sval = str(value) if value is not None else ""
+
+        if v_num is not None:
+            # эвристика: доли с unit='%' → проценты
+            if unit and "%" in unit and 0.0 <= v_num <= 1.2:
+                v_num *= 100.0
+
+            if abs(v_num - round(v_num)) < 0.05:
+                sval = str(int(round(v_num)))
+            else:
+                sval = f"{v_num:.2f}".rstrip("0").rstrip(".")
+
+        # добавляем единицы измерения
+        if unit:
+            if "%" in unit and not sval.endswith("%"):
+                sval += "%"
+            else:
+                sval += f" {unit}"
+        return sval
+
+    lines: list[str] = []
     for r in (pairs or []):
         lab = (str(r.get("label") or "")).strip()
-        val = (str(r.get("value") or "")).strip()
         unit = (str(r.get("unit") or "")).strip()
-        if lab or val:
-            lines.append(f"— {lab}: {val}" + (f" {unit}" if unit else ""))
+        raw_val = r.get("value")
+        val = _fmt(raw_val, unit)
+
+        if not lab and not val:
+            continue
+        if lab and val:
+            lines.append(f"— {lab}: {val}")
+        elif lab:
+            lines.append(f"— {lab}")
+        else:
+            lines.append(f"— {val}")
     return "\n".join(lines)
+
 
 async def _stream_to_telegram(m: types.Message, stream, head_text: str = "⌛️ Печатаю ответ…") -> None:
     current_text = ""
@@ -1441,25 +1489,25 @@ def _compose_figure_display(attrs_json: str | None, section_path: str, title_tex
 def _fetch_figure_row_by_num(uid: int, doc_id: int, num: str):
     """
     Возвращает строку chunks для рисунка с указанным номером (если найдена),
-    желательно ту, где в attrs лежит caption_num/label.
+    ориентируясь ТОЛЬКО на caption_num (номер рисунка в подписи).
+    По label больше не ищем, чтобы не путать номер рисунка с подписями серий/категорий.
     """
     con = get_conn()
     cur = con.cursor()
     like1 = f'%\"caption_num\": \"{num}\"%'
-    like2 = f'%\"label\": \"{num}\"%'
     row = None
 
-    # 1) по номеру в attrs
+    # 1) по номеру в attrs (caption_num)
     try:
         cur.execute(
             """
-            SELECT page, section_path, attrs, text
+            SELECT id, page, section_path, attrs, text
             FROM chunks
             WHERE owner_id=? AND doc_id=? AND element_type='figure'
-              AND (attrs LIKE ? OR attrs LIKE ?)
+              AND attrs LIKE ?
             ORDER BY id ASC LIMIT 1
             """,
-            (uid, doc_id, like1, like2),
+            (uid, doc_id, like1),
         )
         row = cur.fetchone()
     except Exception:
@@ -1470,7 +1518,7 @@ def _fetch_figure_row_by_num(uid: int, doc_id: int, num: str):
         try:
             cur.execute(
                 """
-                SELECT page, section_path, attrs, text
+                SELECT id, page, section_path, attrs, text
                 FROM chunks
                 WHERE owner_id=? AND doc_id=? AND element_type='figure'
                   AND section_path LIKE ? COLLATE NOCASE
@@ -1484,6 +1532,73 @@ def _fetch_figure_row_by_num(uid: int, doc_id: int, num: str):
 
     con.close()
     return row
+
+def _figure_following_paragraphs(
+    uid: int,
+    doc_id: int,
+    fig_row,
+    max_paragraphs: int = 3,
+    max_chars: int = 1500,
+) -> list[str]:
+    """
+    Берём 2–3 абзаца текста ПОСЛЕ рисунка в том же section_path.
+    Останавливаемся, как только встретили следующий heading/table/figure.
+    """
+    if not fig_row:
+        return []
+
+    base_id = fig_row["id"]
+    sec = fig_row["section_path"] or ""
+
+    con = get_conn()
+    cur = con.cursor()
+
+    has_et = _table_has_columns(con, "chunks", ["element_type"])
+
+    if has_et:
+        cur.execute(
+            """
+            SELECT text, element_type
+            FROM chunks
+            WHERE owner_id=? AND doc_id=? AND id>? AND section_path=?
+            ORDER BY id ASC
+            LIMIT 20
+            """,
+            (uid, doc_id, base_id, sec),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT text, NULL AS element_type
+            FROM chunks
+            WHERE owner_id=? AND doc_id=? AND id>? AND section_path=?
+            ORDER BY id ASC
+            LIMIT 20
+            """,
+            (uid, doc_id, base_id, sec),
+        )
+
+    rows = cur.fetchall() or []
+    con.close()
+
+    paras: list[str] = []
+    total = 0
+
+    for r in rows:
+        et = (r["element_type"] or "").lower() if "element_type" in r.keys() else ""
+        if et in ("heading", "table", "figure", "table_row"):
+            # дошли до следующего структурного блока — дальше уже не «про этот рисунок»
+            break
+        t = (r["text"] or "").strip()
+        if not t:
+            continue
+
+        paras.append(t)
+        total += len(t)
+        if len(paras) >= max_paragraphs or total >= max_chars:
+            break
+
+    return paras
 
 
 def _parse_chart_data(attrs_json: str | None) -> tuple[list | None, str | None, dict]:
@@ -1528,58 +1643,346 @@ def _parse_chart_data(attrs_json: str | None) -> tuple[list | None, str | None, 
         pass
     return None, None, {}
 
+def _extract_raw_values_from_attrs(attrs_json: str | None) -> dict | None:
+    """
+    Пытаемся вытащить структурированные данные диаграммы ИЗ OOXML-атрибутов.
+
+    Возвращает dict вида:
+    {
+      "categories": [...],
+      "series": [
+        {"name": "Низкий уровень", "unit": "%", "values": [65, 60, ...]},
+        ...
+      ]
+    }
+    или None, если такой структуры нет.
+
+    ВАЖНО:
+    - поддерживаем формат из нового ooxml_lite (chart.cats + chart.series);
+    - если chart_data — список строк [{label, value, unit, series_name}],
+      собираем полноценные серии, а не схлопываем всё в одну.
+    """
+    if not attrs_json:
+        return None
+    try:
+        a = json.loads(attrs_json or "{}")
+    except Exception:
+        return None
+
+    # 1) Типичный формат OOXML-индекса: {"chart_data": {"categories": [...], "series": [...]}},
+    #    либо {"chart": {...}}, либо {"data": {...}}.
+    for key in ("chart_data", "chart", "data"):
+        raw = a.get(key)
+        if isinstance(raw, dict) and raw.get("categories") and raw.get("series"):
+            cats = list(raw.get("categories") or [])
+            series_out: list[dict] = []
+            for s in (raw.get("series") or []):
+                if not isinstance(s, dict):
+                    continue
+                name = s.get("name")
+                unit = s.get("unit")
+                vals = list(s.get("values") or s.get("data") or [])
+                series_out.append({
+                    "name": name,
+                    "unit": unit,
+                    "values": vals,
+                })
+            if cats and series_out:
+                return {"categories": cats, "series": series_out}
+
+    # 1а) Новый формат из ooxml_lite: "chart": {"cats": [...], "series": [...]}
+    chart = a.get("chart")
+    if isinstance(chart, dict) and chart.get("series"):
+        cats = chart.get("cats") or chart.get("categories") or []
+        cats = [str(c) for c in cats]
+        series_out: list[dict] = []
+        for s in (chart.get("series") or []):
+            if not isinstance(s, dict):
+                continue
+            name = s.get("name")
+            unit = s.get("unit")
+            # в ooxml_lite мы уже кладём числовые значения в s["values"]
+            vals = list(s.get("values") or s.get("data") or s.get("vals") or [])
+            series_out.append({
+                "name": name,
+                "unit": unit,
+                "values": vals,
+            })
+        if cats and series_out:
+            return {"categories": cats, "series": series_out}
+
+    # 2) chart_data как СПИСОК строк [{label, value, unit, series_name, ...}]
+    raw_rows = a.get("chart_data")
+    if isinstance(raw_rows, list) and raw_rows:
+        # 2.1. Категории — уникальные label'ы в порядке первого появления
+        categories: list[str] = []
+        cat_index: dict[str, int] = {}
+        for r in raw_rows:
+            label = str(
+                r.get("label")
+                or r.get("name")
+                or r.get("category")
+                or ""
+            ).strip()
+            if label not in cat_index:
+                cat_index[label] = len(categories)
+                categories.append(label)
+
+        if not categories:
+            return None
+
+        # 2.2. Группируем по series_name (если есть), иначе всё в одну серию None
+        series_map: dict[str | None, dict] = {}
+        any_named_series = False
+
+        for r in raw_rows:
+            # имя серии
+            raw_sname = (
+                r.get("series_name")
+                or r.get("series")
+                or r.get("name")
+            )
+            sname = str(raw_sname).strip() if raw_sname is not None else None
+            if sname:
+                any_named_series = True
+                key = sname
+            else:
+                key = None  # безымянная серия
+
+            # категория → индекс
+            label = str(
+                r.get("label")
+                or r.get("name")
+                or r.get("category")
+                or ""
+            ).strip()
+            idx = cat_index.get(label)
+            if idx is None:
+                continue
+
+            # значение и unit
+            v = r.get("value")
+            if v is None:
+                v = r.get("y") or r.get("x") or r.get("v") or r.get("count")
+
+            unit = r.get("unit")
+            unit_str = str(unit).strip() if isinstance(unit, str) else None
+
+            if key not in series_map:
+                series_map[key] = {
+                    "name": key,
+                    "unit": unit_str,
+                    "values": [None] * len(categories),
+                }
+
+            # если в серии unit ещё не проставлен, а тут есть — запоминаем
+            if unit_str and not series_map[key].get("unit"):
+                series_map[key]["unit"] = unit_str
+
+            series_map[key]["values"][idx] = v
+
+        series_out = list(series_map.values())
+
+        # если имён серий нет вообще — всё равно вернём одну серию,
+        # чтобы _format_exact_values мог её красиво оформить
+        if not series_out and raw_rows:
+            vals: list = []
+            unit: str | None = None
+            for r in raw_rows:
+                vv = r.get("value")
+                if vv is None:
+                    vv = r.get("y") or r.get("x") or r.get("v") or r.get("count")
+                vals.append(vv)
+                if isinstance(r.get("unit"), str):
+                    unit = r.get("unit")
+            if vals:
+                series_out = [{
+                    "name": None,
+                    "unit": unit,
+                    "values": vals,
+                }]
+
+        if categories and series_out:
+            return {
+                "categories": categories,
+                "series": series_out,
+            }
+
+    return None
+
+
+
+def _format_exact_values(raw_values: dict) -> str:
+    """
+    Форматируем raw_values, аккуратно обращаясь с долями:
+    если unit содержит '%' и ВСЕ значения лежат в [0 .. 1.2],
+    считаем их долями и выводим как проценты (0.7 → 70 %).
+    """
+    if not raw_values:
+        return ""
+
+    cats = list(raw_values.get("categories") or [])
+    series = list(raw_values.get("series") or [])
+
+    if not cats or not series:
+        return ""
+
+    lines: list[str] = ["Точные значения (как в документе):", ""]
+    n = len(cats)
+
+    for s in series:
+        name = (s.get("name") or "").strip()
+        unit = (s.get("unit") or "").strip()
+        vals = list(s.get("values") or [])
+
+        # эвристика «это доли в процентах»
+        numeric_vals: list[float] = []
+        for v in vals:
+            try:
+                numeric_vals.append(float(str(v).replace(",", ".")))
+            except Exception:
+                # текст/пусто — игнорим для эвристики
+                pass
+
+        has_percent_unit = bool(unit) and "%" in unit
+        is_share_like = bool(
+            has_percent_unit
+            and numeric_vals
+            and all(0.0 <= x <= 1.2 for x in numeric_vals)
+        )
+
+        header = name or "Серия"
+        # если единицы НЕ проценты — покажем их в заголовке
+        if unit and "%" not in unit:
+            header = f"{header} ({unit})"
+        lines.append(f"{header}:")
+
+        for i in range(min(n, len(vals))):
+            label = str(cats[i]).strip() or str(i + 1)
+            raw_v = vals[i]
+
+            v_num: float | None = None
+            sval = ""
+
+            if isinstance(raw_v, (int, float, Decimal)):
+                v_num = float(raw_v)
+            else:
+                try:
+                    v_num = float(str(raw_v).replace(",", "."))
+                except Exception:
+                    sval = str(raw_v) if raw_v is not None else ""
+
+            if v_num is not None:
+                if is_share_like:
+                    v_num *= 100.0  # 0.7 → 70.0
+
+                if abs(v_num - round(v_num)) < 0.05:
+                    sval = str(int(round(v_num)))
+                else:
+                    sval = f"{v_num:.2f}".rstrip("0").rstrip(".")
+
+            # суффикс единиц
+            unit_suffix = ""
+            if has_percent_unit:
+                # хотим «70%», без пробела
+                if not sval.endswith("%"):
+                    unit_suffix = "%"
+            elif unit:
+                unit_suffix = f" {unit}"
+
+            line = f"— {label}: {sval}{unit_suffix}".strip()
+            if line:
+                lines.append(line)
+
+        lines.append("")  # пустая строка между сериями
+
+    return "\n".join(l for l in lines if l.strip())
+
 
 
 def _format_chart_values(chart_data: list) -> str:
+    """
+    Форматируем chart_data БЕЗ нормировки сумм и без «подгонки» к 100%.
+
+    Логика:
+      - если unit содержит '%' и все значения в [0..1.2],
+        трактуем их как доли (0.8 → 80) и домножаем на 100;
+      - дальше просто печатаем: «— label: 80%».
+    """
     rows = chart_data or []
+    if not rows:
+        return "Нет данных для вывода."
 
-    # Соберём числа и метки
-    labels, nums, units = [], [], []
-    all_numeric = True
+    # соберём данные для евристики «это доли в процентах»
+    numeric_vals: list[float] = []
+    has_percent_unit = False
     for r in rows:
-        labels.append((str(r.get("label") or r.get("name") or r.get("category") or "")).strip())
-        val = r.get("value")
-        if val is None:
-            val = r.get("y") or r.get("x") or r.get("v") or r.get("count")
-        units.append(r.get("unit") or "")
-        try:
-            nums.append(float(str(val).replace(",", ".")))
-        except Exception:
-            all_numeric = False
-            break
-
-    # Эвристики "это проценты":
-    #  - единицы содержат '%' ИЛИ
-    #  - все значения в [0..1.2] и сумма ≈ 1 (доли) ИЛИ
-    #  - все значения в [0..100] и сумма ≈ 100 (почти проценты)
-    if all_numeric and rows:
-        total = sum(nums)
-        unit_has_percent = any(isinstance(u, str) and "%" in u for u in units)
-        looks_fraction = all(0 <= v <= 1.2 for v in nums) and 0.98 <= total <= 1.02
-        looks_percent  = all(0 <= v <= 100 for v in nums) and 99 <= total <= 101
-
-        if unit_has_percent or looks_fraction or looks_percent:
-            base = [v * 100 for v in nums] if looks_fraction else nums[:]
-            # Округляем так, чтобы сумма была ровно 100 (метод наибольших остатков)
-            floors = [int(math.floor(x)) for x in base]
-            need = int(round(100 - sum(floors)))
-            remainders = [x - f for x, f in zip(base, floors)]
-            order = sorted(range(len(base)), key=lambda i: remainders[i], reverse=True)
-            for i in order[:max(0, abs(need))]:
-                floors[i] += 1 if need > 0 else -1
-            return "\n".join([f"— {labels[i]}: {floors[i]}%" for i in range(len(floors))])
-
-    # Фолбэк: как было
-    lines = []
-    for i, r in enumerate(rows):
-        label = labels[i] if i < len(labels) else (str(r.get("label") or r.get("name") or r.get("category") or "")).strip()
-        val = r.get("value")
-        if val is None:
-            val = r.get("y") or r.get("x") or r.get("v") or r.get("count")
         unit = r.get("unit")
-        unit_s = f" {unit}" if isinstance(unit, str) and unit.strip() else ""
-        if label or val is not None:
-            lines.append(f"— {label}: {val}{unit_s}".strip())
+        if isinstance(unit, str) and "%" in unit:
+            has_percent_unit = True
+
+        v = r.get("value")
+        if v is None:
+            v = r.get("y") or r.get("x") or r.get("v") or r.get("count")
+        try:
+            numeric_vals.append(float(str(v).replace(",", ".")))
+        except Exception:
+            # если хоть один не приводится к числу — просто не применяем евристику
+            pass
+
+    is_share_like = bool(
+        has_percent_unit
+        and numeric_vals
+        and all(0.0 <= x <= 1.2 for x in numeric_vals)
+    )
+
+    lines: list[str] = []
+    for r in rows:
+        label = (str(r.get("label") or r.get("name") or r.get("category") or "")).strip()
+
+        raw_v = r.get("value")
+        if raw_v is None:
+            raw_v = r.get("y") or r.get("x") or r.get("v") or r.get("count")
+
+        unit = r.get("unit")
+
+        v_num: float | None = None
+        sval = ""
+
+        # пробуем привести к числу
+        if isinstance(raw_v, (int, float, Decimal)):
+            v_num = float(raw_v)
+        else:
+            try:
+                v_num = float(str(raw_v).replace(",", "."))
+            except Exception:
+                # это строка/текст — оставим как есть
+                sval = str(raw_v) if raw_v is not None else ""
+
+        # числовое значение → форматируем
+        if v_num is not None:
+            if is_share_like:
+                v_num *= 100.0  # 0.8 → 80.0
+
+            if abs(v_num - round(v_num)) < 0.05:
+                sval = str(int(round(v_num)))
+            else:
+                sval = f"{v_num:.2f}".rstrip("0").rstrip(".")
+
+        # добавляем единицы измерения
+        unit_suffix = ""
+        if isinstance(unit, str) and unit.strip():
+            u = unit.strip()
+            # если это проценты и в строке ещё нет '%', добавим без пробела
+            if "%" in u and not sval.endswith("%"):
+                unit_suffix = "%"
+            else:
+                unit_suffix = f" {u}"
+
+        text = (f"— {label}: {sval}{unit_suffix}").strip()
+        if text:
+            lines.append(text)
+
     return "\n".join(lines) if lines else "Нет данных для вывода."
 
 # --- небольшая косметика для процентов из OOXML-графиков ---
@@ -1763,11 +2166,17 @@ def _build_figure_records(uid: int, doc_id: int, nums: list[str]) -> list[dict]:
             "orig": orig,
             "display": None,
             "images": [],
+            # ЕДИНЫЙ источник истины по числам
+            "raw_values": None,        # структурированные данные из OOXML
+            "values_text": None,       # уже отформатированный блок «Точные значения»
+            "values_source": None,     # "ooxml" | "summary" | "vision" | ...
+            # для обратной совместимости со старым кодом
             "values": None,
             "near_text": [],
             "caption": None,
             "vision_desc": None,
         }
+
 
         # --- 1) данные из RAG-карточек ---
         if card:
@@ -1818,14 +2227,48 @@ def _build_figure_records(uid: int, doc_id: int, nums: list[str]) -> list[dict]:
                     rec["near_text"].append(cap_text)
 
         # --- 4) chart_data из attrs (точные числовые значения) ---
+                # --- 4) chart_data из attrs (ТОЧНЫЕ числовые значения из OOXML) ---
         row = _fetch_figure_row_by_num(uid, doc_id, orig)
         if not row and norm != orig:
             row = _fetch_figure_row_by_num(uid, doc_id, norm)
+
         if row:
             attrs_json = row["attrs"] if ("attrs" in row.keys()) else None
-            cd, _ctype, _attrs = _parse_chart_data(attrs_json)
-            if cd:
-                rec["values"] = _fill_empty_percents(_format_chart_values(cd))
+
+            # 4.a) пробуем достать структурированные raw_values из OOXML
+            raw = _extract_raw_values_from_attrs(attrs_json)
+            if raw:
+                rec["raw_values"] = raw
+                rec["values_text"] = _format_exact_values(raw)
+                rec["values_source"] = "ooxml"
+                rec["values"] = rec["values_text"]  # для старого кода
+
+            # фолбэк: если raw_values не получилось собрать, но старый
+            # _parse_chart_data вернул плоский список — аккуратно
+            # оборачиваем его в одну серию без доп. магии
+            if not rec.get("raw_values"):
+                cd, _ctype, _attrs = _parse_chart_data(attrs_json)
+                if cd:
+                    categories = [str(r.get("label") or r.get("name") or r.get("category") or "") for r in cd]
+                    values = []
+                    for r in cd:
+                        v = r.get("value")
+                        if v is None:
+                            v = r.get("y") or r.get("x") or r.get("v") or r.get("count")
+                        values.append(v)
+                    rec["raw_values"] = {
+                        "categories": categories,
+                        "series": [{
+                            "name": None,
+                            "unit": (cd[0].get("unit") if cd and isinstance(cd[0].get("unit"), str) else None),
+                            "values": values,
+                        }],
+                    }
+                    rec["values_text"] = _format_exact_values(rec["raw_values"])
+                    rec["values_source"] = "ooxml"
+                    rec["values"] = rec["values_text"]
+
+            # 4.b) display — как и раньше
             if not rec["display"]:
                 title_text = row["text"] if ("text" in row.keys()) else None
                 rec["display"] = _compose_figure_display(
@@ -1833,6 +2276,16 @@ def _build_figure_records(uid: int, doc_id: int, nums: list[str]) -> list[dict]:
                     row["section_path"],
                     title_text,
                 )
+
+            # 4.c) ТЕКСТ ПОСЛЕ РИСУНКА: 2–3 абзаца прямо из диплома
+            try:
+                follow = _figure_following_paragraphs(uid, doc_id, row, max_paragraphs=3, max_chars=1500)
+                if follow:
+                    rec["near_text"] = follow
+            except Exception:
+                # не ломаем обработку рисунка, если что-то пошло не так
+                pass
+
 
         if not rec["display"]:
             rec["display"] = f"Рисунок {norm}"
@@ -1848,40 +2301,26 @@ def _fig_values_text_from_records(
     need_values: bool,
 ) -> str:
     """
-    Собираем текстовый блок с точными значениями по рисункам
-    (без отправки в Telegram). Используется как префикс к
-    основному описанию.
+    Собираем текстовый блок с точными значениями по рисункам.
+    Приоритет:
+      1) rec.raw_values / rec.values_text (OOXML);
+      2) oox_fig_lookup (готовый текст).
     """
     lines: list[str] = []
 
     for rec in records:
-        # 1) chart_data уже мог быть проставлен в _build_figure_records
-        values = (rec.get("values") or "").strip()
+        # 1) приоритет — сырые OOXML-данные
+        raw = rec.get("raw_values")
+        values_text = (rec.get("values_text") or rec.get("values") or "").strip()
 
-        # 2) ФОЛБЭК №1: если chart_data нет, пробуем через summarizer.extract_figure_value
-        if not values and summ_extract_figure_value is not None:
-            owner_id = rec.get("owner_id")
-            doc_id = rec.get("doc_id")
-            num = rec.get("orig") or rec.get("num")
+        if raw and not values_text:
+            values_text = _format_exact_values(raw)
+            rec["values_text"] = values_text
+            rec["values"] = values_text
+            rec["values_source"] = rec.get("values_source") or "ooxml"
 
-            if owner_id and doc_id and num:
-                try:
-                    raw = summ_extract_figure_value(owner_id, doc_id, str(num)) or ""
-                    raw = raw.strip()
-                except Exception:
-                    raw = ""
-
-                # ожидаемый формат из summarizer.extract_figure_value:
-                # "**Рисунок N.** Заголовок\n<табличка/CSV/...>"
-                if raw.startswith("**Рисунок"):
-                    raw_lines = raw.splitlines()
-                    body = "\n".join(raw_lines[1:]).strip() if len(raw_lines) >= 2 else ""
-                    if body:
-                        values = body
-                        rec["values"] = body  # чтобы GPT-описание тоже видело эти числа
-
-        # 3) ФОЛБЭК №2: если нет ни chart_data, ни summarizer — пробуем OOXML-индекс
-        if not values:
+        # 2) ФОЛБЭК: OOXML-индекс figure_lookup (готовый текст)
+        if not values_text:
             try:
                 doc_id = rec.get("doc_id")
                 num = rec.get("orig") or rec.get("num")
@@ -1890,9 +2329,6 @@ def _fig_values_text_from_records(
 
                 if idx and "oox_fig_lookup" in globals() and num:
                     oox_res = oox_fig_lookup(idx, str(num))
-
-                    # Подстрой под свою реализацию figure_lookup:
-                    # здесь предполагаем, что вернётся либо строка, либо dict.
                     if isinstance(oox_res, str):
                         body = oox_res.strip()
                     elif isinstance(oox_res, dict):
@@ -1903,18 +2339,27 @@ def _fig_values_text_from_records(
                         ).strip()
 
                 if body:
-                    values = body
+                    values_text = body
+                    rec["values_text"] = body
                     rec["values"] = body
+                    rec["values_source"] = rec.get("values_source") or "ooxml_text"
             except Exception:
-                # не ломаем весь ответ, если с OOXML что-то пошло не так
                 pass
 
-        # 4) если после всех попыток чисел нет — пропускаем этот рисунок
-        if not values:
+        # если после всех попыток чисел нет — пропускаем этот рисунок
+        if not values_text:
             continue
 
         disp = rec.get("display") or f"Рисунок {rec.get('num') or ''}".strip()
-        lines.append(f"**{disp} — точные значения**\n\n{values}")
+        # для OOXML-данных заголовок однозначный
+        if rec.get("values_source") == "ooxml":
+            title = f"**{disp} — точные значения (как в документе)**"
+        elif rec.get("values_source") in {"summary", "vision"}:
+            title = f"**{disp} — значения, распознанные по изображению (возможны неточности)**"
+        else:
+            title = f"**{disp} — значения**"
+
+        lines.append(f"{title}\n\n{values_text}")
 
     if lines:
         return "\n\n".join(lines)
@@ -1922,7 +2367,7 @@ def _fig_values_text_from_records(
     if need_values:
         return (
             "По указанным рисункам не удалось автоматически извлечь точные числовые данные "
-            "(ни из chart_data, ни через анализ изображения/OOXML). "
+            "(нет структурированных OOXML-данных и распознавания по картинкам). "
             "Могу дать только текстовое описание."
         )
 
@@ -1977,9 +2422,20 @@ async def _explain_figures_with_gpt(
             parts.append("Текст рядом: " + " ".join(rec["near_text"][:2]))
         if rec.get("vision_desc"):
             parts.append("Описание по картинке: " + rec["vision_desc"])
-        if rec.get("values"):
-            parts.append("Точные значения (как в документе):\n" + rec["values"])
+
+        values_text = (rec.get("values_text") or rec.get("values") or "").strip()
+        if values_text:
+            parts.append("Точные значения (как в документе):\n" + values_text)
+
+        # при желании можно подать и сырую структуру, чтобы LLM понимала серии/категории
+        if rec.get("raw_values"):
+            try:
+                parts.append("Сырые данные диаграммы (JSON):\n" + json.dumps(rec["raw_values"], ensure_ascii=False))
+            except Exception:
+                pass
+
         ctx_blocks.append("\n".join(parts))
+
 
     ctx = "\n\n---\n\n".join(ctx_blocks)
     if not ctx.strip():
@@ -1992,13 +2448,19 @@ async def _explain_figures_with_gpt(
     )
 
     system_prompt = (
-        "Ты репетитор по дипломным работам. У тебя есть информация о рисунках диплома "
-        "(подписи, текст рядом, распознанные данные диаграмм). "
-        "Объясни студенту, что показывают рисунки, какие тенденции видны и какие выводы можно сделать. "
-        "Не придумывай новые числа и не ссылайся на номера страниц."
+        "Ты репетитор по дипломным работам. В ЭТОМ вызове ты анализируешь только рисунки "
+        "(диаграммы, графики) из диплома. "
+        "Тебе уже даны подписи, ближайший текст и точные числовые данные диаграмм из документа. "
+        "Используй эти данные как есть: не придумывай новые числа, не пересчитывай проценты "
+        "и не пытайся нормировать суммы до 100%. Не ссылайся на номера страниц."
     )
+
     user_prompt = (
         f"Вопрос пользователя: {question}\n\n"
+        "Числа по каждому рисунку уже перечислены выше в блоках «Точные значения (как в документе)» "
+        "и/или в JSON-структуре. НЕ переписывай эти числа и НЕ изменяй проценты. "
+        "Твоя задача — только смысловая интерпретация: что показывают рисунки, какие уровни выше/ниже, "
+        "какие тенденции видны, какие выводы можно сделать.\n\n"
         f"Сконцентрируйся только на указанных рисунках, опиши их содержание и сделай интерпретацию {focus}.\n"
         f"{_verbosity_addendum(verbosity, 'описания рисунков')}"
     )
@@ -2034,9 +2496,9 @@ async def _answer_figure_query(
     """
     Новый единый сценарий:
     1) всегда вытаскиваем максимум по рисункам (_build_figure_records);
-    2) всегда стараемся отправить сами картинки;
-    3) собираем общий блок с точными значениями (если есть);
-    4) даём одно связное пояснение через GPT, в которое подмешан блок значений.
+    2) собираем общий блок с точными значениями (если есть);
+    3) даём одно связное пояснение через GPT, в которое подмешан блок значений.
+
 
     Поведение не зависит от того, спросили ли «опиши рисунок 2.3»
     или «дай точные значения по рисунку 2.3» — меняется только акцент
@@ -2063,21 +2525,6 @@ async def _answer_figure_query(
     if not records:
         await _send(m, "Указанные рисунки в работе не найдены.")
         return True
-
-    # 3) сначала сами изображения (по всем найденным)
-    try:
-        cards_for_media = [
-            {
-                "num": r["num"],
-                "display": r.get("display") or f"Рисунок {r['num']}",
-                "images": r.get("images") or [],
-            }
-            for r in records
-        ]
-        await _send_media_from_cards(m, cards_for_media)
-    except Exception:
-        # если что-то не получилось — не срываем дальнейшие шаги
-        pass
 
     # 4) собираем общий блок с точными значениями (без отправки)
     values_block = _fig_values_text_from_records(records, need_values=need_values)
@@ -2432,21 +2879,45 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
             "list": list(lst.get("list") or []),
             "more": int(lst.get("more") or 0),
             "describe_lines": [],
+            "describe_cards": [],
         }
 
-        if intents["figures"]["describe"]:
+        nums = list(intents.get("figures", {}).get("describe") or [])
+        if nums:
             try:
+                # ⚙️ Берём карточки ТОЛЬКО по указанным номерам (5 и 6 → только 5 и 6)
                 cards = describe_figures_by_numbers(
-                    uid, doc_id, intents["figures"]["describe"],
-                    sample_chunks=2, use_vision=True, lang="ru"
-                )
+                    uid,
+                    doc_id,
+                    nums,
+                    sample_chunks=2,
+                    use_vision=True,
+                    lang="ru",
+                    vision_first_image_only=True,
+                ) or []
+
                 if not cards:
                     figs_block["describe_lines"] = ["Данного рисунка нет в работе."]
+                    figs_block["describe_cards"] = []
                 else:
+                    # Основное для answer_builder: полный набор describe_cards
+                    figs_block["describe_cards"] = cards
+
+                    # Чтобы в [Figures]/list не попадали лишние рисунки,
+                    # если запрос был только про конкретные номера.
+                    figs_block["list"] = [
+                        (c.get("display")
+                         or f"Рисунок {c.get('num') or ''}".strip())
+                        for c in cards
+                    ]
+                    figs_block["count"] = len(figs_block["list"])
+                    figs_block["more"] = 0
+
+                    # Для обратной совместимости — короткие describe_lines
                     lines = []
                     for c in cards:
                         disp = c.get("display") or "Рисунок"
-                        vis  = (c.get("vision") or {}).get("description", "") or ""
+                        vis = (c.get("vision") or {}).get("description", "") or ""
                         vis_clean = vis.strip()
                         low_vis = vis_clean.lower()
                         if ("описание не распознано" in low_vis
@@ -2462,9 +2933,10 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
                     figs_block["describe_lines"] = lines[:25]
             except Exception as e:
                 figs_block["describe_lines"] = [f"Не удалось описать рисунки: {e}"]
-
+                figs_block["describe_cards"] = []
 
         facts["figures"] = figs_block
+
 
     # ----- Источники -----
     if intents["sources"]["want"]:
@@ -2568,7 +3040,7 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
                 for i, s in enumerate(cov["items"])
             ]
 
-        # --- [VISION] второй проход: числа из диаграмм/картинок (подмешиваем в контекст) ---
+                # --- [VISION] второй проход: числа из диаграмм/картинок (подмешиваем в контекст) ---
         try:
             vision_block = ""
             if Cfg.vision_active():
@@ -2592,17 +3064,33 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
                 if chart_lines:
                     vision_block = "\n".join(chart_lines[:3])
                 else:
-                    # 2) иначе — отправляем 1–3 картинки в vision_extract_values
-                    img_paths = _pick_images_from_hits(hits_v, limit=getattr(Cfg, "VISION_MAX_IMAGES_PER_REQUEST", 3))
-                    if img_paths and vision_extract_values:
+                    # 2) иначе — отправляем 1–3 картинки в новый vision_analyzer
+                    img_paths = _pick_images_from_hits(
+                        hits_v,
+                        limit=getattr(Cfg, "VISION_MAX_IMAGES_PER_REQUEST", 3),
+                    )
+                    if img_paths and va_analyze_figure:
+                        chunks: list[str] = []
                         hint = (hits_v[0].get("text") or "")[:300]
-                        res = vision_extract_values(img_paths, caption_hint=hint, lang="ru")
-                        rows = (res or {}).get("data") or []
-                        if rows:
-                            vision_block = "\n".join(
-                                ["[Text on image]"] +
-                                _pairs_to_bullets(rows).splitlines()
-                            )
+                        for p in img_paths:
+                            try:
+                                res = va_analyze_figure(p, caption_hint=hint, lang="ru")
+                            except Exception:
+                                continue
+
+                            text_block = ""
+                            if isinstance(res, dict):
+                                # ожидаемый формат: {"text": "...", "data": [...]}
+                                pairs = res.get("data") or []
+                                text_block = (res.get("text") or "").strip() or _pairs_to_bullets(pairs)
+                            else:
+                                text_block = (str(res) or "").strip()
+
+                            if text_block:
+                                chunks.append("[Text on image]\n" + text_block)
+
+                        if chunks:
+                            vision_block = "\n\n".join(chunks)
                         elif FIG_STRICT:
                             # нет надёжных чисел с картинки — явно помечаем
                             vision_block = "[No precise data]"
@@ -2967,8 +3455,16 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
     if await _maybe_run_gost(m, uid, doc_id, q_text):
         return
 
+    # быстрый путь для запросов про рисунки
+    if _is_pure_figure_request(q_text):
+        verbosity = _detect_verbosity(q_text)
+        handled = await _answer_figure_query(m, uid, doc_id, q_text, verbosity=verbosity)
+        if handled:
+            return
+
 
     # РАНО в respond_with_answer, до detect_intents:
+        # РАНО в respond_with_answer, до detect_intents:
     if _ALL_FIGS_HINT.search(q_text or ""):
         meta = _list_figures_db(uid, doc_id, limit=999999)
         total = int(meta["count"])
@@ -2983,16 +3479,16 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
             if mnum:
                 nums.append(mnum.group(1).replace(" ", "").replace(",", "."))
         batch = nums[:8] or nums[:12]
-        # карточки + сначала отправим фотографии пользователю
+        # карточки (используем только для текста; картинки в чат больше не шлём)
         cards = []
         try:
             cards = describe_figures_by_numbers(uid, doc_id, batch, sample_chunks=1, use_vision=False, lang="ru") or []
         except Exception:
             cards = []
-        await _send_media_from_cards(m, cards)
 
         # затем — связный текст по каждому рисунку: prefer vision_analyzer
         lines = []
+
         if va_analyze_figure and cards:
             for c in cards:
                 disp = c.get("display") or f"Рисунок {c.get('num') or ''}".strip()
@@ -3009,7 +3505,7 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
                 except Exception:
                     text_block = ""
                 if not text_block:
-                    # фолбэк — старый summarizer
+                    # фолбэк — старый summarizer больше не используем
                     text_block = ""
                 if text_block:
                     # это текст по изображению (OCR/описание)
@@ -3019,14 +3515,12 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
                     if FIG_STRICT:
                         lines.append(f"[No precise data] **{disp}**")
 
-
         suffix = (f"\n\nПоказана первая партия из {len(batch)} / {total}." if total > len(batch) else "")
         if lines:
             await _send(m, "\n\n".join(lines) + suffix)
         else:
             # финальный фолбэк, если анализатор недоступен
-            txt = vision_describe_figures(uid, doc_id, batch)
-            await _send(m, (txt or "Не удалось описать рисунки.") + suffix)
+            await _send(m, "Не удалось описать рисунки." + suffix)
         return
 
 
@@ -3062,27 +3556,18 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
     intents = detect_intents(q_text)
     verbosity = _detect_verbosity(q_text)
 
-    # Чистый запрос про рисунки (нет секций/таблиц/общего обсуждения)
+    # Чистый запрос про конкретные рисунки (нет секций/таблиц/источников/общего вопроса)
     pure_figs = intents["figures"]["want"] and not (
         intents["tables"]["want"] or intents["sources"]["want"] or
         intents.get("summary") or intents.get("general_question") or
         _SECTION_NUM_RE.search(q_text)
     )
 
-    if intents["figures"]["want"]:
-        try:
-            await _ensure_modalities_indexed(m, uid, doc_id, intents)  # если figure==0, тихо переиндексирует
-        except Exception:
-            pass
-
-    if pure_figs:
-        if await _answer_figure_query(m, uid, doc_id, q_text, verbosity=verbosity):
-            return
-    else:
-        if intents["figures"]["want"]:
-            # сначала кратко ответим по рисункам, затем продолжим общий пайплайн
-            await _answer_figure_query(m, uid, doc_id, q_text, verbosity=verbosity)
-
+    # Если запрос только про рисунки (например: «опиши рисунок 6» или «рисунки 5 и 6»),
+    # отключаем общий RAG-вопрос, чтобы в промпт не попали лишние куски текста
+    # с упоминаниями других рисунков. Далее всё идёт через facts → answer_builder.
+    if pure_figs and "general_question" in intents:
+        intents["general_question"] = None
 
 
     # NEW: явная обработка «по пункту/разделу/главе X.Y»
@@ -3149,15 +3634,10 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
             await _send(m, f"Пункт {sec} не найден в индексе документа.")
             return
 
-    # Если sec найден, но запрос НЕ чистый — не отправляем отдельный ответ по пункту,
-    # продолжаем обычный пайплайн ниже (RAG / FULLREAD), чтобы ответить на всё целиком.
-
-
-
 
     # ====== FULLREAD: auto ======
     fr_mode = getattr(Cfg, "FULLREAD_MODE", "off")
-    if fr_mode == "auto":
+    if fr_mode == "auto" and not pure_figs:
         _limit = int(getattr(Cfg, "DIRECT_MAX_CHARS", 80000))
         # пробуем дать модели ПОЛНЫЙ текст, если влазит
         full_text = _full_document_text(uid, doc_id, limit_chars=_limit + 1)
@@ -3217,7 +3697,7 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
 
 
     # ====== FULLREAD: direct ======
-    if fr_mode == "direct":
+    if fr_mode == "direct" and not pure_figs:
         fr = _fullread_try_answer(uid, doc_id, q_text)
         if isinstance(fr, tuple) and fr and fr[0] == "__STREAM__":
             messages = json.loads(fr[1])
@@ -3234,7 +3714,7 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
         # иначе — RAG ниже
 
     # ====== FULLREAD: iterative/digest ======
-    if fr_mode in {"iterative", "digest"}:
+    if fr_mode in {"iterative", "digest"} and not pure_figs:
         messages, err = _iterative_fullread_build_messages(uid, doc_id, q_text)
         if messages:
             if STREAM_ENABLED and chat_with_gpt_stream is not None:

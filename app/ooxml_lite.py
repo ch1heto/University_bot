@@ -69,6 +69,9 @@ class Figure:
     image_path: Optional[str] = None
     chart: Optional[Dict] = None
     _order: int = field(default=0)
+    # индекс параграфа, в котором встретили этот drawing (для привязки к ближайшей подписи)
+    para_idx: int = field(default=-1)
+
 
 
 @dataclass
@@ -77,6 +80,8 @@ class Table:
     caption: Optional[str] = None
     n: Optional[int] = None
     _order: int = field(default=0)
+    # индекс параграфа, рядом с которым встретилась таблица
+    para_idx: int = field(default=-1)
 
 
 def _read_xml(z: ZipFile, path: str) -> etree._Element:
@@ -130,6 +135,7 @@ def _extract_heading_level(p: etree._Element) -> Optional[int]:
         except Exception:
             return None
     return None
+
 
 
 def _parse_tbl(tbl: etree._Element, limit_rows: int = MAX_TABLE_ROWS) -> List[List[str]]:
@@ -816,6 +822,8 @@ def _parse_chart_data(z: ZipFile, chart_xml_path: str) -> Dict:
             values_raw: List[str] = []
             vals_num: List[str] = []
 
+            # Если по формату/группировке понимаем, что это проценты –
+            # просто помечаем unit='%', но не меняем сами числа.
             unit = "%" if percent_context else None
 
             for item in values_raw_dec:
@@ -828,15 +836,11 @@ def _parse_chart_data(z: ZipFile, chart_xml_path: str) -> Dict:
                     vals_num.append("")
                     continue
 
-                # Если считаем, что это проценты и значения в долях 0–1 → домножаем до 0–100
-                if percent_context and abs(dec) <= Decimal("1.05"):
-                    num = float(dec * 100)
-                else:
-                    num = float(dec)
-
+                # БОЛЬШЕ НЕ домножаем на 100 — значение остаётся «как в документе»
+                num = float(dec)
                 values.append(num)
 
-                # Строковое представление исходного числа (без шкалы)
+                # Строковое представление исходного числа (тоже «как есть»)
                 s_dec = format(dec.normalize(), "f").rstrip("0").rstrip(".")
                 vals_num.append(s_dec if s_dec != "" else "0")
 
@@ -845,27 +849,23 @@ def _parse_chart_data(z: ZipFile, chart_xml_path: str) -> Dict:
             s["unit"] = unit
             s["vals_num"] = vals_num
 
-            # Старое поле "vals" для совместимости:
-            # если проценты – делаем человекочитаемый вид "70%"
+            # Старое поле "vals" для совместимости: человекочитаемый вид,
+            # но БЕЗ пересчитывания шкалы/нормировки.
             if percent_context:
                 vals_str: List[str] = []
                 for v in values:
                     if v is None:
                         vals_str.append("")
                         continue
-                    # v уже в шкале 0–100
-                    if 1.0 < v <= 100.0:
-                        if abs(v - round(v)) < 0.05:
-                            vals_str.append(f"{int(round(v))}%")
-                        else:
-                            s_v = f"{v:.2f}".rstrip("0").rstrip(".")
-                            vals_str.append(f"{s_v}%")
+                    if abs(v - round(v)) < 0.05:
+                        sval = str(int(round(v)))
                     else:
-                        vals_str.append(_fmt_percent_value(v / 100.0))
+                        sval = f"{v:.2f}".rstrip("0").rstrip(".")
+                    vals_str.append(f"{sval}%")
                 s["vals"] = vals_str
             else:
-                # не проценты – просто числовые значения
                 s["vals"] = [v for v in values if v is not None]
+
 
     # 5. Общие категории (если совпадают)
     shared_cats: Optional[List[str]] = None
@@ -873,32 +873,35 @@ def _parse_chart_data(z: ZipFile, chart_xml_path: str) -> Dict:
         all_cats = [tuple(s.get("cats", [])) for s in series if s.get("cats")]
         if all_cats and all(x == all_cats[0] for x in all_cats):
             shared_cats = list(all_cats[0])
-    # 5.1. Нормализованный список пар label/value/unit для простого использования
+        # 5.1. Нормализованный список пар label/value/unit для простого использования
+    # Теперь собираем ВСЕ серии, а не только первую.
     chart_data_rows: Optional[List[Dict[str, Any]]] = None
     if chart_type not in ("scatter", "bubble") and series:
-        # Берём первую «полноценную» серию (у которой есть и категории, и значения)
+        rows_all: List[Dict[str, Any]] = []
         for s in series:
             cats = s.get("cats") or shared_cats or []
             vals = s.get("values") or []
             unit = s.get("unit") or None
+            sname = s.get("name")  # имя серии (Низкий/Средний/Высокий и т.п.)
             if not cats or not vals:
                 continue
-            rows: List[Dict[str, Any]] = []
             n = min(len(cats), len(vals))
             for i in range(n):
                 v = vals[i]
                 if v is None:
+                    # пропускаем только реально отсутствующие значения,
+                    # 0.0 при этом сохраняем
                     continue
-                rows.append(
+                rows_all.append(
                     {
                         "label": str(cats[i]).strip(),
                         "value": float(v),
                         "unit": unit,
+                        "series_name": sname,
                     }
                 )
-            if rows:
-                chart_data_rows = rows
-                break
+        if rows_all:
+            chart_data_rows = rows_all
 
     # 6. Флаг ok
     ok = False
@@ -937,7 +940,7 @@ def _split_caption_num_tail(caption: Optional[str], *, is_table: bool = False) -
     """
     Из подписи вида 'Рисунок 2.3 — Структура системы'
     достаём:
-      caption_num  -> '2.3'
+      caption_num  -> '2.3' (нормализованный вид)
       caption_tail -> 'Структура системы'
     Для таблиц работает аналогично.
     """
@@ -951,12 +954,14 @@ def _split_caption_num_tail(caption: Optional[str], *, is_table: bool = False) -
     if not m:
         return None, None
 
-    num_str = (m.group(1) or "").strip()
+    num_raw = (m.group(1) or "").strip()
+    num_norm = _norm_label_num(num_raw)
     # хвост — всё после номера, чистим разделители
     tail = cap[m.end(1):].lstrip(" .—–-:\u2013\u2014")
     if not tail:
         tail = None
-    return num_str, tail
+    # caption_num теперь сразу в каноническом виде ("2.3")
+    return num_norm or num_raw or None, tail
 
 
 def build_index(docx_path: str) -> Dict:
@@ -969,8 +974,9 @@ def build_index(docx_path: str) -> Dict:
         headings: List[Heading] = []
         figures: List[Figure] = []
         tables: List[Table] = []
-        fig_captions: List[Tuple[int, str]] = []
-        tab_captions: List[Tuple[int, str]] = []
+        fig_captions: List[Tuple[int, int, str]] = []
+        tab_captions: List[Tuple[int, int, str]] = []
+
         content_seq: List[Tuple[str, int]] = []
         p_index = 0
         fig_idx = 0
@@ -994,7 +1000,8 @@ def build_index(docx_path: str) -> Dict:
                         except Exception:
                             num_int = None
                         if num_int is not None:
-                            fig_captions.append((num_int, txt))
+                            # запоминаем не только номер, но и индекс параграфа
+                            fig_captions.append((p_index, num_int, txt))
 
                     m_tab = TAB_CAP_RE.match(txt)
                     if m_tab:
@@ -1006,7 +1013,8 @@ def build_index(docx_path: str) -> Dict:
                         except Exception:
                             num_int = None
                         if num_int is not None:
-                            tab_captions.append((num_int, txt))
+                            tab_captions.append((p_index, num_int, txt))
+
 
                 drawings = node.findall(".//w:drawing", namespaces=NS)
                 for d in drawings:
@@ -1054,6 +1062,7 @@ def build_index(docx_path: str) -> Dict:
                                 image_path=image_path,
                                 chart=chart_block,
                                 _order=fig_idx,
+                                para_idx=p_index,
                             )
                         )
                         content_seq.append(("figure", fig_idx))
@@ -1062,27 +1071,63 @@ def build_index(docx_path: str) -> Dict:
                 p_index += 1
             elif node.tag.endswith("tbl"):
                 rows = _parse_tbl(node, limit_rows=MAX_TABLE_ROWS)
-                tbl = Table(rows=rows, _order=tbl_idx)
+                # привязываем таблицу к текущему p_index (последний параграф выше)
+                tbl = Table(rows=rows, _order=tbl_idx, para_idx=p_index)
                 tables.append(tbl)
                 content_seq.append(("table", tbl_idx))
                 tbl_idx += 1
 
-        # пронумеруем фигуры/таблицы по подписям
-        for i, fig in enumerate(figures):
-            if i < len(fig_captions):
-                n, cap = fig_captions[i]
-                fig.n = n
-                fig.caption = cap
-            else:
-                fig.n = (i + 1) if fig.n is None else fig.n
 
-        for i, tbl in enumerate(tables):
-            if i < len(tab_captions):
-                n, cap = tab_captions[i]
-                tbl.n = n
-                tbl.caption = cap
+        # пронумеруем фигуры/таблицы по подписям
+                # пронумеруем фигуры/таблицы по подписям:
+        # для каждой фигуры ищем ближайшую по индексу параграфа подпись "Рисунок N"
+        used_fig_caps = set()
+        for fig in figures:
+            best = None
+            best_dist = 10**9
+            best_idx = None
+            for idx, (cap_p_idx, cap_n, cap_txt) in enumerate(fig_captions):
+                if idx in used_fig_caps:
+                    continue
+                if fig.para_idx >= 0:
+                    dist = abs(cap_p_idx - fig.para_idx)
+                else:
+                    # фолбэк — старое поведение по порядку
+                    dist = abs(idx - fig._order)
+                if dist < best_dist:
+                    best_dist = dist
+                    best = (cap_n, cap_txt)
+                    best_idx = idx
+            # ограничиваемся небольшой "окрестностью" по тексту, чтобы не хватать чужие подписи
+            if best is not None and best_dist <= 3:
+                fig.n, fig.caption = best
+                used_fig_caps.add(best_idx)
             else:
-                tbl.n = (i + 1) if tbl.n is None else tbl.n
+                # если подписи явно нет рядом — автонумерация, как раньше
+                fig.n = (fig.n or (fig._order + 1))
+
+        used_tab_caps = set()
+        for tbl in tables:
+            best = None
+            best_dist = 10**9
+            best_idx = None
+            for idx, (cap_p_idx, cap_n, cap_txt) in enumerate(tab_captions):
+                if idx in used_tab_caps:
+                    continue
+                if tbl.para_idx >= 0:
+                    dist = abs(cap_p_idx - tbl.para_idx)
+                else:
+                    dist = abs(idx - tbl._order)
+                if dist < best_dist:
+                    best_dist = dist
+                    best = (cap_n, cap_txt)
+                    best_idx = idx
+            if best is not None and best_dist <= 3:
+                tbl.n, tbl.caption = best
+                used_tab_caps.add(best_idx)
+            else:
+                tbl.n = (tbl.n or (tbl._order + 1))
+
 
         # список литературы
         references: List[str] = []
@@ -1114,11 +1159,15 @@ def build_index(docx_path: str) -> Dict:
 
         for f in sorted(figures, key=_fig_sort_key):
             cap_num, cap_tail = _split_caption_num_tail(f.caption, is_table=False)
+            # канонический номер, который будет использоваться дальше в БД/боте
+            label_norm = _norm_label_num(cap_num if cap_num is not None else f.n)
+
             entry: Dict[str, Any] = {
-                "n": f.n,
+                "n": f.n,                      # исходный int-номер
+                "label": label_norm,           # нормализованный "2.3"
                 "caption": f.caption,
-                "caption_num": cap_num,    # <- строковый номер вида "2.3"
-                "caption_tail": cap_tail,  # <- хвост подписи без "Рисунок 2.3 —"
+                "caption_num": cap_num,        # строка из подписи (уже нормализована)
+                "caption_tail": cap_tail,      # хвост подписи без "Рисунок 2.3 —"
                 "kind": f.kind,
                 "chart": f.chart if f.kind == "chart" else None,
                 "image_path": f.image_path if f.kind == "image" else None,
@@ -1139,12 +1188,14 @@ def build_index(docx_path: str) -> Dict:
 
         for t in sorted(tables, key=_tbl_sort_key):
             cap_num, cap_tail = _split_caption_num_tail(t.caption, is_table=True)
+            label_norm = _norm_label_num(cap_num if cap_num is not None else t.n)
             index["tables"].append(
                 {
                     "n": t.n,
+                    "label": label_norm,         # канонический "3.2"
                     "caption": t.caption,
-                    "caption_num": cap_num,    # например "3.2"
-                    "caption_tail": cap_tail,  # "Распределение ответов по ..."
+                    "caption_num": cap_num,      # например "3.2"
+                    "caption_tail": cap_tail,    # "Распределение ответов по ..."
                     "rows": t.rows,
                 }
             )
@@ -1180,13 +1231,50 @@ def _chart_rows_to_text(rows: List[Dict[str, Any]]) -> str:
     """
     Преобразуем chart_data (список {label, value, unit})
     в человекочитаемый текст с маркерами.
+
+    Евристика:
+    - если у строк unit содержит '%'
+    - и ВСЕ числовые значения в диапазоне [0, 1.2],
+      считаем, что это доли (0.8 → 80%) и домножаем на 100.
     """
     lines: List[str] = []
+
+    # ---- Евристика для "долей" в процентах ----
+    numeric_vals: List[float] = []
+    has_percent_unit = False
+
+    for r in rows or []:
+        unit_raw = r.get("unit")
+        if isinstance(unit_raw, str) and "%" in unit_raw:
+            has_percent_unit = True
+
+        val = r.get("value")
+        if isinstance(val, Decimal):
+            try:
+                numeric_vals.append(float(val))
+            except Exception:
+                pass
+        elif isinstance(val, (int, float)):
+            try:
+                numeric_vals.append(float(val))
+            except Exception:
+                pass
+
+    is_share_like = bool(
+        has_percent_unit
+        and numeric_vals
+        and all(0.0 <= v <= 1.2 for v in numeric_vals)
+    )
+    # -------------------------------------------
+
     for r in rows or []:
         label = str(r.get("label") or "").strip()
+        series_name = str(r.get("series_name") or "").strip()
         val = r.get("value")
         unit = r.get("unit") or ""
+
         sval = ""
+        v: Optional[float] = None
 
         if isinstance(val, Decimal):
             v = float(val)
@@ -1196,7 +1284,11 @@ def _chart_rows_to_text(rows: List[Dict[str, Any]]) -> str:
             # если вдруг value строка — просто берём как есть
             sval = str(val) if val is not None else ""
 
-        if sval == "" and isinstance(v, float):
+        # применяем евристику: 0.8 → 80 (если это доли в процентах)
+        if v is not None and is_share_like:
+            v = v * 100.0
+
+        if sval == "" and v is not None:
             # форматируем число аккуратно
             if abs(v - round(v)) < 0.05:
                 sval = str(int(round(v)))
@@ -1210,7 +1302,13 @@ def _chart_rows_to_text(rows: List[Dict[str, Any]]) -> str:
             else:
                 sval = f"{sval} {unit.strip()}"
 
-        line = f"— {label}: {sval}".strip()
+        # если есть имя серии, добавляем его в скобках
+        if series_name:
+            label_full = f"{label} ({series_name})"
+        else:
+            label_full = label
+
+        line = f"— {label_full}: {sval}".strip()
         if line:
             lines.append(line)
 
