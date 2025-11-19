@@ -3048,7 +3048,6 @@ async def _answer_table_query(
         else:
             missing.append(n)
 
-
     # если вообще ничего не нашли — честно говорим, что № нет в индексе,
     # и НЕ перекладываем это на модель
     if not blocks and missing:
