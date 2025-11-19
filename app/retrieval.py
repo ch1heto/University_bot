@@ -7,6 +7,17 @@ from typing import Optional, List, Dict, Tuple, Any
 from .db import get_conn, get_figures_for_doc
 from .polza_client import embeddings, vision_describe  # эмбеддинги + vision
 
+# Опциональные хелперы по номерам таблиц/рисунков и «все значения»
+try:
+    from .intents import extract_table_numbers, extract_figure_numbers, TABLE_ALL_VALUES_RE  # type: ignore
+except Exception:
+    extract_table_numbers = None      # type: ignore
+    extract_figure_numbers = None     # type: ignore
+    TABLE_ALL_VALUES_RE = re.compile(  # type: ignore
+        r"(?i)\b(все|всю|целиком|полностью|полная)\b.*\b(таблиц\w*|таблица|значени\w*|данн\w*|строк\w*|колон\w*)\b"
+        r"|(?:\ball\b.*\b(table|values|rows|columns)\b|\bfull\s+(table|values)\b|\bentire\s+table\b)"
+    )
+
 # Кэш векторов на процесс: (owner_id, doc_id) -> {"mat": np.ndarray [N,D], "meta": list[dict]}
 _DOC_CACHE: dict[tuple[int, int], dict] = {}
 
@@ -911,7 +922,7 @@ def _figure_context_snippets_for_query(doc_id: int, query: str, max_items: int =
     Если вопрос явно ссылается на «Рисунок N», подмешиваем в контекст 1–2
     синтетических сниппета с кратким описанием соответствующих рисунков.
     """
-    nums = _extract_figure_numbers_from_query(query)
+    nums = extract_figure_numbers(query) if extract_figure_numbers else []  # type: ignore
     if not nums:
         return []
 
@@ -1133,7 +1144,7 @@ def describe_figures_by_numbers(
 
 # «Таблица 2.1 — ...», «Table A.1 — ...»
 _TABLE_TITLE_RE = re.compile(
-    r"(?i)\b(?:табл(?:ица)?|table)\s+([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)\b(?:\s*[—\-–:]\s*(.+))?"
+    r"(?i)\b(?:табл(?:ица)?|table)\s+([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)\b(?:\s*[—\-–:]\s*(.+))?",
 )
 _ROW_TAG_RE = re.compile(r"\[\s*row\s+(\d+)\s*\]", re.IGNORECASE)
 
@@ -1159,25 +1170,37 @@ def _parse_table_title(text: str) -> Tuple[Optional[str], Optional[str]]:
     title = (m.group(2) or "").strip() or None
     return (num or None, title)
 
-def _extract_table_numbers_from_query(q: str) -> List[str]:
-    out: List[str] = []
-    for m in re.finditer(r"(?:табл(?:ица)?|table)\s*(?:№\s*|no\.?\s*|номер\s*)?([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)", q or "", re.IGNORECASE):
-        out.append(_num_norm(m.group(1)))
-    return [x for x in out if x]
+# --- Fallback-реализации, если extract_* не приехали из .intents ---
 
-def _extract_figure_numbers_from_query(q: str) -> List[str]:
-    out: List[str] = []
-    for m in re.finditer(r"(?:рис(?:унок)?|fig(?:ure)?\.?)\s*(?:№\s*|no\.?\s*|номер\s*)?([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)", q or "", re.IGNORECASE):
-        out.append(_num_norm(m.group(1)))
-    return [x for x in out if x]
+if extract_table_numbers is None:  # type: ignore
+    def extract_table_numbers(q: str) -> List[str]:  # type: ignore
+        out: List[str] = []
+        for m in re.finditer(
+            r"(?:табл(?:ица)?|table)\s*(?:№\s*|no\.?\s*|номер\s*)?([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)",
+            q or "",
+            re.IGNORECASE,
+        ):
+            out.append(_num_norm(m.group(1)))
+        return [x for x in out if x]
 
-_ALL_VALUES_HINT = re.compile(
-    r"(все|всю|полные|полный|целиком|полностью)\s+(значени|строк|столбц|данн|таблиц)|all\s+values|entire\s+table|full\s+table",
-    re.IGNORECASE
-)
+if extract_figure_numbers is None:  # type: ignore
+    def extract_figure_numbers(q: str) -> List[str]:  # type: ignore
+        out: List[str] = []
+        for m in re.finditer(
+            r"(?:рис(?:унок)?|fig(?:ure)?\.?)\s*(?:№\s*|no\.?\s*|номер\s*)?([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)",
+            q or "",
+            re.IGNORECASE,
+        ):
+            out.append(_num_norm(m.group(1)))
+        return [x for x in out if x]
 
 def _wants_all_values(ask: str) -> bool:
-    return bool(_ALL_VALUES_HINT.search(ask or ""))
+    """
+    Хинт «все значения / всю таблицу»:
+      - либо через TABLE_ALL_VALUES_RE из .intents,
+      - либо через локальный fallback (он уже зашит в TABLE_ALL_VALUES_RE выше).
+    """
+    return bool(TABLE_ALL_VALUES_RE.search(ask or ""))
 
 def _find_table_bases_by_number(pack: dict, num: str) -> List[str]:
     """
@@ -1276,7 +1299,7 @@ def _inject_special_sources_for_item(pack: dict, ask: str, used_ids: set[int], *
     added: List[Dict] = []
 
     # Таблицы
-    table_nums = _extract_table_numbers_from_query(ask)
+    table_nums = extract_table_numbers(ask) if extract_table_numbers else []  # type: ignore
     want_all = _wants_all_values(ask)
     for num in table_nums:
         bases = _find_table_bases_by_number(pack, num)
@@ -1294,10 +1317,9 @@ def _inject_special_sources_for_item(pack: dict, ask: str, used_ids: set[int], *
                 added.append(ch)
                 used_ids.add(ch["id"])
 
-    # Рисунки: берём все чанки этой секции (обычно один-три), чтобы было описание + подпись
-        # Рисунки: берём все чанки этой секции (обычно один-три), чтобы было описание + подпись
-        # Рисунки: работаем только через таблицу figures (без regex-поиска по chunks)
-    fig_nums = _extract_figure_numbers_from_query(ask)
+    # Рисунки: работаем только через таблицу figures (без regex-поиска по chunks)
+    fig_nums = extract_figure_numbers(ask) if extract_figure_numbers else []  # type: ignore
+
     if fig_nums:
         for raw_num in fig_nums:
             num = _num_norm(raw_num)

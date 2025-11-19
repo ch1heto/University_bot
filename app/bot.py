@@ -9,7 +9,7 @@ import time
 import math
 from decimal import Decimal 
 from typing import Iterable, AsyncIterable, Optional, List, Tuple
-
+from .docs_handlers import register_docs_handlers
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.exceptions import TelegramBadRequest
@@ -48,18 +48,6 @@ from .retrieval import (
     describe_figures_by_numbers,
 )
 from .intents import detect_intents
-
-# ↓ добавили мягкий импорт по-подпунктной генерации из ace
-try:
-    from .ace import plan_subtasks, answer_subpoint, _merge_subanswers as merge_subanswers  # type: ignore
-except Exception:
-    try:
-        # бэкап: если в ace функции экспортированы с подчёркиванием
-        from .ace import _plan_subtasks as plan_subtasks, _answer_subpoint as answer_subpoint, _merge_subanswers as merge_subanswers  # type: ignore
-    except Exception:
-        plan_subtasks = None   # type: ignore
-        answer_subpoint = None # type: ignore
-        merge_subanswers = None # type: ignore
 
 # ---------- polza client: пробуем стрим, фолбэк на обычный чат ----------
 try:
@@ -126,6 +114,7 @@ dp = Dispatcher()
 # добавьте эту строку (один раз):
 setup_paywall(dp, bot)
 
+register_docs_handlers(dp)
 
 # --------------------- ПАРАМЕТРЫ СТРИМИНГА (с дефолтами) ---------------------
 
@@ -271,7 +260,7 @@ def _verbosity_addendum(verbosity: str, what: str = "ответ") -> str:
     """
     what = (what or "ответ").strip()
 
-    if verbosity == "short":
+    if verbosity in ("short", "brief"):
         # пример: "Ответь кратко (по описанию рисунков)."
         return f" Ответь кратко (по {what})."
 
@@ -618,6 +607,185 @@ async def _stream_to_telegram(m: types.Message, stream, head_text: str = "⌛️
         except Exception:
             pass
 
+def _plan_subtasks_via_gpt(question: str, max_items: int = 8) -> list[dict]:
+    """
+    Планировщик подпунктов без ACE.
+    Берёт исходный вопрос и просит GPT разбить его на 2–N подпунктов.
+    Возвращает список dict: {"id": int, "ask": str}.
+    """
+    question = (question or "").strip()
+    if not question:
+        return []
+
+    if "chat_with_gpt" not in globals() or chat_with_gpt is None:
+        return []
+
+    system_prompt = (
+        "Ты помогаешь студенту с дипломом. Получив сложный или многочастный вопрос, "
+        "разбей его на несколько более простых подпунктов, которые можно последовательно разобрать. "
+        "Верни ТОЛЬКО JSON-массив без текста вокруг, формата:\n"
+        "[{\"id\": 1, \"ask\": \"...\"}, {\"id\": 2, \"ask\": \"...\"}, ...].\n"
+        "Не добавляй пояснений, комментариев и текста вне JSON."
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": question},
+    ]
+
+    try:
+        raw = chat_with_gpt(messages, temperature=0.0, max_tokens=400) or ""
+    except Exception as e:
+        logging.exception("plan_subtasks_via_gpt failed: %s", e)
+        return []
+
+    raw = raw.strip()
+
+    # Пытаемся выдернуть JSON-массив
+    data = None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        m = re.search(r"\[[\s\S]*\]", raw)
+        if not m:
+            return []
+        try:
+            data = json.loads(m.group(0))
+        except Exception:
+            return []
+
+    if not isinstance(data, list):
+        return []
+
+    items: list[dict] = []
+    for i, it in enumerate(data, start=1):
+        if isinstance(it, str):
+            ask = it.strip()
+            if not ask:
+                continue
+            items.append({"id": i, "ask": ask})
+        elif isinstance(it, dict):
+            ask = str(it.get("ask") or it.get("question") or it.get("text") or "").strip()
+            if not ask:
+                continue
+            iid = it.get("id") or i
+            items.append({"id": iid, "ask": ask})
+        if len(items) >= max_items:
+            break
+
+    return items
+
+
+def _answer_subpoint_via_gpt(
+    ask: str,
+    ctx_text: str,
+    base_question: str,
+    *,
+    verbosity: str = "normal",
+) -> str:
+    """
+    Генерация ответа по одному подпункту через GPT (без ACE).
+    """
+    ask = (ask or "").strip()
+    if not ask:
+        return ""
+
+    if "chat_with_gpt" not in globals() or chat_with_gpt is None:
+        return ""
+
+    ctx = (ctx_text or "").strip()
+
+    system_prompt = (
+        "Ты репетитор по дипломным работам. Тебе дали фрагмент текста диплома "
+        "и один подпункт вопроса.\n"
+        "Отвечай ТОЛЬКО по этому фрагменту. Не придумывай фактов, которых в тексте нет. "
+        "Если информации недостаточно для уверенного ответа, честно скажи об этом.\n"
+        "Не добавляй разделы вида «чего не хватает»."
+    )
+
+    if ctx:
+        assistant_ctx = f"[Фрагмент диплома]\n{ctx}"
+    else:
+        assistant_ctx = "[Фрагмент по этому подпункту не найден в тексте документа]"
+
+    user_prompt = (
+        f"Исходный общий вопрос пользователя:\n{base_question}\n\n"
+        f"Текущий подпункт (подвопрос): {ask}\n\n"
+        "Ответь только по этому подпункту, опираясь на переданный фрагмент диплома."
+        f"{_verbosity_addendum(verbosity)}"
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "assistant", "content": assistant_ctx},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    try:
+        ans = chat_with_gpt(messages, temperature=0.2, max_tokens=FINAL_MAX_TOKENS) or ""
+    except Exception as e:
+        logging.exception("answer_subpoint_via_gpt failed: %s", e)
+        return ""
+
+    return ans.strip()
+
+
+def _merge_subanswers_via_gpt(
+    base_question: str,
+    items: list[dict],
+    subanswers: list[str],
+    *,
+    verbosity: str = "normal",
+) -> str:
+    """
+    Финальный сводный ответ по всем подпунктам без ACE.
+    """
+    if not subanswers:
+        return ""
+
+    if "chat_with_gpt" not in globals() or chat_with_gpt is None:
+        return ""
+
+    blocks: list[str] = []
+    for i, ans in enumerate(subanswers, start=1):
+        it = items[i - 1] if i - 1 < len(items) else {}
+        ask = (isinstance(it, dict) and (it.get("ask") or "")) or ""
+        ask = str(ask).strip()
+        header = f"[Подпункт {i}" + (f": {ask}]" if ask else "]")
+        blocks.append(f"{header}\n{ans}")
+
+    ctx = "\n\n".join(blocks)
+
+    system_prompt = (
+        "Ты репетитор по дипломным работам. Ниже собраны ответы по отдельным подпунктам "
+        "одного большого вопроса. Твоя задача — сделать один связный общий ответ.\n"
+        "Не повторяй дословно все подпункты, а аккуратно их объединяй. "
+        "Не добавляй новых фактов, которых нет в подпунктах.\n"
+        "Не пиши разделы вида «чего не хватает»."
+    )
+
+    user_prompt = (
+        f"Исходный общий вопрос пользователя:\n{base_question}\n\n"
+        "На него уже есть ответы по подпунктам (см. ниже). "
+        "Собери из них один цельный ответ для пользователя."
+        f"{_verbosity_addendum(verbosity)}\n\n"
+        "[Ответы по подпунктам]\n"
+        f"{ctx}"
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    try:
+        merged = chat_with_gpt(messages, temperature=0.2, max_tokens=FINAL_MAX_TOKENS) or ""
+    except Exception as e:
+        logging.exception("merge_subanswers_via_gpt failed: %s", e)
+        return ""
+
+    return merged.strip()
+
 
 async def _run_multistep_answer(
     m: types.Message,
@@ -628,33 +796,37 @@ async def _run_multistep_answer(
     discovered_items: list[dict] | None = None,
 ) -> bool:
     """
-    Генерируем: план → по каждому подпункту отдельный ответ → (опц.) финальный merge.
-    Возвращает True, если путь обработан и ничего дальше делать не нужно.
+    Многошаговый ответ без ACE:
+    1) План подпунктов — через _plan_subtasks_via_gpt или coverage.
+    2) По каждому подпункту — отдельный вызов GPT с жёстким контекстом.
+    3) (опц.) финальный merge через _merge_subanswers_via_gpt.
     """
     if not MULTI_STEP_SEND_ENABLED:
         return False
-    if not (plan_subtasks and answer_subpoint and merge_subanswers):
-        # нет необходимых функций из ace — выходим
+
+    # GPT обязателен для этого режима
+    if "chat_with_gpt" not in globals() or chat_with_gpt is None:
         return False
 
-    # план из coverage или строим планерoм
-            # план из coverage или строим планером
+    verbosity = _detect_verbosity(q_text)
+
+    # 1) план из coverage/discovered_items или строим через GPT
     items = (discovered_items or [])
     if not items:
-        try:
-            items = plan_subtasks(q_text) or []
-        except Exception:
-            items = []
+        items = _plan_subtasks_via_gpt(q_text, max_items=MULTI_STEP_MAX_ITEMS)
 
     # нормализация: поддерживаем и dict, и str
     norm_items: list[dict] = []
     for idx, it in enumerate(items, start=1):
         if isinstance(it, str):
-            norm_items.append({"id": idx, "ask": it.strip()})
+            ask = it.strip()
+            if ask:
+                norm_items.append({"id": idx, "ask": ask})
         elif isinstance(it, dict):
             ask = (it.get("ask") or it.get("text") or it.get("q") or "").strip()
             if ask:
                 norm_items.append({"id": it.get("id") or idx, "ask": ask})
+
     items = [it for it in norm_items if (it.get("ask") or "").strip()]
     if len(items) < MULTI_STEP_MIN_ITEMS:
         return False
@@ -664,7 +836,10 @@ async def _run_multistep_answer(
 
     # краткий анонс
     preview = "\n".join([f"{i+1}) {(it['ask'] or '').strip()}" for i, it in enumerate(items)])
-    await _send(m, f"Вопрос многочастный. Отвечаю по подпунктам ({len(items)} шт.):\n\n{preview}")
+    await _send(
+        m,
+        f"Вопрос многочастный. Отвечаю по подпунктам ({len(items)} шт.):\n\n{preview}",
+    )
 
     subanswers: list[str] = []
 
@@ -676,10 +851,12 @@ async def _run_multistep_answer(
         cov = None
     cov_map = (cov or {}).get("by_item") or {}
 
-
     # по очереди: A → send, B → send, ...
     for i, it in enumerate(items, start=1):
         ask = (it.get("ask") or "").strip()
+        if not ask:
+            continue
+
         # контекст для конкретного подпункта
         ctx_text = ""
         try:
@@ -689,7 +866,8 @@ async def _run_multistep_answer(
                 ctx_text = build_context_coverage(bucket, items_count=1)
         except Exception:
             ctx_text = ""
-        # 2) фолбэки
+
+        # фолбэки по контексту
         if not ctx_text:
             ctx_text = best_context(uid, doc_id, ask, max_chars=6000) or ""
         if not ctx_text:
@@ -699,11 +877,16 @@ async def _run_multistep_answer(
         if not ctx_text:
             ctx_text = _first_chunks_context(uid, doc_id, n=12, max_chars=6000)
 
-        # генерация по подпункту (кастомная подсказка в ace + критика/правка)
+        # генерация по подпункту через GPT (без ACE)
         try:
-            part = answer_subpoint(ask, ctx_text, MULTI_PASS_SCORE).strip()
+            part = _answer_subpoint_via_gpt(
+                ask=ask,
+                ctx_text=ctx_text,
+                base_question=q_text,
+                verbosity=verbosity,
+            )
         except Exception as e:
-            logging.exception("answer_subpoint failed: %s", e)
+            logging.exception("answer_subpoint_via_gpt failed: %s", e)
             part = ""
 
         # отправка блока
@@ -715,13 +898,18 @@ async def _run_multistep_answer(
         await asyncio.sleep(MULTI_STEP_PAUSE_MS / 1000)
 
     # (опционально) финальный сводный блок
-    if MULTI_STEP_FINAL_MERGE:
+    if MULTI_STEP_FINAL_MERGE and subanswers:
         try:
-            merged = merge_subanswers(q_text, items, subanswers).strip()
+            merged = _merge_subanswers_via_gpt(
+                base_question=q_text,
+                items=items,
+                subanswers=subanswers,
+                verbosity=verbosity,
+            ).strip()
             if merged:
                 await _send(m, "**Итоговый сводный ответ**\n\n" + merged)
         except Exception as e:
-            logging.exception("merge_subanswers failed: %s", e)
+            logging.exception("merge_subanswers_via_gpt failed: %s", e)
 
     return True
 
@@ -806,12 +994,65 @@ LAST_REF: dict[int, dict] = {}   # {uid: {"figure_nums": list[str], "area": "3.2
 FIG_INDEX: dict[int, dict] = {}
 OOXML_INDEX: dict[int, dict] = {}
 
+# NEW: ждём ли от пользователя «да/нет» на предложение ответа от [модель]
+MODEL_EXTRA_PENDING: dict[int, dict] = {}   # {uid: {"question": str}}
+
+# NEW: для подстановки номера раздела из вопроса и для анафоры «этот пункт/рисунок»
 # NEW: для подстановки номера раздела из вопроса и для анафоры «этот пункт/рисунок»
 _SECTION_NUM_RE = re.compile(
     r"(?i)\b(?:глава\w*|раздел\w*|пункт\w*|подраздел\w*|sec(?:tion)?\.?|chapter)"
     r"\s*(?:№\s*)?((?:[A-Za-zА-Яа-я](?=[\.\d]))?\s*\d+(?:[.,]\d+)*)"
 )
 _ANAPH_HINT_RE = re.compile(r"(?i)\b(этот|эта|это|данн\w+|про него|про неё|про нее)\b")
+
+# Короткие фоллоу-апы вида «опиши подробнее», «объясни подробнее, пожалуйста»
+_FOLLOWUP_MORE_RE = re.compile(
+    r"(?i)^(опиши|распиши|объясни|расскажи)\s+подробнее(?:\s+пожалуйста)?[.!]?$"
+)
+
+def _expand_with_last_referent(uid: int, text: str) -> str:
+    """
+    Подставляем последний объект (таблица/рисунок/пункт) для реплик вида:
+      - «опиши подробнее»
+      - «расскажи про него»
+      - «опиши её подробнее»
+    чтобы они превратились, например, в
+      - «опиши подробнее (имеется в виду таблица 4)».
+    """
+    t = (text or "").strip()
+    if not t:
+        return text
+
+    # если уже явно указана таблица/рисунок/пункт — ничего не меняем
+    if _TABLE_NUM_IN_TEXT_RE.search(t) or FIG_NUM_RE.search(t) or _SECTION_NUM_RE.search(t):
+        return text
+
+    # нет ни анафоры («этот/про неё»), ни короткого фоллоу-апа «опиши подробнее» — выходим
+    if not (_ANAPH_HINT_RE.search(t) or _FOLLOWUP_MORE_RE.match(t)):
+        return text
+
+    last = LAST_REF.get(uid) or {}
+
+    # 1) приоритет — последняя таблица
+    tables = last.get("table_nums") or []
+    if tables:
+        num = str(tables[0])
+        return f"{text} (имеется в виду таблица {num})"
+
+    # 2) затем — последний рисунок
+    figs = last.get("figure_nums") or []
+    if figs:
+        num = str(figs[0])
+        return f"{text} (имеется в виду рисунок {num})"
+
+    # 3) затем — последний пункт/раздел
+    area = (last.get("area") or "").strip()
+    if area:
+        if not re.search(r"(?i)\b(глава|раздел|пункт|подраздел)\b", t):
+            return f"{text} (имеется в виду пункт {area})"
+        return f"{text} ({area})"
+
+    return text
 
 
 # ------------------------ Гардрейлы ------------------------
@@ -864,11 +1105,53 @@ def _table_has_columns(con, table: str, cols: list[str]) -> bool:
 
 # --------------------- Таблицы: парсинг/нормализация ---------------------
 
+# --------------------- Таблицы: парсинг/нормализация ---------------------
+
 _TABLE_ANY = re.compile(r"\bтаблиц\w*|\bтабл\.\b|\bтаблица\w*|(?:^|\s)table(s)?\b", re.IGNORECASE)
 # Поддерживаем: 2.1, 3, A.1, А.1, П1.2
 _TABLE_TITLE_RE = re.compile(r"(?i)\bтаблица\s+(\d+(?:[.,]\d+)*|[a-zа-я]\.?\s*\d+(?:[.,]\d+)*)\b(?:\s*[—\-–]\s*(.+))?")
 _COUNT_HINT = re.compile(r"\bсколько\b|how many", re.IGNORECASE)
 _WHICH_HINT = re.compile(r"\bкаки(е|х)\b|\bсписок\b|\bперечисл\w*\b|\bназов\w*\b", re.IGNORECASE)
+
+# НОВОЕ: вытаскиваем номер таблицы из запроса вида "опиши таблицу 4", "что показывает таблица 2.3" и т.п.
+_TABLE_NUM_IN_TEXT_RE = re.compile(
+    r"(?i)\bтаблиц[а-я]*\s+([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)"
+)
+
+def _extract_table_nums(text: str) -> list[str]:
+    """Достаём все номера таблиц из фразы пользователя."""
+    nums: list[str] = []
+    for m in _TABLE_NUM_IN_TEXT_RE.finditer(text or ""):
+        raw = (m.group(1) or "").strip()
+        #  " 4 , 1 " -> "4.1"
+        norm = raw.replace(" ", "").replace(",", ".")
+        if norm:
+            nums.append(norm)
+    return nums
+
+def _is_pure_table_request(text: str) -> bool:
+    """
+    Эвристика: запрос ТОЛЬКО про конкретные таблицы
+    (например: "опиши таблицу 4", "что показывает таблица 2.3"),
+    без рисунков, разделов и общих вопросов.
+    """
+    t = (text or "").strip()
+    if not t:
+        return False
+
+    # нет слова "таблица" — точно не наш случай
+    if not _TABLE_ANY.search(t):
+        return False
+
+    # нет номера после "таблицы" — тоже не чистый запрос
+    if not _TABLE_NUM_IN_TEXT_RE.search(t):
+        return False
+
+    # если одновременно спрашивают про рисунки или разделы — это уже смешанный вопрос
+    if FIG_NUM_RE.search(t) or _SECTION_NUM_RE.search(t):
+        return False
+
+    return True
 
 def _plural_tables(n: int) -> str:
     n_abs = abs(n) % 100
@@ -2499,7 +2782,6 @@ async def _answer_figure_query(
     2) собираем общий блок с точными значениями (если есть);
     3) даём одно связное пояснение через GPT, в которое подмешан блок значений.
 
-
     Поведение не зависит от того, спросили ли «опиши рисунок 2.3»
     или «дай точные значения по рисунку 2.3» — меняется только акцент
     в текстовом объяснении.
@@ -2523,8 +2805,11 @@ async def _answer_figure_query(
     # 2) собираем единую структуру по всем рисункам
     records = _build_figure_records(uid, doc_id, nums)
     if not records:
-        await _send(m, "Указанные рисунки в работе не найдены.")
-        return True
+        # 🔧 Раньше здесь сразу шёл ответ «Указанные рисунки в работе не найдены.»,
+        # из-за чего мы не доходили до общего RAG-пайплайна и не могли,
+        # например, ответить по таблицам или общему контексту.
+        # Теперь просто говорим вызывающему коду «я не обработал этот запрос».
+        return False
 
     # 4) собираем общий блок с точными значениями (без отправки)
     values_block = _fig_values_text_from_records(records, need_values=need_values)
@@ -2547,6 +2832,332 @@ async def _answer_figure_query(
 
     return True
 
+def _ooxml_table_block(uid: int, doc_id: int, num: str) -> str | None:
+    """
+    1) Пытаемся взять сырые данные таблицы из OOXML-индекса через oox_tbl_lookup.
+    2) Если там ничего не нашли — падаем в обычные chunks (table/table_row) и
+       собираем текст таблицы по строкам. Это защищает от глюков OOXML-парсера.
+    """
+    # --- 1. OOXML ---
+    idx = _ooxml_get_index(doc_id)
+    if idx and "oox_tbl_lookup" in globals():
+        try:
+            res = oox_tbl_lookup(idx, str(num))
+        except Exception:
+            res = None
+
+        if res is not None:
+            if isinstance(res, str):
+                body = res.strip()
+            else:
+                try:
+                    body = json.dumps(res, ensure_ascii=False, indent=2)
+                except Exception:
+                    body = str(res)
+            body = (body or "").strip()
+            if body:
+                return f"Таблица {num} (сырые данные из документа):\n{body}"
+
+    # --- 2. Фолбэк: chunks из БД ---
+    con = get_conn()
+    cur = con.cursor()
+
+    has_et   = _table_has_columns(con, "chunks", ["element_type"])
+    has_attr = _table_has_columns(con, "chunks", ["attrs"])
+
+    rows = []
+
+    try:
+        if has_attr and has_et:
+            like1 = f'%\"caption_num\": \"{num}\"%'
+            like2 = f'%\"label\": \"{num}\"%'
+            cur.execute(
+                """
+                SELECT section_path, text
+                FROM chunks
+                WHERE owner_id=? AND doc_id=?
+                  AND element_type IN ('table','table_row')
+                  AND (attrs LIKE ? OR attrs LIKE ?)
+                ORDER BY id ASC
+                """,
+                (uid, doc_id, like1, like2),
+            )
+            rows = cur.fetchall() or []
+
+        if not rows:
+            # фолбэк по section_path / тексту, работает даже на старых индексах
+            cur.execute(
+                """
+                SELECT section_path, text
+                FROM chunks
+                WHERE owner_id=? AND doc_id=?
+                  AND (section_path LIKE ? OR text LIKE ?)
+                ORDER BY id ASC
+                """,
+                (uid, doc_id, f'%Таблица {num}%', f'[Таблица]%{num}%'),
+            )
+            rows = cur.fetchall() or []
+    finally:
+        con.close()
+
+    if not rows:
+        return None
+
+    sec = (rows[0]["section_path"] or "").strip()
+    lines = []
+    if sec:
+        lines.append(f"[{sec}]")
+    for r in rows:
+        t = (r["text"] or "").strip()
+        if t:
+            lines.append(t)
+
+    body = "\n".join(lines).strip()
+    if not body:
+        return None
+
+    return f"Таблица {num} (как в документе, по строкам таблицы):\n{body}"
+
+
+
+def _table_related_context(
+    uid: int,
+    doc_id: int,
+    num: str,
+    *,
+    max_chars: int = 4000,
+) -> str:
+    """
+    Ищем дополнительный текст, который связан с таблицей `num`.
+
+    1) Сначала ищем прямые упоминания «таблица N» (кроме самих ячеек таблицы).
+    2) Если таких фрагментов нет – делаем второй проход по ВСЕМУ документу:
+       семантический поиск best_context по запросу
+       «подробное текстовое пояснение и выводы по данным таблицы N».
+    """
+    con = get_conn()
+    cur = con.cursor()
+    has_et = _table_has_columns(con, "chunks", ["element_type"])
+
+    like1 = f"%Таблица {num}%"
+    like2 = f"%таблица {num}%"
+
+    if has_et:
+        cur.execute(
+            """
+            SELECT page, section_path, text, element_type
+            FROM chunks
+            WHERE owner_id=? AND doc_id=?
+              AND (text LIKE ? OR text LIKE ?)
+            ORDER BY page ASC, id ASC
+            """,
+            (uid, doc_id, like1, like2),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT page, section_path, text
+            FROM chunks
+            WHERE owner_id=? AND doc_id=?
+              AND (text LIKE ? OR text LIKE ?)
+            ORDER BY page ASC, id ASC
+            """,
+            (uid, doc_id, like1, like2),
+        )
+
+    rows = cur.fetchall() or []
+    con.close()
+
+    parts: list[str] = []
+    total = 0
+
+    for r in rows:
+        et = ""
+        if "element_type" in r.keys():
+            et = (r["element_type"] or "").lower()
+        if et in ("table", "table_row"):
+            continue
+
+        t = (r["text"] or "").strip()
+        if not t:
+            continue
+
+        if total + len(t) > max_chars:
+            parts.append(t[: max_chars - total])
+            break
+
+        parts.append(t)
+        total += len(t)
+
+    extra = "\n\n".join(parts).strip()
+    if extra:
+        return extra
+
+    # второй проход: семантический поиск по всему документу
+    query = f"подробное текстовое пояснение, анализ и выводы по данным таблицы {num}"
+    try:
+        ctx = best_context(
+            uid,
+            doc_id,
+            query,
+            max_chars=max_chars,
+        ) or ""
+    except Exception:
+        ctx = ""
+
+    return (ctx or "").strip()
+
+
+
+async def _answer_table_query(
+    m: types.Message,
+    uid: int,
+    doc_id: int,
+    text: str,
+    *,
+    verbosity: str = "normal",
+    mode: str = "normal",
+) -> bool:
+    """
+    Спец-путь для запросов вида:
+      - "опиши таблицу 4"
+      - "что показывает таблица 2.3"
+      - "сделай выводы по таблице 4"
+      - и фоллоу-апа "опиши подробнее" по этой же таблице (mode="more").
+    ...
+    """
+    nums = _extract_table_nums(text)
+    if not nums:
+        return False
+
+    # запоминаем последнюю(ие) таблицу(ы) для фраз типа «опиши подробнее»
+    try:
+        LAST_REF.setdefault(uid, {})["table_nums"] = [
+            n.replace(" ", "").replace(",", ".") for n in nums
+        ]
+    except Exception:
+        pass
+
+    blocks: list[str] = []
+    missing: list[str] = []
+
+    for n in nums:
+        blk = _ooxml_table_block(uid, doc_id, n)
+        if blk:
+            blocks.append(blk)
+        else:
+            missing.append(n)
+
+
+    # если вообще ничего не нашли — честно говорим, что № нет в индексе,
+    # и НЕ перекладываем это на модель
+    if not blocks and missing:
+        await _send(
+            m,
+            "В OOXML-индексе документа не найдено таблиц с номерами: "
+            + ", ".join(missing)
+        )
+        return True
+
+    if not blocks:
+        # ничего не нашли и ничего не знаем — отдаём на обычный пайплайн
+        return False
+
+    ctx_tables = "\n\n---\n\n".join(blocks)
+
+    # Дополнительный текст по таблицам (для режима "подробнее")
+    extra_ctx_parts: list[str] = []
+    if mode == "more":
+        for n in nums:
+            extra = _table_related_context(uid, doc_id, n, max_chars=4000)
+            if extra:
+                extra_ctx_parts.append(
+                    f"[Дополнительный текст по таблице {n}]\n{extra}"
+                )
+
+    extra_ctx = "\n\n---\n\n".join(extra_ctx_parts).strip()
+
+    # Если это запрос «подробнее», но в самой работе НЕТ доп. текста про эту таблицу,
+    # мы сохраняем сырые данные таблицы и предлагаем расширенный ответ от [модель],
+    # который будет опираться на ЭТИ данные.
+    if mode == "more" and not extra_ctx:
+        nums_str = ", ".join(nums)
+        MODEL_EXTRA_PENDING[uid] = {
+            "kind": "table_more",
+            # сам вопрос пользователя (чаще всего «опиши подробнее (таблица N)»)
+            "question": text,
+            # сырые данные таблиц из OOXML — чтобы [модель] их видела
+            "ctx_tables": ctx_tables,
+            "nums": nums,
+        }
+        await _send(
+            m,
+            "В самой работе нет дополнительного текста, который подробно объясняет эту таблицу. "
+            "Могу дополнительно, как [модель], подробно пояснить её, опираясь на сами данные таблицы "
+            "и общие теоретические знания по теме (без ссылок на текст ВКР). "
+            "Если нужно — напиши «да», если не нужно — «нет»."
+        )
+        return True
+
+    # Общий контекст для GPT: сырые данные таблиц +, при наличии, доп. текст
+    full_ctx = ctx_tables
+    if extra_ctx:
+        full_ctx += "\n\n[Дополнительный текст из работы про эти таблицы]\n" + extra_ctx
+
+    system_prompt = (
+        "Ты репетитор по дипломным работам. Ниже даны таблицы, распарсенные прямо из документа.\n"
+        "Отвечай СТРОГО по этим данным:\n"
+        "— не придумывай новые строки, столбцы и значения;\n"
+        "— не добавляй факты, которых нет в таблицах;\n"
+        "— не ссылаться на страницы, только описывай содержание.\n"
+        "Если в вопросе указан номер таблицы, но такой таблицы нет в переданном контексте — "
+        "напиши, что по этому номеру в контексте данных нет."
+    )
+
+    # В режиме "подробнее" прямо говорим, что нужен более развёрнутый разбор
+    if mode == "more":
+        user_prompt = (
+            f"Вопрос пользователя: {text}\n\n"
+            "Ниже структура таблиц в машинно-читаемом виде и дополнительный текст из работы. "
+            "Сделай БОЛЕЕ ПОДРОБНЫЙ разбор по этой таблице: "
+            "что именно в ней сравнивается, какие значения выше/ниже, какие тенденции видны, "
+            "какие аккуратные выводы можно сделать, не придумывая новых данных."
+            f"{_verbosity_addendum('detailed', 'описания таблицы')}\n\n"
+            "[Таблицы и связанный текст из документа]\n"
+            f"{full_ctx}"
+        )
+    else:
+        user_prompt = (
+            f"Вопрос пользователя: {text}\n\n"
+            "Ниже структура таблиц в машинно-читаемом виде. "
+            "Сначала объясни простыми словами, что показывает каждая таблица "
+            "(что по строкам, что по столбцам), затем сделай аккуратные выводы: "
+            "какие значения выше/ниже, какие различия заметны.\n"
+            "Не придумывай никаких фактов, которых нет в данных таблиц."
+            f"{_verbosity_addendum(verbosity, 'описания таблицы')}\n\n"
+            "[Таблицы из документа]\n"
+            f"{full_ctx}"
+        )
+
+    try:
+        answer = chat_with_gpt(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+            max_tokens=FINAL_MAX_TOKENS,
+        )
+    except Exception as e:
+        logging.exception("table explanation failed: %s", e)
+        return False
+
+    answer = (answer or "").strip()
+    if not answer:
+        return False
+
+    await _send(m, _strip_unwanted_sections(answer))
+    return True
 
 # -------------------------- САМОВОССТАНОВЛЕНИЕ ИНДЕКСА --------------------------
 
@@ -2796,7 +3407,7 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
         facts["tables"]["describe"] = desc_cards
         # describe по конкретным номерам + точные расчеты
         desc_cards = []
-        if intents["tables"]["describe"]:
+        if intents.get("tables", {}).get("describe"):
             con = get_conn()
             cur = con.cursor()
             for num in intents["tables"]["describe"]:
@@ -2869,6 +3480,14 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
             con.close()
 
             facts["tables"]["describe"] = desc_cards
+
+            # запомним эти номера таблиц как «последние упомянутые»
+            try:
+                LAST_REF.setdefault(uid, {})["table_nums"] = [
+                    str(c["num"]) for c in desc_cards if c.get("num")
+                ]
+            except Exception:
+                pass
 
     # ----- Рисунки -----
     if intents["figures"]["want"]:
@@ -3304,16 +3923,19 @@ def _iterative_fullread_build_messages(uid: int, doc_id: int, question: str) -> 
             logging.exception("map extract failed: %s", e)
             digests.append(b[:800])
 
-    joined = "\n\n".join([f"[MAP {i+1}]\n{d}" for i, d in enumerate(digests)])
+    # вместо техничных [MAP 1] используем более нейтральные метки
+    joined = "\n\n".join([f"[Фрагмент {i+1}]\n{d}" for i, d in enumerate(digests)])
     ctx = joined[: int(getattr(Cfg, "FULLREAD_CONTEXT_CHARS", 9000))]
 
     sys_reduce = (
-        "Ты репетитор по ВКР. Ниже — короткие факты из разных частей документа (map-выжимки). "
+        "Ты репетитор по ВКР. Ниже — короткие факты из разных частей документа. "
         "Собери из них связный ответ на вопрос. Не выдумывай новых цифр/таблиц и не добавляй разделов "
         "про «чего не хватает». Отвечай только по имеющимся данным. Если запрошенного рисунка/таблицы "
         "нет в тексте — сформулируй кратко: «данного рисунка нет в работе». Если объект есть, но он "
-        "нечитабелен, дай: «Рисунок плохого качества, не могу проанализировать», и добавь подпись/контекст из текста."
+        "нечитабелен, дай: «Рисунок плохого качества, не могу проанализировать», и добавь подпись/контекст из текста. "
+        "В своём ответе не ссылайся на технические метки вроде «фрагмент 1» и не используй слово «выжимка»."
     )
+
 
     verbosity = _detect_verbosity(question)
     messages = [
@@ -3440,8 +4062,149 @@ async def handle_doc(m: types.Message):
 
 # ------------------------------ основной ответчик ------------------------------
 
+async def _answer_with_model_extra(m: types.Message, uid: int, base_question: str) -> None:
+    """
+    Ответ без привязки к конкретному документу — общий совет от [модель].
+
+    Используется, когда в тексте работы не нашлось фактов по вопросу
+    и пользователь подтвердил, что хочет такой ответ.
+    """
+    if not (chat_with_gpt or chat_with_gpt_stream):
+        await _send(
+            m,
+            "Сейчас могу отвечать только по тексту документа, режим [модель] недоступен."
+        )
+        return
+
+    base_question = (base_question or "").strip()
+    if not base_question:
+        await _send(m, "Не удалось восстановить исходный вопрос. Сформулируй его ещё раз, пожалуйста.")
+        return
+
+    system_prompt = (
+        "Ты помощник по учёбе. В ЭТОМ ответе ты не опираешься на текст диплома пользователя, "
+        "а используешь только свои общие знания и здравый смысл. "
+        "Сразу в начале ответа укажи тег '[модель] ' и дальше отвечай простым, понятным языком."
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": base_question},
+    ]
+
+    try:
+        if STREAM_ENABLED and chat_with_gpt_stream is not None:
+            stream = chat_with_gpt_stream(messages, temperature=0.3, max_tokens=FINAL_MAX_TOKENS)  # type: ignore
+            await _stream_to_telegram(m, stream)
+            return
+
+        answer = chat_with_gpt(messages, temperature=0.3, max_tokens=FINAL_MAX_TOKENS)
+    except Exception as e:
+        logging.exception("model-extra answer failed: %s", e)
+        await _send(
+            m,
+            "Не получилось получить дополнительный ответ от [модель]. Попробуй переформулировать вопрос."
+        )
+        return
+
+    answer = (answer or "").strip()
+    if not answer:
+        await _send(
+            m,
+            "Не получилось получить дополнительный ответ от [модель]. Попробуй переформулировать вопрос."
+        )
+        return
+
+    if not answer.startswith("[модель]"):
+        answer = "[модель] " + answer
+
+    await _send(m, answer)
+
+async def _answer_with_model_extra_table(
+    m: types.Message,
+    uid: int,
+    base_question: str,
+    ctx_tables: str,
+    nums: list[str],
+) -> None:
+    """
+    Расширенный ответ от [модель] по таблице(таблицам):
+    модель видит сырые данные таблиц из OOXML и может на них опираться,
+    добавляя общую теорию, но НЕ меняя сами числа.
+    """
+    if not (chat_with_gpt or chat_with_gpt_stream):
+        await _send(
+            m,
+            "Сейчас могу отвечать только по тексту документа, режим [модель] недоступен."
+        )
+        return
+
+    ctx_tables = (ctx_tables or "").strip()
+    if not ctx_tables:
+        # на всякий случай — фолбэк в общий режим
+        await _answer_with_model_extra(m, uid, base_question)
+        return
+
+    nums = [str(n).strip() for n in (nums or []) if str(n).strip()]
+    nums_str = ", ".join(nums) if nums else "этим таблицам"
+
+    base_question = (base_question or "").strip()
+    if not base_question:
+        base_question = f"Подробно объясни и интерпретируй данные по таблице(таблицам) {nums_str}."
+
+    system_prompt = (
+        "Ты помощник по учёбе. В ЭТОМ ответе ты опираешься на данные таблиц из диплома пользователя "
+        "(они переданы ниже в машинно-читаемом виде). "
+        "Используй эти числа как источник истины: не меняй их и не придумывай другие значения. "
+        "При этом можешь дополнять интерпретацию общими теоретическими сведениями по теме. "
+        "Сразу в начале ответа укажи тег '[модель] '."
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "assistant", "content": f"[Данные таблиц из диплома]\n{ctx_tables}"},
+        {"role": "user", "content": base_question},
+    ]
+
+    try:
+        if STREAM_ENABLED and chat_with_gpt_stream is not None:
+            stream = chat_with_gpt_stream(
+                messages,
+                temperature=0.3,
+                max_tokens=FINAL_MAX_TOKENS,
+            )  # type: ignore
+            await _stream_to_telegram(m, stream)
+            return
+
+        answer = chat_with_gpt(
+            messages,
+            temperature=0.3,
+            max_tokens=FINAL_MAX_TOKENS,
+        )
+    except Exception as e:
+        logging.exception("model-extra-table answer failed: %s", e)
+        await _send(
+            m,
+            "Не получилось получить расширенный ответ по таблице. Попробуй переформулировать вопрос."
+        )
+        return
+
+    answer = (answer or "").strip()
+    if not answer:
+        await _send(
+            m,
+            "Не получилось получить расширенный ответ по таблице. Попробуй переформулировать вопрос."
+        )
+        return
+
+    if not answer.startswith("[модель]"):
+        answer = "[модель] " + answer
+
+    await _send(m, answer)
+
 async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: str):
     q_text = (q_text or "").strip()
+    orig_q_text = q_text  # запомним исходную формулировку до подстановок
     logging.debug(f"Получен запрос от пользователя: {q_text}")
     if not q_text:
         await _send(m, "Вопрос пустой. Напишите, что именно вас интересует по ВКР.")
@@ -3455,13 +4218,27 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
     if await _maybe_run_gost(m, uid, doc_id, q_text):
         return
 
+    # NEW: подставляем последний объект (таблица/рисунок/пункт)
+    # для коротких реплик вида «опиши подробнее», «расскажи про него»
+    q_text = _expand_with_last_referent(uid, q_text)
+
+    # НОВОЕ: быстрый путь для запросов про таблицы
+    # Примеры: "опиши таблицу 4", "что показывает таблица 2.3", "сделай выводы по таблице 4"
+    if _is_pure_table_request(q_text):
+        verbosity = _detect_verbosity(q_text)
+        mode = "more" if _FOLLOWUP_MORE_RE.match(orig_q_text or "") else "normal"
+        handled = await _answer_table_query(
+            m, uid, doc_id, q_text, verbosity=verbosity, mode=mode
+        )
+        if handled:
+            return
+
     # быстрый путь для запросов про рисунки
     if _is_pure_figure_request(q_text):
         verbosity = _detect_verbosity(q_text)
         handled = await _answer_figure_query(m, uid, doc_id, q_text, verbosity=verbosity)
         if handled:
             return
-
 
     # РАНО в respond_with_answer, до detect_intents:
         # РАНО в respond_with_answer, до detect_intents:
@@ -3532,24 +4309,6 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
             LAST_REF.setdefault(uid, {})["area"] = area
         except Exception:
             pass
-
-    # NEW: если вопрос расплывчатый «про этот ...», подставим последний референт
-    def _expand_with_last_referent(uid: int, text: str) -> str:
-        if not _ANAPH_HINT_RE.search(text or ""):
-            return text
-        last = LAST_REF.get(uid) or {}
-        # приоритет — последний рисунок
-        figs = last.get("figure_nums") or []
-        if figs:
-            return f"{text} (имеется в виду рисунок {figs[0]})"
-        area = (last.get("area") or "").strip()
-        if area:
-            # если нет слова «пункт/раздел», добавим
-            if not re.search(r"(?i)\b(глава|раздел|пункт|подраздел)\b", text):
-                return f"{text} (имеется в виду пункт {area})"
-            return f"{text} ({area})"
-        return text
-    q_text = _expand_with_last_referent(uid, q_text)
 
     # NEW: быстрый детерминированный путь для «поясни рисунок 2.1/3.4 …»
     # --- Определяем интенты заранее
@@ -3741,6 +4500,20 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
     await _ensure_modalities_indexed(m, uid, doc_id, intents)
     facts = _gather_facts(uid, doc_id, intents)
 
+    # NEW: если по общему вопросу ничего не нашлось именно в тексте работы —
+    # сначала спрашиваем, можно ли ответить в общем виде как [модель].
+    if intents.get("general_question") and not facts.get("general_ctx") and not facts.get("summary_text"):
+        MODEL_EXTRA_PENDING[uid] = {
+            "kind": "generic",
+            "question": intents["general_question"] or q_text,
+        }
+        await _send(
+            m,
+            "По этому вопросу я не нашёл явной информации в самом тексте работы. "
+            "Могу ответить в общем виде как [модель] (это уже не будет опираться на документ). "
+            "Напиши «да» или «нет»."
+        )
+        return
 
     # ↓ НОВОЕ: если есть план подпунктов — включаем многошаговую подачу
     discovered_items = None
@@ -3764,7 +4537,7 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
     enriched_q = f"{SAFE_RULES}\n\n{q_text}\n\n{_verbosity_addendum(verbosity)}"
 
     # если хочется обновлять «последний упомянутый рисунок» — возьми из текста запроса
-    figs_in_q = [_num_norm_fig(n) for n in FIG_NUM_RE.findall(q_text)]
+    figs_in_q = [_num_norm_fig(n) for n in _extract_fig_nums(q_text)]
     if figs_in_q:
         LAST_REF.setdefault(uid, {})["figure_nums"] = figs_in_q
 
@@ -3874,6 +4647,38 @@ async def qa(m: types.Message):
             doc_id = persisted
 
     text = (m.text or "").strip()
+
+    # NEW: если ждём от пользователя ответа «да/нет» про [модель] — обрабатываем его отдельно
+    pending = MODEL_EXTRA_PENDING.get(uid)
+    if pending:
+        low = text.lower()
+        if low in ("да", "д", "ага", "ок", "хорошо", "yes", "y"):
+            info = MODEL_EXTRA_PENDING.pop(uid, None) or {}
+            kind = (info.get("kind") or "generic").lower()
+            if kind == "table_more":
+                await _answer_with_model_extra_table(
+                    m,
+                    uid,
+                    info.get("question") or "",
+                    info.get("ctx_tables") or "",
+                    info.get("nums") or [],
+                )
+            else:
+                await _answer_with_model_extra(
+                    m,
+                    uid,
+                    info.get("question") or "",
+                )
+            return
+        if low in ("нет", "не", "no", "n", "не надо"):
+            MODEL_EXTRA_PENDING.pop(uid, None)
+            await _send(
+                m,
+                "Хорошо, тогда на какие вопросы по документу я ещё могу ответить для тебя?"
+            )
+            return
+        # любая другая реплика сбрасывает ожидание и идёт по обычному пути
+        MODEL_EXTRA_PENDING.pop(uid, None)
 
     # 👋 РАННИЙ ответ на приветствие, без постановки в очередь
     if _is_greeting(text):

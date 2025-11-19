@@ -6,22 +6,12 @@ import json
 import asyncio
 from typing import Dict, List, Any, Optional, AsyncIterable, Iterable, Union
 
-# --- Строгий агент (основной путь) ---
+# --- Прямой доступ к модели (без ACE) ---
 try:
-    # STRICT / CRITIC / EDIT внутри ace
-    from .ace import ace_once, ace_stream  # type: ignore
+    from .polza_client import chat_with_gpt, chat_with_gpt_stream  # type: ignore
 except Exception:
-    ace_stream = None  # type: ignore
-
-    def ace_once(question: str, ctx: str, pass_score: int = 85) -> str:
-        # Мягкий фолбэк, если ACE не прогружен
-        return f"{question}\n\n[fallback]\n{ctx[:1000]}"
-
-# --- Прямой стрим к модели (фолбэк, если нет ace_stream) ---
-try:
-    from .polza_client import chat_with_gpt_stream  # type: ignore
-except Exception:
-    chat_with_gpt_stream = None  # type: ignore
+    chat_with_gpt = None          # type: ignore
+    chat_with_gpt_stream = None   # type: ignore
 
 # Опциональные аналитические «подсказки» по таблицам (если модуль есть)
 try:
@@ -143,6 +133,9 @@ _DEFAULT_RULES = (
     "не придумывай числа, которых там нет.\n"
     "9) Для диаграмм и графиков сначала коротко поясни, что показывают оси, легенда и единицы измерения, как устроен масштаб (шаг шкалы, начало отсчёта). "
     "Если в [Figures]/values нет явного описания масштаба, не придумывай его: прямо указывай, что масштаб можно только приблизительно оценить по подписям.\n"
+    "10) Структура ответа: сначала дай блок '[документ]' — ответ строго по фактам из [Facts]; затем блок '[модель]' — короткие общие пояснения, "
+    "интерпретации и советы по теме вопроса. В блоке '[модель]' не добавляй новых «фактов» про документ, только общий контекст и рекомендации. "
+    "Если дополнительных пояснений нет, всё равно выведи строку '[модель] дополнительных комментариев нет'.\n"
 )
 
 
@@ -835,31 +828,65 @@ def facts_to_prompt(
             block.append("describe:\n" + json.dumps(cards, ensure_ascii=False, indent=2))
         parts.append("- Tables:\n  " + "\n  ".join(block))
 
-    # ----- Рисунки -----
+        # ----- Рисунки -----
     figures = (facts or {}).get("figures") or {}
     cards = figures.get("describe_cards") if figures else None
+    describe_lines = (figures.get("describe") or []) if figures else []
 
-    if cards:
+    if cards or describe_lines:
+        # Если в интентах/фактах стоит флаг single_only — сфокусируемся только на нужном(ых) номере(ах)
+        try:
+            focus_nums = _figure_focus_from_facts(facts)
+        except Exception:
+            focus_nums = []
+
+        # фильтрация карточек по номерам, если есть фокус
+        if cards and focus_nums:
+            focus_set = {n for n in focus_nums if n}
+            filtered_cards: List[Dict[str, Any]] = []
+            for c in cards:
+                num = c.get("num") or c.get("label")
+                if not num:
+                    continue
+                norm = _normalize_fig_num_local(str(num))
+                if norm in focus_set:
+                    filtered_cards.append(c)
+            if filtered_cards:
+                cards = filtered_cards
+
         block: List[str] = []
 
-        for c in cards[:25]:
-            title = c.get("title") or c.get("display") or "Рисунок"
-            desc = c.get("description") or ""
-            values = c.get("values") or []  # ← Новый формат vision_analyzer
+        # Карточки от vision_analyzer (describe_cards)
+        if cards:
+            for c in cards[:25]:
+                title = c.get("title") or c.get("display") or "Рисунок"
+                desc = c.get("description") or ""
+                values = c.get("values") or []  # новый формат vision_analyzer
 
-            # Заголовок
-            block.append(f"- **{title}**")
+                # Заголовок
+                block.append(f"- **{title}**")
 
-            # Значения
-            if values:
-                vals = ", ".join(values)
-                block.append(f"  Значения: {vals}")
+                # Значения (если есть явный список)
+                if values:
+                    vals = ", ".join(values)
+                    block.append(f"  Значения: {vals}")
 
-            # Описание
-            if desc:
-                block.append(f"  Описание: {desc}")
+                # Описание
+                if desc:
+                    block.append(f"  Описание: {desc}")
 
-        parts.append("- Figures:\n  " + "\n  ".join(block))
+        # Текстовый формат facts['figures']['describe'] (старый/резервный путь)
+        if describe_lines:
+            # если включён режим single_only — оставим только строки про нужный(е) номер(а)
+            lines = _filter_lines_for_figure_focus(describe_lines, focus_nums or [])
+            for s in lines[:25]:
+                txt = _normalize_numbers(str(s)) if norm_numbers else str(s)
+                block.append(f"- {txt}")
+
+        if block:
+            parts.append("- Figures:\n  " + "\n  ".join(block))
+
+
 
 
     # ----- Источники -----
@@ -980,6 +1007,66 @@ async def _aiter_any(obj: Union[str, Iterable[str], AsyncIterable[str]]) -> Asyn
 
 # ----------------------------- Публичное API -----------------------------
 
+# Вопрос вообще про таблицу?
+# Вопрос вообще про таблицу?
+_ASKS_TABLE_RE = re.compile(r"(?i)\bтаблиц[а-я]*\b|\btable\b")
+
+def _asks_about_table(question: str) -> bool:
+    q = (question or "").strip()
+    return bool(_ASKS_TABLE_RE.search(q))
+
+
+def _has_any_table_facts(facts: Dict[str, Any]) -> bool:
+    """
+    Понимаем, есть ли в фактах хоть какая-то конкретика по таблицам.
+    Нужен, чтобы не отдавать в модель вопрос про таблицу без таблиц.
+    """
+    if not isinstance(facts, dict):
+        return False
+
+    tables = (facts.get("tables") or {})
+    if not isinstance(tables, dict):
+        return False
+
+    if (tables.get("count") or 0) > 0:
+        return True
+    if tables.get("list"):
+        return True
+    if tables.get("describe"):
+        return True
+
+    # на будущее: если где-то вручную положили tables_raw
+    if facts.get("tables_raw"):
+        return True
+
+    return False
+
+
+def _has_any_figure_facts(facts: Dict[str, Any]) -> bool:
+    """
+    Мягкий аналог _has_any_table_facts для рисунков.
+    Используем как «страховку»: если вопрос формулируют как про таблицу,
+    но в фактах есть только блок по рисункам (например, таблица как картинка),
+    не блокируем ответ.
+    """
+    if not isinstance(facts, dict):
+        return False
+
+    figures = (facts.get("figures") or {})
+    if not isinstance(figures, dict):
+        return False
+
+    if (figures.get("count") or 0) > 0:
+        return True
+    if figures.get("list"):
+        return True
+    if figures.get("describe_cards"):
+        return True
+    if figures.get("describe"):
+        return True
+
+    return False
+
 def _extract_fulltable_request(question: str) -> tuple[bool, Optional[int]]:
     """
     Определяем, просили ли «все значения/полностью» и/или лимит строк.
@@ -1020,19 +1107,29 @@ def generate_answer(
     facts: Dict[str, Any],
     *,
     language: str = "ru",
-    pass_score: int = 85,
+    pass_score: int = 85,  # оставлен для совместимости, сейчас не используется
     rules_override: Optional[str] = None,
 ) -> str:
     """
     Универсальный билдер финального ответа (нестримовый путь):
       1) по умолчанию нормализует числа в блоке фактов, но отключает это при запросе «как в документе»;
       2) собирает устойчивый блок промпта (Facts + Rules), включая TablesRaw при необходимости;
-      3) вызывает строгий агент ace_once;
+      3) обращается напрямую к chat_with_gpt без ACE;
       4) возвращает финальный текст.
     """
     q = (question or "").strip()
     if not q:
         return "Вопрос пустой. Сформулируйте, пожалуйста, что именно требуется разобрать по ВКР."
+
+    # 💡 Гард: пользователь спрашивает про таблицу, а фактов по таблицам нет вообще.
+    # Вместо фантазий модели сразу просим уточнить номер.
+    if _asks_about_table(q) and not _has_any_table_facts(facts):
+        if not _has_any_figure_facts(facts):
+            return (
+                "Я не вижу в фактах, к какой именно таблице можно привязаться.\n"
+                "Пожалуйста, укажите номер таблицы (например, «таблица 2.4») "
+                "или пришлите скрин / точный заголовок."
+            )
 
     owner_id, doc_id = _extract_ids_from_facts(facts)
     want_exact = _want_exact_numbers(q, facts)
@@ -1057,24 +1154,52 @@ def generate_answer(
         norm_numbers=not want_exact,
     )
 
-    try:
-        reply = ace_once(q, ctx, pass_score=pass_score)
-        return _headings_to_bold((reply or "").strip())
+    # --- Прямой вызов модели без ACE ---
+    system_prompt = (
+        "Ты ассистент по дипломным работам. Тебе дан блок фактов из ВКР и правила ответа.\n"
+        "Ответ всегда дели на два явных блока:\n"
+        "[документ] — ответ строго по фактам из блока [Facts].\n"
+        "[модель] — дополнительные общие пояснения, интерпретации и советы по теме вопроса; "
+        "в этом блоке не добавляй новых «фактов» про документ."
+    )
 
-    except Exception:
+    if chat_with_gpt is None:
+        # жёсткий фолбэк — просто возвращаем дайджест фактов
         fallback = [
-            "Не удалось сгенерировать ответ строгим агентом. Ниже — краткий конспект найденных фактов.",
+            "Не удалось обратиться к модели. Ниже — краткий конспект найденных фактов:",
             "",
-            ctx[:4000]
+            ctx[:4000],
         ]
         return "\n".join(fallback)
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "assistant", "content": ctx},
+        {"role": "user", "content": q},
+    ]
+
+    try:
+        reply = chat_with_gpt(  # type: ignore
+            messages,
+            temperature=0.2,
+            max_tokens=getattr(Cfg, "FINAL_MAX_TOKENS", 1600),
+        )
+        return _headings_to_bold((reply or "").strip())
+    except Exception:
+        fallback = [
+            "Не удалось сгенерировать ответ моделью. Ниже — краткий конспект найденных фактов:",
+            "",
+            ctx[:4000],
+        ]
+        return "\n".join(fallback)
+
 
 async def generate_answer_stream(
     question: str,
     facts: Dict[str, Any],
     *,
     language: str = "ru",
-    pass_score: int = 85,
+    pass_score: int = 85,  # оставлен для совместимости
     rules_override: Optional[str] = None,
     temperature: float = 0.2,
     max_tokens: int = getattr(Cfg, "FINAL_MAX_TOKENS", 1600),
@@ -1083,15 +1208,26 @@ async def generate_answer_stream(
     Стриминговый билдер финального ответа (корутина, возвращает async-итератор):
       - собирает Facts+Rules (+ TablesRaw если нужно, по номерам или по «главе/разделу»);
       - учитывает запрос на «точные числа как в документе» (отключает нормализацию в промпте);
-      - пытается стримить через ace_stream;
-      - если ace_stream недоступен — стримит напрямую через chat_with_gpt_stream;
-      - если и это недоступно — эмулирует стрим, нарезая результат ace_once.
+      - стримит напрямую через chat_with_gpt_stream (без ACE);
+      - если стрим недоступен — эмулирует стрим, нарезая результат generate_answer.
     """
     q = (question or "").strip()
     if not q:
         async def _empty():
             yield "Вопрос пустой. Сформулируйте, пожалуйста, что именно требуется разобрать по ВКР."
         return _empty()
+
+    # 💡 Тот же гард, что и в синхронной версии:
+    # если про таблицу спрашивают, а таблиц в фактах нет — сразу просим уточнить номер.
+    if _asks_about_table(q) and not _has_any_table_facts(facts):
+        if not _has_any_figure_facts(facts):
+            async def _need_table_num():
+                yield (
+                    "Я не вижу в фактах, к какой именно таблице можно привязаться.\n"
+                    "Пожалуйста, укажите номер таблицы (например, «таблица 2.4») "
+                    "или пришлите скрин / точный заголовок."
+                )
+            return _need_table_num()
 
     owner_id, doc_id = _extract_ids_from_facts(facts)
     want_exact = _want_exact_numbers(q, facts)
@@ -1116,55 +1252,54 @@ async def generate_answer_stream(
         norm_numbers=not want_exact,
     )
 
-    # 1) Предпочтительный путь — строгий агент со стримом (если доступен)
-    if ace_stream is not None:
-        try:
-            stream_obj = ace_stream(q, ctx, pass_score=pass_score)
-            async def _fmt():
-                async for chunk in _aiter_any(stream_obj):
-                    yield _headings_to_bold(chunk)
-            return _fmt()
+    system_prompt = (
+        "Ты ассистент по дипломным работам. Тебе дан блок фактов из ВКР и правила ответа.\n"
+        "Ответ всегда дели на два явных блока:\n"
+        "[документ] — ответ строго по фактам из блока [Facts].\n"
+        "[модель] — дополнительные общие пояснения, интерпретации и советы по теме вопроса; "
+        "в этом блоке не добавляй новых «фактов» про документ."
+    )
 
-        except Exception:
-            pass
-
-    # 2) Фолбэк — прямой стрим в модель
-        # 2) Фолбэк — прямой стрим в модель
+    # 1) Нормальный путь — стрим напрямую из модели
     if chat_with_gpt_stream is not None:
         try:
-            system_prompt = (
-                "Ты ассистент по дипломным работам. Тебе дан блок фактов из ВКР и правила ответа.\n"
-                "Отвечай строго по фактам. Если данных недостаточно — скажи об этом."
-            )
             messages = [
                 {"role": "system", "content": system_prompt},
                 {"role": "assistant", "content": ctx},
                 {"role": "user", "content": q},
             ]
             stream_obj = chat_with_gpt_stream(
-                messages, temperature=temperature, max_tokens=max_tokens  # type: ignore
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,  # type: ignore
             )
 
-            async def _fmt2():
+            async def _fmt():
                 async for chunk in _aiter_any(stream_obj):
-                    # Приводим заголовки "# ..." к "**...**", как и в ace_stream-пути
                     yield _headings_to_bold(chunk)
-
-            return _fmt2()
+            return _fmt()
 
         except Exception:
+            # пойдём в эмулированный стрим
             pass
 
-    # 3) Фолбэк — эмулируем стрим
+    # 2) Фолбэк — эмулируем стрим через generate_answer
     async def _emulated() -> AsyncIterable[str]:  # type: ignore
         try:
-            final = generate_answer(question=q, facts=facts, language=language, pass_score=pass_score, rules_override=rules_override)
+            final = generate_answer(
+                question=q,
+                facts=facts,
+                language=language,
+                pass_score=pass_score,
+                rules_override=rules_override,
+            )
         except Exception:
             final = "Не удалось сгенерировать ответ."
         for part in _chunk_text(final, 480):
             yield part
             await asyncio.sleep(0)
     return _emulated()
+
 
 def debug_digest(facts: Dict[str, Any]) -> str:
     """

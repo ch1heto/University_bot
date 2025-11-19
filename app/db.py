@@ -148,6 +148,11 @@ def _ensure_columns(con: sqlite3.Connection) -> None:
         cur.execute("ALTER TABLE users ADD COLUMN last_error TEXT")
     if "pending_queue" not in ucols:
         cur.execute("ALTER TABLE users ADD COLUMN pending_queue TEXT")  # JSON-массив
+    # user_state: добавляем last_context (JSON) и context_mode
+    if "last_context" not in ucols:
+        cur.execute("ALTER TABLE users ADD COLUMN last_context TEXT")
+    if "context_mode" not in ucols:
+        cur.execute("ALTER TABLE users ADD COLUMN context_mode TEXT")
 
     # documents: content_sha256, file_uid, indexer_version, layout_profile
     dcols = _table_info(con, "documents")
@@ -502,6 +507,101 @@ def update_document_meta(doc_id: int,
     cur.execute(f"UPDATE documents SET {', '.join(sets)} WHERE id=?", vals)
     con.close()
 
+# ---------- NEW: helpers для выбора / списка документов пользователя ----------
+
+def get_document_meta(doc_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Возвращает базовую мета-информацию по документу:
+    owner_id, kind, путь, время создания и служебные поля индексатора.
+    Удобно, когда пользователь выбрал документ по номеру, а нужно показать имя файла и т.п.
+    """
+    con = get_conn()
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT
+            id,
+            owner_id,
+            kind,
+            path,
+            created_at,
+            content_sha256,
+            file_uid,
+            indexer_version,
+            layout_profile
+        FROM documents
+        WHERE id = ?
+        LIMIT 1
+        """,
+        (doc_id,),
+    )
+    row = cur.fetchone()
+    con.close()
+    if not row:
+        return None
+    return {
+        "id": row["id"],
+        "owner_id": row["owner_id"],
+        "kind": row["kind"],
+        "path": row["path"],
+        "created_at": row["created_at"],
+        "content_sha256": row["content_sha256"],
+        "file_uid": row["file_uid"],
+        "indexer_version": row["indexer_version"],
+        "layout_profile": row["layout_profile"],
+    }
+
+
+def list_user_documents(owner_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+    """
+    Возвращает последние документы пользователя (по created_at/id),
+    помечая, какой из них сейчас активный (users.active_doc_id).
+
+    Формат элемента:
+    {
+        "id": int,
+        "kind": str | None,
+        "path": str,
+        "created_at": str,
+        "is_active": bool
+    }
+    """
+    con = get_conn()
+    cur = con.cursor()
+    # берём active_doc_id пользователя, чтобы не делать лишний JOIN в основном запросе
+    cur.execute("SELECT active_doc_id FROM users WHERE id = ?", (owner_id,))
+    row_user = cur.fetchone()
+    active_doc_id = row_user["active_doc_id"] if row_user else None
+
+    cur.execute(
+        """
+        SELECT
+            id,
+            kind,
+            path,
+            created_at
+        FROM documents
+        WHERE owner_id = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?
+        """,
+        (owner_id, limit),
+    )
+    rows = cur.fetchall()
+    con.close()
+
+    docs: List[Dict[str, Any]] = []
+    for r in rows or []:
+        docs.append(
+            {
+                "id": r["id"],
+                "kind": r["kind"],
+                "path": r["path"],
+                "created_at": r["created_at"],
+                "is_active": (active_doc_id is not None and int(active_doc_id) == int(r["id"])),
+            }
+        )
+    return docs
 
 # ----------------------------- public API: sections (NEW) -----------------------------
 
@@ -964,14 +1064,21 @@ def get_user_state(user_id: int) -> Dict[str, Any]:
     row = cur.fetchone()
     con.close()
     if not row:
+        try:
+            last_ctx = json.loads(row["last_context"]) if row["last_context"] else None
+        except Exception:
+            last_ctx = None
+
         return {
-            "processing_state": ProcessingState.IDLE.value,
-            "ingest_job_id": None,
-            "ingest_started_at": None,
-            "last_ready_at": None,
-            "last_error": None,
-            "active_doc_id": None,
-            "pending_queue": [],
+            "processing_state": row["processing_state"] or ProcessingState.IDLE.value,
+            "ingest_job_id": row["ingest_job_id"],
+            "ingest_started_at": row["ingest_started_at"],
+            "last_ready_at": row["last_ready_at"],
+            "last_error": row["last_error"],
+            "active_doc_id": row["active_doc_id"],
+            "pending_queue": q,
+            "last_context": last_ctx,
+            "context_mode": row.get("context_mode") or "general",
         }
     queue_raw = row["pending_queue"]
     try:
@@ -1001,10 +1108,11 @@ def _set_user_fields_atomic(user_id: int, fields: Dict[str, Any]) -> None:
         vals: List[Any] = []
         for k, v in fields.items():
             sets.append(f"{k}=?")
-            if isinstance(v, list) or isinstance(v, dict):
+            if k in ("last_context",) and isinstance(v, dict):
                 vals.append(json.dumps(v, ensure_ascii=False))
             else:
                 vals.append(v)
+
         vals.append(user_id)
         cur.execute(f"UPDATE users SET {', '.join(sets)} WHERE id=?", vals)
         cur.execute("COMMIT;")

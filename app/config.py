@@ -247,14 +247,16 @@ class Cfg:
     FULL_TABLE_MAX_CHARS: int = _env_int("FULL_TABLE_MAX_CHARS", 20_000)
     SECTION_TABLES_MAX: int = _env_int("SECTION_TABLES_MAX", 3)
 
-    # --- Декомпозиция многопунктных вопросов ---
+    # --- Декомпозиция многопунктных вопросов (ботовый планировщик, без ACE) ---
     MULTI_PLAN_ENABLED: bool = _env_bool("MULTI_PLAN_ENABLED", True)
     MULTI_MIN_ITEMS: int = _env_int("MULTI_MIN_ITEMS", 2)
     MULTI_MAX_ITEMS: int = _env_int("MULTI_MAX_ITEMS", 12)
     MULTI_PASS_SCORE: int = _env_int("MULTI_PASS_SCORE", 85)
 
-    # Настройки подачи подпунктов (используются в bot.py)
-    MULTI_STEP_SEND_ENABLED: bool = _env_bool("MULTI_STEP_SEND_ENABLED", True)
+    # Настройки подачи подпунктов (используются в bot.py).
+    # По умолчанию многошаговая отправка подпунктов в Telegram выключена:
+    # бот отдаёт только финальный собранный ответ.
+    MULTI_STEP_SEND_ENABLED: bool = _env_bool("MULTI_STEP_SEND_ENABLED", False)
     MULTI_STEP_MIN_ITEMS: int = _env_int("MULTI_STEP_MIN_ITEMS", 2)
     MULTI_STEP_MAX_ITEMS: int = _env_int("MULTI_STEP_MAX_ITEMS", 8)
     MULTI_STEP_FINAL_MERGE: bool = _env_bool("MULTI_STEP_FINAL_MERGE", True)

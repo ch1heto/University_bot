@@ -17,17 +17,15 @@ except Exception:
 
 
 __all__ = [
-    "ace_once", "ace_stream",
-    "agent_no_context",
-    "ace_fullread_once", "ace_fullread_stream",
+    # базовые операции, если где-то ещё используются
     "expand_text", "explain_answer", "draft_answer",
     "critique_json", "edit_answer",
     "expand_text_stream", "explain_answer_stream", "edit_answer_stream",
-    # новое — публичный доступ к шагам декомпозиции
-    "plan_subtasks", "answer_subpoint", "merge_subanswers",
-    # back-compat алиасы
-    "_plan_subtasks", "_answer_subpoint", "_merge_subanswers",
+    "ace_fullread_once", "ace_fullread_stream",
+    "agent_no_context",
+    # ВНИМАНИЕ: ACE-пайплайн и декомпозиция отключены и не должны использоваться напрямую.
 ]
+
 
 
 # -------------------- БЮДЖЕТЫ ТОКЕНОВ (читаются из Cfg, есть дефолты) --------------------
@@ -581,262 +579,30 @@ async def ace_fullread_stream(
     return _empty()
 
 
-# -------------------- ДЕКОМПОЗИЦИЯ МНОГОПУНКТНЫХ ВОПРОСОВ --------------------
-
-_ENUM_LINE = re.compile(r"(?m)^\s*(?:\d+[).\)]|[-—•])\s+")
-_ENUM_INLINE = re.compile(r"(?:\s|^)\(?\d{1,2}[)\.]\s+")
-
-def _looks_multipart(q: str) -> bool:
-    q = q or ""
-    lines = _ENUM_LINE.findall(q)
-    if len(lines) >= MULTI_MIN_ITEMS:
-        return True
-    inline = _ENUM_INLINE.findall(q)
-    if len(inline) >= MULTI_MIN_ITEMS:
-        return True
-    if q.count(";") >= 3:
-        return True
-    return False
-
-def _naive_split(q: str) -> List[str]:
-    q = q.strip()
-    items: List[str] = []
-    if _ENUM_LINE.search(q):
-        for line in q.splitlines():
-            if _ENUM_LINE.match(line):
-                items.append(re.sub(r"^\s*(?:\d+[).\)]|[-—•])\s+", "", line).strip())
-    if not items and _ENUM_INLINE.search(q):
-        # простая сборка по «1) … 2) …»
-        parts = _ENUM_INLINE.split(q)
-        buf = []
-        cur = None
-        for token in re.finditer(r"\(?\d{1,2}[)\.]\s+|[^()]+", q):
-            s = token.group(0)
-            if re.fullmatch(r"\(?\d{1,2}[)\.]\s+", s):
-                if cur:
-                    items.append(cur.strip())
-                cur = ""
-            else:
-                cur = (cur or "") + s
-        if cur:
-            items.append(cur.strip())
-    if not items and q.count(";") >= 2:
-        items = [p.strip() for p in q.split(";") if p.strip()]
-    items = [re.sub(r"\s+", " ", it).strip(" .;—-") for it in items if it and len(it.strip()) >= 2]
-    return items[:MULTI_MAX_ITEMS]
-
-def _plan_subtasks(question: str) -> List[Dict[str, str]]:
-    """
-    Возвращает план подпунктов: [{"id": "1", "ask": "..."}...]
-    1) пытается получить структурированный JSON у модели;
-    2) если не вышло — делает наивный парсинг (нумерация/маркеры/точки с запятой).
-    """
-    if not MULTI_PLAN_ENABLED:
-        items = _naive_split(question)
-        return [{"id": str(i + 1), "ask": it} for i, it in enumerate(items)]
-
-    raw = chat_with_gpt(
-        [
-            {"role": "system", "content": SYS_PLANNER},
-            {"role": "user", "content": question},
-        ],
-        temperature=0.0,
-        max_tokens=PLANNER_MAX_TOKENS,
-    )
-    plan: List[Dict[str, str]] = []
-    try:
-        obj = json.loads(_strip_code_fences(raw))
-        items = obj.get("items", [])
-        if isinstance(items, list):
-            for i, it in enumerate(items[:MULTI_MAX_ITEMS]):
-                ask = str((it or {}).get("ask", "")).strip()
-                if ask:
-                    plan.append({"id": str((it or {}).get("id") or i + 1), "ask": ask})
-    except Exception:
-        pass
-
-    if not plan:
-        items = _naive_split(question)
-        plan = [{"id": str(i + 1), "ask": it} for i, it in enumerate(items)]
-    return plan
-
-def _answer_subpoint(ask: str, ctx: str, pass_score: int | None = None) -> str:
-    """
-    Отвечает на одиночный подпункт, проверяет критиком и при необходимости редактирует.
-    """
-    pass_score = int(pass_score if pass_score is not None else MULTI_PASS_SCORE)
-
-    draft = chat_with_gpt(
-        [
-            {"role": "system", "content": SYS_PART_ANSWER},
-            {"role": "assistant", "content": f"Контекст:\n{_safe_clip(ctx)}"},
-            {"role": "user", "content": f"Подпункт: {ask}"},
-        ],
-        temperature=0.2,
-        max_tokens=PART_MAX_TOKENS,
-    )
-    rep = critique_json(draft, ctx)
-    if rep.get("grounded") and rep.get("score", 0) >= pass_score:
-        return (draft or "").strip()
-    return edit_answer(draft, ctx, rep).strip()
-
-def _merge_subanswers(original_question: str, plan: List[Dict[str, str]], answers: List[str]) -> str:
-    """
-    Объединяет ответы по подпунктам в один финальный (не добавляя новых фактов).
-    """
-    bundle = []
-    for i, (p, a) in enumerate(zip(plan, answers), start=1):
-        bundle.append(f"[{i}] {p.get('ask','')}\n— Ответ:\n{a.strip()}")
-    material = "\n\n".join(bundle)
-
-    return chat_with_gpt(
-        [
-            {"role": "system", "content": SYS_MERGE},
-            {"role": "assistant", "content": f"Подпункты и ответы:\n{_safe_clip(material, 12000)}"},
-            {"role": "user", "content": f"Итоговый вопрос: {original_question}\nСобери полный ответ."},
-        ],
-        temperature=0.2,
-        max_tokens=MERGE_MAX_TOKENS,
-    )
-
-# Публичные алиасы для bot.py (и обратная совместимость)
-def plan_subtasks(question: str) -> List[Dict[str, str]]:
-    return _plan_subtasks(question)
-
-def answer_subpoint(ask: str, ctx: str, pass_score: int | None = None) -> str:
-    return _answer_subpoint(ask, ctx, pass_score)
-
-def merge_subanswers(original_question: str, plan: List[Dict[str, str]], answers: List[str]) -> str:
-    return _merge_subanswers(original_question, plan, answers)
-
-
 # -------------------- КЛАССИЧЕСКИЙ ACE (RAG/контекст) --------------------
 
 def ace_once(question: str, ctx: str, pass_score: int = MULTI_PASS_SCORE) -> str:
     """
-    Один проход ACE:
-    - EXPLAIN: «объясни / что за смысл / развёрнутое объяснение».
-    - EXPAND: «подробнее / распиши / разверни / побольше».
-    - MULTI: декомпозиция сложного вопроса на подпункты → ответы по каждому → слияние.
-    - STRICT: обычный режим (черновик → критик → редактор).
+    [DEPRECATED] Классический ACE-пайплайн отключён.
+    Вместо него ответы формируются напрямую в answer_builder / bot.py через chat_with_gpt.
+    Эта функция оставлена только для обратной совместимости и не должна использоваться.
     """
-    q = (question or "").strip()
-    c = _safe_clip(ctx)
-
-    if is_explain_intent(q):
-        return explain_answer(q, c)
-
-    if is_expand_intent(q):
-        return expand_text(q, c)
-
-    # Декомпозиция длинных вопросов
-    if _looks_multipart(q):
-        plan = _plan_subtasks(q)
-        if len(plan) >= MULTI_MIN_ITEMS:
-            subanswers: List[str] = []
-            for item in plan:
-                try:
-                    subanswers.append(_answer_subpoint(item["ask"], c, pass_score))
-                except Exception:
-                    subanswers.append(
-                        chat_with_gpt(
-                            [
-                                {"role": "system", "content": SYS_PART_ANSWER},
-                                {"role": "assistant", "content": f"Контекст:\n{_safe_clip(c)}"},
-                                {"role": "user", "content": f"Подпункт: {item['ask']} (очень кратко)"},
-                            ],
-                            temperature=0.2,
-                            max_tokens=max(220, PART_MAX_TOKENS // 3),
-                        )
-                    )
-            merged = _merge_subanswers(q, plan, subanswers)
-            report = critique_json(merged, c)
-            if report.get("grounded") and report.get("score", 0) >= int(pass_score):
-                return (merged or "").strip()
-            return edit_answer(merged, c, report).strip()
-        # если план не получился — падаем в STRICT
-
-    # STRICT-пайплайн
-    draft = draft_answer(q, c)
-    report = critique_json(draft, c)
-    if report.get("grounded") and report.get("score", 0) >= int(pass_score):
-        return (draft or "").strip()
-    return edit_answer(draft, c, report).strip()
-
+    raise RuntimeError(
+        "ace_once() больше не поддерживается. "
+        "Переключи код на новый пайплайн в answer_builder / bot.py (без ACE)."
+    )
 
 async def ace_stream(question: str, ctx: str, pass_score: int = MULTI_PASS_SCORE) -> AsyncIterable[str]:
     """
-    Стримовый ACE:
-      - EXPLAIN/EXPAND — стримим единственный вызов модели;
-      - MULTI (декомпозиция): считаем подпункты и их ответы синхронно, затем стримим merge-этап;
-      - STRICT — draft + critic синхронно, затем финальный EDIT стримим;
-                 если черновик прошёл по score — стримим сам черновик (эмуляцией).
+    [DEPRECATED] Стримовый ACE-пайплайн отключён.
+    Используй новый стримовый режим из bot.py / answer_builder.
     """
-    q = (question or "").strip()
-    c = _safe_clip(ctx)
-
-    if is_explain_intent(q):
-        async for ch in explain_answer_stream(q, c):
-            yield ch
-        return
-
-    if is_expand_intent(q):
-        async for ch in expand_text_stream(q, c):
-            yield ch
-        return
-
-    # MULTI-режим (стримим только merge)
-    if _looks_multipart(q):
-        plan = _plan_subtasks(q)
-        if len(plan) >= MULTI_MIN_ITEMS:
-            subanswers: List[str] = []
-            for item in plan:
-                try:
-                    subanswers.append(_answer_subpoint(item["ask"], c, pass_score))
-                except Exception:
-                    subanswers.append(
-                        chat_with_gpt(
-                            [
-                                {"role": "system", "content": SYS_PART_ANSWER},
-                                {"role": "assistant", "content": f"Контекст:\n{_safe_clip(c)}"},
-                                {"role": "user", "content": f"Подпункт: {item['ask']} (очень кратко)"},
-                            ],
-                            temperature=0.2,
-                            max_tokens=max(220, PART_MAX_TOKENS // 3),
-                        )
-                    )
-
-            bundle = []
-            for i, (p, a) in enumerate(zip(plan, subanswers), start=1):
-                bundle.append(f"[{i}] {p.get('ask','')}\n— Ответ:\n{a.strip()}")
-            material = "\n\n".join(bundle)
-
-            messages = [
-                {"role": "system", "content": SYS_MERGE},
-                {"role": "assistant", "content": f"Подпункты и ответы:\n{_safe_clip(material, 12000)}"},
-                {"role": "user", "content": f"Итоговый вопрос: {q}\nСобери полный ответ."},
-            ]
-
-            merged_text = ""
-            async for ch in _stream_from_model(messages, temperature=0.2, max_tokens=MERGE_MAX_TOKENS):
-                merged_text += ch
-                yield ch
-
-            report = critique_json(merged_text, c)
-            if not (report.get("grounded") and report.get("score", 0) >= int(pass_score)):
-                fixed = edit_answer(merged_text, c, report)
-                async for ch in _as_async_stream("\n\n" + fixed):
-                    yield ch
-            return
-
-    # STRICT-пайплайн
-    draft = draft_answer(q, c)
-    report = critique_json(draft, c)
-    if report.get("grounded") and report.get("score", 0) >= int(pass_score):
-        async for ch in _as_async_stream(draft or ""):
-            yield ch
-        return
-    async for ch in edit_answer_stream(draft, c, report):
+    msg = (
+        "ace_stream() больше не поддерживается. "
+        "Переключи код на новый стримовый пайплайн в answer_builder / bot.py (без ACE)."
+    )
+    # даём хоть что-то в стрим, чтобы старый код не падал на уровне протокола
+    async for ch in _as_async_stream(msg):
         yield ch
 
 
