@@ -335,6 +335,12 @@ def _read_cache_nums_with_raw(parent: etree._Element, path: str) -> List[dict]:
     items: List[dict] = []
     max_idx: int = -1
 
+    # если у последнего <c:pt> нет атрибута idx — добавляем вручную
+    for i, p in enumerate(pts):
+        if p.get("idx") is None:
+            p.set("idx", str(i))
+
+
     for p in pts[:MAX_SERIES_POINTS]:
         idx_raw = p.get("idx")
         try:
@@ -361,6 +367,11 @@ def _read_cache_nums_with_raw(parent: etree._Element, path: str) -> List[dict]:
         if idx is None or idx < 0 or idx > max_idx:
             continue
         dense[idx] = {"raw": it["raw"], "dec": it["dec"]}
+
+    if len(dense) < len(items):
+    # если длина меньше — расширяем
+        while len(dense) < len(items):
+            dense.append({"raw": "", "dec": None})
 
     return dense
 
@@ -1099,12 +1110,14 @@ def build_index(docx_path: str) -> Dict:
                     best = (cap_n, cap_txt)
                     best_idx = idx
             # ограничиваемся небольшой "окрестностью" по тексту, чтобы не хватать чужие подписи
-            if best is not None and best_dist <= 3:
-                fig.n, fig.caption = best
-                used_fig_caps.add(best_idx)
-            else:
-                # если подписи явно нет рядом — автонумерация, как раньше
-                fig.n = (fig.n or (fig._order + 1))
+            if best is not None and best_dist <= 3 and best_idx is not None:
+                cap_p_idx = fig_captions[best_idx][0]
+                if cap_p_idx >= fig.para_idx:
+                    fig.n, fig.caption = best
+                    used_fig_caps.add(best_idx)
+                else:
+                    fig.n = (fig.n or (fig._order + 1))
+
 
         used_tab_caps = set()
         for tbl in tables:
@@ -1348,20 +1361,6 @@ def figure_lookup(index: Dict, n: Any) -> Optional[Dict]:
         for f in figures:
             cap = f.get("caption_num")
             if _norm_label_num(cap) == norm:
-                res = dict(f)
-                rows = (
-                    res.get("chart_data")
-                    or (res.get("chart") or {}).get("chart_data")
-                    or (res.get("chart") or {}).get("data")
-                )
-                if isinstance(rows, list) and rows:
-                    res["values_text"] = _chart_rows_to_text(rows)
-                return res
-
-    # 2) фолбэк — по целой части номера (совместимо со старой логикой)
-    if num_int is not None:
-        for f in figures:
-            if f.get("n") == num_int:
                 res = dict(f)
                 rows = (
                     res.get("chart_data")

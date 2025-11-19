@@ -864,11 +864,53 @@ def _table_has_columns(con, table: str, cols: list[str]) -> bool:
 
 # --------------------- Таблицы: парсинг/нормализация ---------------------
 
+# --------------------- Таблицы: парсинг/нормализация ---------------------
+
 _TABLE_ANY = re.compile(r"\bтаблиц\w*|\bтабл\.\b|\bтаблица\w*|(?:^|\s)table(s)?\b", re.IGNORECASE)
 # Поддерживаем: 2.1, 3, A.1, А.1, П1.2
 _TABLE_TITLE_RE = re.compile(r"(?i)\bтаблица\s+(\d+(?:[.,]\d+)*|[a-zа-я]\.?\s*\d+(?:[.,]\d+)*)\b(?:\s*[—\-–]\s*(.+))?")
 _COUNT_HINT = re.compile(r"\bсколько\b|how many", re.IGNORECASE)
 _WHICH_HINT = re.compile(r"\bкаки(е|х)\b|\bсписок\b|\bперечисл\w*\b|\bназов\w*\b", re.IGNORECASE)
+
+# НОВОЕ: вытаскиваем номер таблицы из запроса вида "опиши таблицу 4", "что показывает таблица 2.3" и т.п.
+_TABLE_NUM_IN_TEXT_RE = re.compile(
+    r"(?i)\bтаблиц[а-я]*\s+([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)"
+)
+
+def _extract_table_nums(text: str) -> list[str]:
+    """Достаём все номера таблиц из фразы пользователя."""
+    nums: list[str] = []
+    for m in _TABLE_NUM_IN_TEXT_RE.finditer(text or ""):
+        raw = (m.group(1) or "").strip()
+        #  " 4 , 1 " -> "4.1"
+        norm = raw.replace(" ", "").replace(",", ".")
+        if norm:
+            nums.append(norm)
+    return nums
+
+def _is_pure_table_request(text: str) -> bool:
+    """
+    Эвристика: запрос ТОЛЬКО про конкретные таблицы
+    (например: "опиши таблицу 4", "что показывает таблица 2.3"),
+    без рисунков, разделов и общих вопросов.
+    """
+    t = (text or "").strip()
+    if not t:
+        return False
+
+    # нет слова "таблица" — точно не наш случай
+    if not _TABLE_ANY.search(t):
+        return False
+
+    # нет номера после "таблицы" — тоже не чистый запрос
+    if not _TABLE_NUM_IN_TEXT_RE.search(t):
+        return False
+
+    # если одновременно спрашивают про рисунки или разделы — это уже смешанный вопрос
+    if FIG_NUM_RE.search(t) or _SECTION_NUM_RE.search(t):
+        return False
+
+    return True
 
 def _plural_tables(n: int) -> str:
     n_abs = abs(n) % 100
@@ -2547,6 +2589,132 @@ async def _answer_figure_query(
 
     return True
 
+def _ooxml_table_block(doc_id: int, num: str) -> str | None:
+    """
+    Берём сырые данные таблицы из OOXML-индекса через oox_tbl_lookup.
+    Никаких доп. вычислений — просто даём модели структуру "как есть".
+    """
+    idx = _ooxml_get_index(doc_id)
+    if not idx:
+        return None
+    if "oox_tbl_lookup" not in globals():
+        return None
+
+    try:
+        res = oox_tbl_lookup(idx, str(num))
+    except Exception:
+        return None
+
+    if res is None:
+        return None
+
+    # строка или словарь — приводим к читаемому виду
+    if isinstance(res, str):
+        body = res.strip()
+    else:
+        try:
+            body = json.dumps(res, ensure_ascii=False, indent=2)
+        except Exception:
+            body = str(res)
+
+    body = (body or "").strip()
+    if not body:
+        return None
+
+    return f"Таблица {num} (сырые данные из документа):\n{body}"
+
+
+async def _answer_table_query(
+    m: types.Message,
+    uid: int,
+    doc_id: int,
+    text: str,
+    *,
+    verbosity: str = "normal",
+) -> bool:
+    """
+    Спец-путь для запросов вида:
+      - "опиши таблицу 4"
+      - "что показывает таблица 2.3"
+      - "сделай выводы по таблице 4"
+
+    Делаем так:
+      1) достаём номера таблиц из текста;
+      2) по каждому номеру берём таблицу из OOXML-индекса (oox_tbl_lookup);
+      3) отправляем GPT структуру таблицы и жёсткую инструкцию
+         "отвечать только по этим данным, ничего не придумывать".
+    """
+    nums = _extract_table_nums(text)
+    if not nums:
+        return False
+
+    blocks: list[str] = []
+    missing: list[str] = []
+
+    for n in nums:
+        blk = _ooxml_table_block(doc_id, n)
+        if blk:
+            blocks.append(blk)
+        else:
+            missing.append(n)
+
+    # если вообще ничего не нашли — честно говорим, что № нет в индексе,
+    # и НЕ перекладываем это на модель
+    if not blocks and missing:
+        await _send(
+            m,
+            "В OOXML-индексе документа не найдено таблиц с номерами: "
+            + ", ".join(missing)
+        )
+        return True
+
+    if not blocks:
+        # ничего не нашли и ничего не знаем — отдаём на обычный пайплайн
+        return False
+
+    ctx = "\n\n---\n\n".join(blocks)
+
+    system_prompt = (
+        "Ты репетитор по дипломным работам. Ниже даны таблицы, распарсенные прямо из документа.\n"
+        "Отвечай СТРОГО по этим данным:\n"
+        "— не придумывай новые строки, столбцы и значения;\n"
+        "— не добавляй факты, которых нет в таблицах;\n"
+        "— не ссылаться на страницы, только описывай содержание.\n"
+        "Если в вопросе указан номер таблицы, но такой таблицы нет в переданном контексте — "
+        "напиши, что по этому номеру в контексте данных нет."
+    )
+
+    user_prompt = (
+        f"Вопрос пользователя: {text}\n\n"
+        "Ниже структура таблиц в машинно-читаемом виде. "
+        "Сначала объясни простыми словами, что показывает каждая таблица "
+        "(что по строкам, что по столбцам), затем сделай аккуратные выводы: "
+        "какие значения выше/ниже, какие различия заметны.\n"
+        "Не придумывай никаких фактов, которых нет в данных таблиц."
+        f"{_verbosity_addendum(verbosity, 'описания таблицы')}\n\n"
+        "[Таблицы из документа]\n"
+        f"{ctx}"
+    )
+
+    try:
+        answer = chat_with_gpt(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+            max_tokens=FINAL_MAX_TOKENS,
+        )
+    except Exception as e:
+        logging.exception("table explanation failed: %s", e)
+        return False
+
+    answer = (answer or "").strip()
+    if not answer:
+        return False
+
+    await _send(m, _strip_unwanted_sections(answer))
+    return True
 
 # -------------------------- САМОВОССТАНОВЛЕНИЕ ИНДЕКСА --------------------------
 
@@ -3455,13 +3623,20 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
     if await _maybe_run_gost(m, uid, doc_id, q_text):
         return
 
+    # НОВОЕ: быстрый путь для запросов про таблицы
+    # Примеры: "опиши таблицу 4", "что показывает таблица 2.3", "сделай выводы по таблице 4"
+    if _is_pure_table_request(q_text):
+        verbosity = _detect_verbosity(q_text)
+        handled = await _answer_table_query(m, uid, doc_id, q_text, verbosity=verbosity)
+        if handled:
+            return
+
     # быстрый путь для запросов про рисунки
     if _is_pure_figure_request(q_text):
         verbosity = _detect_verbosity(q_text)
         handled = await _answer_figure_query(m, uid, doc_id, q_text, verbosity=verbosity)
         if handled:
             return
-
 
     # РАНО в respond_with_answer, до detect_intents:
         # РАНО в respond_with_answer, до detect_intents:
