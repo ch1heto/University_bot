@@ -1208,6 +1208,8 @@ def _find_table_bases_by_number(pack: dict, num: str) -> List[str]:
       - по attrs.caption_num/label,
       - по вхождению 'Таблица/Табл./Table N' в section_path/text
         с терпимостью к '2.1' / '2,1' / '2.1.'.
+      - ЕСЛИ не нашли — резервный режим: по порядковому номеру таблицы (attrs.order_index),
+        чтобы уметь находить даже «кривые» таблицы без нормальной подписи.
     Возвращаем список базовых section_path (без [row k]).
     """
     bases: List[str] = []
@@ -1221,6 +1223,7 @@ def _find_table_bases_by_number(pack: dict, num: str) -> List[str]:
     ru_pat = re.compile(rf"(?i)\bтабл(?:ица)?\s+{num_pat}")
     en_pat = re.compile(rf"(?i)\btable\s+{num_pat}")
 
+    # --- 1) Обычный путь: по caption_num/label и вхождениям "Таблица N" в тексте/пути ---
     for m in pack["meta"]:
         et = _chunk_type(m)
         if et not in {"table", "table_row"}:
@@ -1242,7 +1245,61 @@ def _find_table_bases_by_number(pack: dict, num: str) -> List[str]:
             if base and base not in bases:
                 bases.append(base)
 
+    # Если уже что-то нашли — резервный режим не нужен
+    if bases:
+        return bases
+
+    # --- 2) Резервный режим: поиск по порядковому номеру таблицы (attrs.order_index) ---
+    # Работает, когда пользователь спрашивает "таблица 6", а подпись в документе кривая
+    # или вообще отсутствует, но при парсинге мы всё равно присвоили order_index=6.
+    try:
+        # Берём целую часть номера (для '6', '6.1' → 6)
+        ordinal = int(float(needle.split(".")[0]))
+    except Exception:
+        return bases
+
+    # Собираем все таблицы с order_index и их базовые пути
+    candidates: List[Tuple[int, str]] = []
+    for m in pack["meta"]:
+        et = _chunk_type(m)
+        if et not in {"table", "table_row"}:
+            continue
+
+        attrs = m.get("attrs") or {}
+        oi = attrs.get("order_index")
+        if isinstance(oi, str):
+            try:
+                oi = int(oi)
+            except Exception:
+                oi = None
+        if not isinstance(oi, int):
+            continue
+
+        base = _table_base_from_section(m.get("section_path") or "")
+        if not base:
+            continue
+        candidates.append((oi, base))
+
+    if not candidates:
+        return bases
+
+    # Для каждого base оставляем минимальный order_index (заголовочный чанк таблицы)
+    best_by_base: Dict[str, int] = {}
+    for oi, base in candidates:
+        prev = best_by_base.get(base)
+        if prev is None or oi < prev:
+            best_by_base[base] = oi
+
+    # Сортируем по порядку появления в документе
+    sorted_bases = sorted(best_by_base.items(), key=lambda x: x[1])
+
+    # Ищем таблицу с нужным порядковым номером
+    for oi, base in sorted_bases:
+        if oi == ordinal and base not in bases:
+            bases.append(base)
+
     return bases
+
 
 def _row_index(section_path: str) -> int:
     m = _ROW_TAG_RE.search(section_path or "")

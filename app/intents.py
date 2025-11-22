@@ -148,12 +148,24 @@ def _language_guess(text: str) -> str:
     return "en" if (has_lat and not has_cyr) else "ru"
 
 def _normalize_num(s: str) -> str:
+    """
+    Нормализация номера таблицы/рисунка так, чтобы он совпадал с caption_num из parsing.py:
+
+    - убираем неразрывные пробелы и обычные пробелы по краям
+    - отрезаем ведущую литеру с точкой/дефисом/пробелом: "А.1" / "A 1.2" / "П-2.3" -> "1" / "1.2" / "2.3"
+    - убираем внутренние пробелы
+    - запятую превращаем в точку: "2,3" -> "2.3"
+    """
     s = (s or "")
+    s = s.replace("\u00A0", " ").strip()
+    if not s:
+        return ""
+    # убираем ведущую литеру/букву (как в _norm_caption_num из parsing.py)
+    s = re.sub(r"^[A-Za-zА-Яа-я]\.?[\s\-]*", "", s)
     s = s.replace(" ", "")
     s = s.replace(",", ".")
-    # убираем точку/дефис между литерой и цифрой: "A.1" -> "A1" (для поиска по label/caption_num)
-    s = re.sub(r"([A-Za-zА-Яа-я])[\.\-]?(?=\d)", r"\1", s)
     return s.strip()
+
 
 def _sort_key_for_dotted(num: str):
     parts = [p for p in str(num).split(".") if p != ""]

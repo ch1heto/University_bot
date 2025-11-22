@@ -1096,8 +1096,13 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
     last_title_candidate: Optional[str] = None
     last_title_candidate_age: int = 999
 
+    # NEW: последняя встреченная inline-ссылка на таблицу (см. табл. 6)
+    last_table_ref_num: Optional[str] = None
+    last_table_ref_age: int = 999  # счётчик «старения» ссылки
+
     table_counter = 0
     figure_counter = 0
+
 
     def flush_text_section():
         nonlocal buf, cur_title, cur_level, last_para_attrs
@@ -1136,6 +1141,8 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
 
     for block in _iter_block_items(doc):
         last_title_candidate_age = last_title_candidate_age + 1
+        last_table_ref_age = last_table_ref_age + 1
+
 
         if isinstance(block, Paragraph):
             p_text = _clean(block.text)
@@ -1371,7 +1378,20 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
             if p_text:
                 last_para_attrs = _paragraph_attrs(block)
                 buf.append(p_text)
+
+                # NEW: ловим inline-ссылку на таблицу: «см. табл. 6», «см. таблицу 3» и т.п.
+                m_ref = re.search(
+                    r"(?:см\.?\s*)?табл(?:ица)?\s*\.?\s*(?:№\s*)?(\d+(?:[.,]\d+)*)",
+                    p_text,
+                    re.IGNORECASE,
+                )
+                if m_ref:
+                    # нормализуем номер как в подписи («6», «2.3» и т.п.)
+                    last_table_ref_num = _norm_caption_num(m_ref.group(1))
+                    last_table_ref_age = 0
+
             continue
+
 
         # Таблица
         if isinstance(block, Table):
@@ -1384,6 +1404,7 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
             tail_final: Optional[str] = None
 
             if pending_tbl_num:
+                # Явная подпись «Таблица N …» — приоритетнее всего
                 num_final = pending_tbl_num
                 if pending_tbl_tail:
                     tail_final = pending_tbl_tail
@@ -1391,13 +1412,24 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                 elif last_title_candidate and last_title_candidate_age <= 2:
                     tail_final = consume_title_candidate()
                     caption_source = "two_lines_after"
+
+            elif last_table_ref_num and last_table_ref_age <= 3:
+                # NEW: нет подписи, но недавно была inline-ссылка «см. табл. N»
+                num_final = last_table_ref_num
+                caption_source = "by_inline_ref"
+
             elif last_title_candidate and last_title_candidate_age <= 2:
+                # Короткая строка над таблицей — хвост подписи без номера
                 tail_final = consume_title_candidate()
                 caption_source = "two_lines_before"
 
 
             t_text = _table_to_text(block) or "(пустая таблица)"
             attrs_tbl = _table_attrs(block) | {"numbers": _extract_numbers(t_text)}
+
+            # NEW: порядковый номер таблицы в документе (для fallback-поиска)
+            attrs_tbl["order_index"] = table_counter
+
 
             if not tail_final and attrs_tbl.get("header_preview"):
                 tail_final = attrs_tbl["header_preview"]
@@ -1485,7 +1517,13 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
             awaiting_tail = False
             last_title_candidate = None
             last_title_candidate_age = 999
+
+            # NEW: inline-ссылка «см. табл. N» сработала → обнуляем
+            last_table_ref_num = None
+            last_table_ref_age = 999
+
             continue
+
 
     if last_title_candidate:
         buf.append(last_title_candidate)

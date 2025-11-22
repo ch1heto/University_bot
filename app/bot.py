@@ -3160,6 +3160,21 @@ def _ooxml_table_block(uid: int, doc_id: int, num: str) -> str | None:
     2) Если там ничего не нашли — падаем в обычные chunks (table/table_row) и
        собираем текст таблицы по строкам. Это защищает от глюков OOXML-парсера.
     """
+
+    # маленький внутренний хелпер: красиво форматируем rows → текстовую таблицу
+    def _format_oox_rows(res: dict) -> str:
+        rows = res.get("rows") or []
+        lines: list[str] = []
+        for row in rows:
+            if not isinstance(row, (list, tuple)):
+                continue
+            cells = [(str(c) if c is not None else "").strip() for c in row]
+            # пустые хвостовые ячейки убираем
+            while cells and cells[-1] == "":
+                cells.pop()
+            lines.append(" | ".join(cells))
+        return "\n".join(lines).strip()
+
     # --- 1. OOXML ---
     idx = _ooxml_get_index(doc_id)
     if idx and "oox_tbl_lookup" in globals():
@@ -3171,16 +3186,22 @@ def _ooxml_table_block(uid: int, doc_id: int, num: str) -> str | None:
         if res is not None:
             if isinstance(res, str):
                 body = res.strip()
+            elif isinstance(res, dict) and "rows" in res:
+                # НОРМАЛЬНОЕ человекочитаемое представление таблицы
+                body = _format_oox_rows(res)
             else:
+                # запасной вариант: если структура неожиданная — просто сериализуем
                 try:
                     body = json.dumps(res, ensure_ascii=False, indent=2)
                 except Exception:
                     body = str(res)
+
             body = (body or "").strip()
             if body:
-                return f"Таблица {num} (сырые данные из документа):\n{body}"
+                # меняем подпись, т.к. теперь это не «сырой JSON», а нормальная таблица
+                return f"Таблица {num} (как в документе):\n{body}"
 
-        # --- 2. Фолбэк: chunks из БД ---
+    # --- 2. Фолбэк: chunks из БД ---
     con = get_conn()
     cur = con.cursor()
 
@@ -3241,7 +3262,6 @@ def _ooxml_table_block(uid: int, doc_id: int, num: str) -> str | None:
     finally:
         con.close()
 
-
     if not rows:
         return None
 
@@ -3261,7 +3281,6 @@ def _ooxml_table_block(uid: int, doc_id: int, num: str) -> str | None:
     return f"Таблица {num} (как в документе, по строкам таблицы):\n{body}"
 
 
-
 def _table_related_context(
     uid: int,
     doc_id: int,
@@ -3273,16 +3292,16 @@ def _table_related_context(
     Ищем дополнительный текст, который связан с таблицей `num`.
 
     1) Сначала ищем прямые упоминания «таблица N» (кроме самих ячеек таблицы).
-    2) Если таких фрагментов нет – делаем второй проход по ВСЕМУ документу:
-       семантический поиск best_context по запросу
-       «подробное текстовое пояснение и выводы по данным таблицы N».
+    2) Если таких фрагментов нет – пытаемся найти абзац(ы) вида «Примечание …»
+       сразу после этой таблицы.
+    3) Если и это не сработало – делаем семантический поиск по всему документу.
     """
     con = get_conn()
     cur = con.cursor()
     has_et = _table_has_columns(con, "chunks", ["element_type"])
 
     variants = _table_num_variants(num)
-    txt_patterns = []
+    txt_patterns: list[str] = []
     for v in variants:
         txt_patterns.append(f"%Таблица {v}%")
         txt_patterns.append(f"%таблица {v}%")
@@ -3318,7 +3337,6 @@ def _table_related_context(
             (uid, doc_id, *txt_patterns),
         )
 
-
     rows = cur.fetchall() or []
     con.close()
 
@@ -3347,6 +3365,89 @@ def _table_related_context(
     if extra:
         return extra
 
+    # НОВОЕ: если прямых упоминаний «таблица N» нет,
+    # попробуем подобрать «Примечание …» сразу после этой таблицы.
+    try:
+        con = get_conn()
+        cur = con.cursor()
+        has_et = _table_has_columns(con, "chunks", ["element_type"])
+        has_attr = _table_has_columns(con, "chunks", ["attrs"])
+
+        base_row = None
+        if has_attr and has_et:
+            like1 = f'%\"caption_num\": \"{num}\"%'
+            like2 = f'%\"label\": \"{num}\"%'
+            cur.execute(
+                """
+                SELECT id, page, section_path, element_type, text
+                FROM chunks
+                WHERE owner_id=? AND doc_id=?
+                  AND element_type IN ('table','table_row')
+                  AND (attrs LIKE ? OR attrs LIKE ?)
+                ORDER BY id ASC LIMIT 1
+                """,
+                (uid, doc_id, like1, like2),
+            )
+            base_row = cur.fetchone()
+
+        if not base_row:
+            cur.execute(
+                """
+                SELECT id, page, section_path, element_type, text
+                FROM chunks
+                WHERE owner_id=? AND doc_id=?
+                  AND element_type IN ('table','table_row')
+                  AND section_path LIKE ? COLLATE NOCASE
+                ORDER BY id ASC LIMIT 1
+                """,
+                (uid, doc_id, f'%Таблица {num}%'),
+            )
+            base_row = cur.fetchone()
+
+        note_text = ""
+        if base_row:
+            base_id = base_row["id"]
+            page = base_row["page"]
+
+            cur.execute(
+                """
+                SELECT text, element_type
+                FROM chunks
+                WHERE owner_id=? AND doc_id=? AND id>? AND page=?
+                ORDER BY id ASC LIMIT 10
+                """,
+                (uid, doc_id, base_id, page),
+            )
+            note_parts: list[str] = []
+            started = False
+            for r in cur.fetchall() or []:
+                et = (r["element_type"] or "").lower() if "element_type" in r.keys() else ""
+                if et in ("heading", "table", "figure", "table_row"):
+                    # дальше уже другая структура
+                    break
+                t = (r["text"] or "").strip()
+                if not t:
+                    continue
+                low = t.lower()
+                if low.startswith("примечание"):
+                    started = True
+                    note_parts.append(t)
+                    continue
+                if started:
+                    # цепляем хвост примечания, если оно в несколько абзацев
+                    note_parts.append(t)
+
+            if note_parts:
+                note_text = "\n".join(note_parts).strip()
+
+        con.close()
+
+        if note_text:
+            return note_text
+    except Exception:
+        # не ломаем пайплайн, если что-то пошло не так
+        pass
+
     # второй проход: семантический поиск по всему документу
     query = f"подробное текстовое пояснение, анализ и выводы по данным таблицы {num}"
     try:
@@ -3360,6 +3461,7 @@ def _table_related_context(
         ctx = ""
 
     return (ctx or "").strip()
+
 
 
 
@@ -3377,8 +3479,7 @@ async def _answer_table_query(
       - "опиши таблицу 4"
       - "что показывает таблица 2.3"
       - "сделай выводы по таблице 4"
-      - и фоллоу-апа "опиши подробнее" по этой же таблице (mode="more").
-    ...
+      - и фоллоу-апа "опиши подробнее" по этой же таблице (mode=\"more\").
     """
     nums = _extract_table_nums(text)
     if not nums:
@@ -3432,18 +3533,31 @@ async def _answer_table_query(
             missing.append(n)
 
 
-    # Если по указанным номерам не удалось собрать структурированные данные
-    # (ни OOXML, ни картинка), не отвечаем «таблица не найдена», а
-    # отдаём вопрос в общий RAG-пайплайн.
     if not blocks:
-        return False
+        # ничего не смогли собрать ни из OOXML, ни из OCR/диаграмм
+        await _send(
+            m,
+            f"Таблица {', '.join(nums)} в документе не найдена. "
+            "Проверь, правильно ли указан номер."
+        )
+        return True  # считаем запрос обработанным, дальше по пайплайну не идём
 
 
     ctx_tables = "\n\n---\n\n".join(blocks)
 
+    # Блок, который ВСЕГДА пойдёт в финальный ответ пользователю,
+    # чтобы он видел все значения таблицы ровно в том виде, как мы её распознали.
+    raw_values_text = ""
+    if ctx_tables:
+        raw_values_text = (
+            "**Все значения таблиц (как в документе)**\n\n"
+            f"{ctx_tables}"
+        )
+
     # Дополнительный текст по таблицам (для обычного режима и "подробнее")
     # В обычном ответе берём поменьше символов, в "подробнее" — побольше.
     extra_ctx_parts: list[str] = []
+
     for n in nums:
         extra = _table_related_context(
             uid,
@@ -3493,33 +3607,54 @@ async def _answer_table_query(
         "— не добавляй факты, которых нет в таблицах;\n"
         "— не ссылаться на страницы, только описывай содержание.\n"
         "Если в вопросе указан номер таблицы, но такой таблицы нет в переданном контексте — "
-        "напиши, что по этому номеру в контексте данных нет."
+        "напиши, что по этому номеру в контексте данных нет.\n\n"
+        "Структура ответа ДОЛЖНА быть такой:\n"
+        "1) Раздел «Структура таблицы» — коротко объясни, что по строкам и что по столбцам.\n"
+        "2) Раздел «Все значения» — выпиши ВСЕ числовые значения таблицы БЕЗ ПРОПУСКОВ.\n"
+        "   Для каждой строки таблицы (например: «Отцы», «Матери», «Общее»)\n"
+        "   напиши одну строку вида:\n"
+        "   «Отцы: 31,55; 26,85; 27,1; …; 51,1» — значения идут строго по порядку столбцов.\n"
+        "   Нельзя объединять строки и нельзя выбрасывать какие-либо числа.\n"
+        "3) Раздел «Выводы» — сделай аккуратную интерпретацию и выводы на основе этих данных.\n"
+        "Если в контексте есть абзац, начинающийся с «Примечание», обязательно приведи его "
+        "отдельным подпунктом «Примечание» и не сокращай текст."
     )
 
-    # В режиме "подробнее" прямо говорим, что нужен более развёрнутый разбор
+
+
+        # В режиме "подробнее" прямо говорим, что нужен более развёрнутый разбор
     if mode == "more":
         user_prompt = (
             f"Вопрос пользователя: {text}\n\n"
             "Ниже структура таблиц в машинно-читаемом виде и дополнительный текст из работы. "
-            "Сделай БОЛЕЕ ПОДРОБНЫЙ разбор по этой таблице: "
-            "что именно в ней сравнивается, какие значения выше/ниже, какие тенденции видны, "
-            "какие аккуратные выводы можно сделать, не придумывая новых данных."
-            f"{_verbosity_addendum('detailed', 'описания таблицы')}\n\n"
+            "Сделай БОЛЕЕ ПОДРОБНЫЙ разбор по этой таблице.\n\n"
+            "Обязательно:\n"
+            "— строго следуй структуре ответа из системной инструкции "
+            "(«Структура таблицы» → «Все значения» → «Выводы»);\n"
+            "— в разделе «Все значения» перечисли ВСЕ показатели и их значения, без сокращений "
+            "и пропусков (можно в виде списков по группам/строкам/столбцам);\n"
+            "— в разделе «Выводы» аккуратно интерпретируй различия и тенденции, не придумывая новых данных."
+            f"{_verbosity_addendum('detailed', 'подробного описания таблицы')}\n\n"
             "[Таблицы и связанный текст из документа]\n"
             f"{full_ctx}"
         )
+
     else:
         user_prompt = (
             f"Вопрос пользователя: {text}\n\n"
             "Ниже структура таблиц в машинно-читаемом виде. "
-            "Сначала объясни простыми словами, что показывает каждая таблица "
-            "(что по строкам, что по столбцам), затем сделай аккуратные выводы: "
-            "какие значения выше/ниже, какие различия заметны.\n"
+            "Ответ оформи в три явных раздела: «Структура таблицы», «Все значения», «Выводы».\n"
+            "Сначала в разделе «Структура таблицы» простыми словами объясни, что по строкам и что по столбцам.\n"
+            "Затем в разделе «Все значения» выпиши все числовые значения таблицы в текстовом виде "
+            "(можно списками по группам/строкам/столбцам), не сокращая и не выбрасывая числа.\n"
+            "В конце, в разделе «Выводы», сделай аккуратные выводы: какие значения выше/ниже, "
+            "какие различия заметны, какие тенденции можно отметить.\n"
             "Не придумывай никаких фактов, которых нет в данных таблиц."
             f"{_verbosity_addendum(verbosity, 'описания таблицы')}\n\n"
             "[Таблицы из документа]\n"
             f"{full_ctx}"
         )
+
 
     try:
         answer = chat_with_gpt(
@@ -3532,14 +3667,43 @@ async def _answer_table_query(
         )
     except Exception as e:
         logging.exception("table explanation failed: %s", e)
-        return False
+        await _send(
+            m,
+            "Не получилось сгенерировать объяснение по таблице — произошла техническая ошибка. "
+            f"Подробности для логов: {e}"
+        )
+        return True  # запрос обработан, не проваливаемся в общий RAG
+
 
     answer = (answer or "").strip()
-    if not answer:
-        return False
 
-    await _send(m, _strip_unwanted_sections(answer))
+    # Если модель ничего внятного не вернула — всё равно показываем пользователю
+    # ВСЕ значения таблицы, а рядом честно пишем, что текстового объяснения нет.
+    if not answer:
+        if raw_values_text:
+            await _send(
+                m,
+                raw_values_text
+                + "\n\n"
+                + "Модель не смогла сгенерировать осмысленное текстовое описание таблицы. "
+                  "Вот сами значения таблицы. Если нужно пояснение — попробуй переформулировать вопрос."
+            )
+        else:
+            await _send(
+                m,
+                "Модель не вернула осмысленный текст по таблице. "
+                "Попробуй переформулировать вопрос или задать его ещё раз."
+            )
+        return True  # тоже не падаем в общий пайплайн
+
+    # Нормальный кейс: сначала ВСЕ значения, потом человеческое объяснение
+    final_answer = _strip_unwanted_sections(answer)
+    if raw_values_text:
+        final_answer = raw_values_text + "\n\n\n" + final_answer
+
+    await _send(m, final_answer)
     return True
+
 
 # -------------------------- САМОВОССТАНОВЛЕНИЕ ИНДЕКСА --------------------------
 
@@ -3620,9 +3784,11 @@ def _reindex_with_sections(uid: int, doc_id: int, sections: list[dict]) -> None:
     set_document_indexer_version(doc_id, CURRENT_INDEXER_VERSION)
     update_document_meta(doc_id, layout_profile=_current_embedding_profile())
 
+
 async def _ensure_modalities_indexed(m: types.Message, uid: int, doc_id: int, intents: dict):
     """Если документ старый и нет reference/figure — тихо перепарсим новым парсером и переиндексируем."""
     need_refs = bool(intents.get("sources", {}).get("want"))
+
     need_figs = bool(intents.get("figures", {}).get("want"))
     if not (need_refs or need_figs):
         return
@@ -4610,10 +4776,6 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
     # для коротких реплик вида «опиши подробнее», «расскажи про него»
     q_text = _expand_with_last_referent(uid, q_text)
 
-    # флаг: пытались ли мы обработать запрос как «чисто табличный»,
-    # но спец-обработчик _answer_table_query ничего не нашёл
-    force_general_from_table = False
-
     # НОВОЕ: быстрый путь для запросов про таблицы
     # Примеры: "опиши таблицу 4", "что показывает таблица 2.3", "сделай выводы по таблице 4"
     if _is_pure_table_request(q_text):
@@ -4624,9 +4786,8 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
         )
         if handled:
             return
-        # сюда попадаем, если _answer_table_query НЕ смог ответить (таблица не нашлась
-        # ни в OOXML, ни как картинка) — дальше будем резать табличный интент
-        force_general_from_table = True
+        # если _answer_table_query не смог ответить (таблица не нашлась в OOXML/картинке),
+
 
     # быстрый путь для запросов про рисунки
     if _is_pure_figure_request(q_text):
@@ -4706,18 +4867,10 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
         except Exception:
             pass
 
-        # --- Определяем интенты заранее
+    # --- Определяем интенты заранее
     intents = detect_intents(q_text)
-    verbosity = _detect_verbosity(q_text)
 
-    # как до появления спец-обработчика таблиц.
-    if force_general_from_table and "tables" in intents:
-        try:
-            intents["tables"]["describe"] = []
-            intents["tables"]["want"] = False
-        except Exception:
-            # на всякий случай, чтобы не уронить пайплайн, если структура интентов другая
-            intents["tables"] = {"want": False, "describe": []}
+    verbosity = _detect_verbosity(q_text)
 
     # Чистый запрос про конкретные рисунки (нет секций/таблиц/источников/общего вопроса)
     pure_figs = intents["figures"]["want"] and not (
