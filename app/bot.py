@@ -1025,9 +1025,9 @@ _SECTION_NUM_RE = re.compile(
 )
 _ANAPH_HINT_RE = re.compile(r"(?i)\b(этот|эта|это|данн\w+|про него|про неё|про нее)\b")
 
-# Короткие фоллоу-апы вида «опиши подробнее», «объясни подробнее, пожалуйста»
+# считаем "уточняющим" любой запрос, где есть глагол + слово "подробнее" в одной фразе
 _FOLLOWUP_MORE_RE = re.compile(
-    r"(?i)^(опиши|распиши|объясни|расскажи)\s+подробнее(?:\s+пожалуйста)?[.!]?$"
+    r"(?i)\b(опиши|распиши|объясни|расскажи)\b.*\bподробнее\b|\bподробнее\b.*\b(опиши|распиши|объясни|расскажи)\b"
 )
 
 def _expand_with_last_referent(uid: int, text: str) -> str:
@@ -1048,7 +1048,7 @@ def _expand_with_last_referent(uid: int, text: str) -> str:
         return text
 
     # нет ни анафоры («этот/про неё»), ни короткого фоллоу-апа «опиши подробнее» — выходим
-    if not (_ANAPH_HINT_RE.search(t) or _FOLLOWUP_MORE_RE.match(t)):
+    if not (_ANAPH_HINT_RE.search(t) or _FOLLOWUP_MORE_RE.search(t)):
         return text
 
     last = LAST_REF.get(uid) or {}
@@ -3584,6 +3584,8 @@ async def _answer_table_query(
             # сырые данные таблиц из OOXML/картинки — чтобы [модель] их видела
             "ctx_tables": ctx_tables,
             "nums": nums,
+            # нужен, чтобы потом ещё раз сходить в документ за контекстом
+            "doc_id": doc_id,
         }
         await _send(
             m,
@@ -3674,11 +3676,43 @@ async def _answer_table_query(
         )
         return True  # запрос обработан, не проваливаемся в общий RAG
 
-
     answer = (answer or "").strip()
 
-    # Если модель ничего внятного не вернула — всё равно показываем пользователю
-    # ВСЕ значения таблицы, а рядом честно пишем, что текстового объяснения нет.
+    # --- НОВОЕ: если модель дала пустой или совсем короткий ответ,
+    # пробуем более простой fallback-промпт только по значениям таблицы.
+    if not answer or len(answer) < 60:
+        if raw_values_text:
+            fb_system = (
+                "Ты репетитор по дипломным работам. Ниже дано текстовое представление таблицы "
+                "из диплома (все её значения). "
+                "По этим данным опиши простыми словами, что показывает таблица, "
+                "какие значения выше/ниже и какие 2–3 вывода можно сделать. "
+                "Не придумывай новых чисел и не пересчитывай проценты."
+            )
+            fb_user = (
+                f"Таблица из диплома:\n{ctx_tables}\n\n"
+                f"Вопрос пользователя: {text}\n\n"
+                "Сформулируй понятное человеку описание и выводы по этой таблице."
+            )
+            try:
+                fb_answer = chat_with_gpt(
+                    [
+                        {"role": "system", "content": fb_system},
+                        {"role": "user",   "content": fb_user},
+                    ],
+                    temperature=0.3,
+                    max_tokens=FINAL_MAX_TOKENS,
+                )
+            except Exception as e:
+                logging.exception("table fallback explanation failed: %s", e)
+                fb_answer = ""
+
+            fb_answer = (fb_answer or "").strip()
+            if fb_answer:
+                answer = fb_answer
+    # --- /НОВОЕ ---
+
+    # Если модель в итоге так и не дала осмысленный текст — показываем только значения
     if not answer:
         if raw_values_text:
             await _send(
@@ -3703,6 +3737,7 @@ async def _answer_table_query(
 
     await _send(m, final_answer)
     return True
+
 
 
 # -------------------------- САМОВОССТАНОВЛЕНИЕ ИНДЕКСА --------------------------
@@ -4678,6 +4713,7 @@ async def _answer_with_model_extra(m: types.Message, uid: int, base_question: st
 async def _answer_with_model_extra_table(
     m: types.Message,
     uid: int,
+    doc_id: int,
     base_question: str,
     ctx_tables: str,
     nums: list[str],
@@ -4869,8 +4905,6 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
 
     # --- Определяем интенты заранее
     intents = detect_intents(q_text)
-
-    verbosity = _detect_verbosity(q_text)
 
     # Чистый запрос про конкретные рисунки (нет секций/таблиц/источников/общего вопроса)
     pure_figs = intents["figures"]["want"] and not (
@@ -5192,10 +5226,24 @@ async def qa(m: types.Message):
         if low in ("да", "д", "ага", "ок", "хорошо", "yes", "y"):
             info = MODEL_EXTRA_PENDING.pop(uid, None) or {}
             kind = (info.get("kind") or "generic").lower()
+
             if kind == "table_more":
+                # doc_id могли сохранить в момент вопроса «опиши подробнее»
+                doc_id_for_pending = info.get("doc_id") or doc_id
+
+                # если почему-то doc_id не удалось восстановить — падаем в общий [модель]
+                if not doc_id_for_pending:
+                    await _answer_with_model_extra(
+                        m,
+                        uid,
+                        info.get("question") or "",
+                    )
+                    return
+
                 await _answer_with_model_extra_table(
                     m,
                     uid,
+                    doc_id_for_pending,
                     info.get("question") or "",
                     info.get("ctx_tables") or "",
                     info.get("nums") or [],
@@ -5206,13 +5254,6 @@ async def qa(m: types.Message):
                     uid,
                     info.get("question") or "",
                 )
-            return
-        if low in ("нет", "не", "no", "n", "не надо"):
-            MODEL_EXTRA_PENDING.pop(uid, None)
-            await _send(
-                m,
-                "Хорошо, тогда на какие вопросы по документу я ещё могу ответить для тебя?"
-            )
             return
         # любая другая реплика сбрасывает ожидание и идёт по обычному пути
         MODEL_EXTRA_PENDING.pop(uid, None)
