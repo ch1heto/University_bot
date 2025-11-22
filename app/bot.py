@@ -1224,8 +1224,22 @@ def _table_num_variants(num: str) -> list[str]:
 
 
 def _shorten(s: str, limit: int = 120) -> str:
-    # Ничего не режем — возвращаем как есть.
-    return (s or "").strip()
+    """
+    Аккуратно обрезаем строку до limit символов с троеточием.
+    Стараемся резать по границе слова.
+    """
+    s = (s or "").strip()
+    if len(s) <= limit:
+        return s
+
+    # пытаемся резать по пробелу, чтобы не рубить слово пополам
+    cut = s.rfind(" ", 0, limit)
+    # если пробел слишком рано (или вообще не найден) — режем ровно по лимиту
+    if cut < max(10, limit // 2):
+        cut = limit
+
+    return s[:cut].rstrip(" .,;:–-") + "…"
+
 
 
 
@@ -3511,14 +3525,12 @@ async def _answer_table_query(
             len(fig_records) if fig_records else 0,
         )
         if fig_records:
-            # достаём точные значения как в документе
             values_text = _fig_values_text_from_records(fig_records, need_values=True)
             if values_text:
                 blocks.append(
                     f"Таблица {n} (в документе оформлена как диаграмма/рисунок):\n"
                     f"{values_text}"
                 )
-                # и сразу обновим LAST_REF, чтобы «опиши подробнее» понималось
                 try:
                     LAST_REF.setdefault(uid, {})["figure_nums"] = [r["num"] for r in fig_records]
                 except Exception:
@@ -3532,16 +3544,22 @@ async def _answer_table_query(
         else:
             missing.append(n)
 
-
     if not blocks:
         # ничего не смогли собрать ни из OOXML, ни из OCR/диаграмм
+        bad = ", ".join(missing or nums)
         await _send(
             m,
-            f"Таблица {', '.join(nums)} в документе не найдена. "
+            f"Таблица {bad} в документе не найдена. "
             "Проверь, правильно ли указан номер."
         )
         return True  # считаем запрос обработанным, дальше по пайплайну не идём
 
+    # если часть таблиц не найдена — явно предупреждаем об этом в ответе
+    if missing:
+        blocks.append(
+            "⚠️ По следующим таблицам данных в документе не найдено: "
+            + ", ".join(missing)
+        )
 
     ctx_tables = "\n\n---\n\n".join(blocks)
 
@@ -3622,10 +3640,9 @@ async def _answer_table_query(
         "отдельным подпунктом «Примечание» и не сокращай текст."
     )
 
-
-
-        # В режиме "подробнее" прямо говорим, что нужен более развёрнутый разбор
+    # В режиме "подробнее" прямо говорим, что нужен более развёрнутый разбор
     if mode == "more":
+
         user_prompt = (
             f"Вопрос пользователя: {text}\n\n"
             "Ниже структура таблиц в машинно-читаемом виде и дополнительный текст из работы. "
@@ -4812,16 +4829,18 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
     # для коротких реплик вида «опиши подробнее», «расскажи про него»
     q_text = _expand_with_last_referent(uid, q_text)
 
-    # НОВОЕ: быстрый путь для запросов про таблицы
     # Примеры: "опиши таблицу 4", "что показывает таблица 2.3", "сделай выводы по таблице 4"
     if _is_pure_table_request(q_text):
         verbosity = _detect_verbosity(q_text)
-        mode = "more" if _FOLLOWUP_MORE_RE.match(orig_q_text or "") else "normal"
+        base_text = (orig_q_text or "")
+        # используем search, чтобы ловить "… опиши подробнее …" в середине фразы
+        mode = "more" if _FOLLOWUP_MORE_RE.search(base_text) else "normal"
         handled = await _answer_table_query(
             m, uid, doc_id, q_text, verbosity=verbosity, mode=mode
         )
         if handled:
             return
+
         # если _answer_table_query не смог ответить (таблица не нашлась в OOXML/картинке),
 
 
