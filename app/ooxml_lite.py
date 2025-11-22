@@ -73,7 +73,6 @@ class Figure:
     para_idx: int = field(default=-1)
 
 
-
 @dataclass
 class Table:
     rows: List[List[str]]
@@ -82,7 +81,6 @@ class Table:
     _order: int = field(default=0)
     # индекс параграфа, рядом с которым встретилась таблица
     para_idx: int = field(default=-1)
-
 
 def _read_xml(z: ZipFile, path: str) -> etree._Element:
     data = z.read(path)
@@ -110,6 +108,33 @@ def _doc_rels(z: ZipFile, rels_path: str) -> Dict[str, Dict[str, str]]:
 
 def _ensure_dir(p: str) -> None:
     os.makedirs(p, exist_ok=True)
+
+def _split_caption_num_tail(caption: Optional[str], *, is_table: bool = False) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Из подписи вида 'Рисунок 2.3 — Структура системы'
+    достаём:
+      caption_num  -> '2.3' (нормализованный вид)
+      caption_tail -> 'Структура системы'
+    Для таблиц работает аналогично.
+    """
+    if not caption:
+        return None, None
+    cap = caption.strip()
+    if not cap:
+        return None, None
+
+    m = (TAB_CAP_RE if is_table else FIG_CAP_RE).match(cap)
+    if not m:
+        return None, None
+
+    num_raw = (m.group(1) or "").strip()
+    num_norm = _norm_label_num(num_raw)
+    # хвост — всё после номера, чистим разделители
+    tail = cap[m.end(1):].lstrip(" .—–-:\u2013\u2014")
+    if not tail:
+        tail = None
+    # caption_num теперь сразу в каноническом виде ("2.3")
+    return num_norm or num_raw or None, tail
 
 
 def _iter_body_children(doc: etree._Element):
@@ -947,38 +972,12 @@ def _parse_chart_data(z: ZipFile, chart_xml_path: str) -> Dict:
         "provenance": {"chart_xml": chart_xml_path, "used": used_source},
     }
 
-def _split_caption_num_tail(caption: Optional[str], *, is_table: bool = False) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Из подписи вида 'Рисунок 2.3 — Структура системы'
-    достаём:
-      caption_num  -> '2.3' (нормализованный вид)
-      caption_tail -> 'Структура системы'
-    Для таблиц работает аналогично.
-    """
-    if not caption:
-        return None, None
-    cap = caption.strip()
-    if not cap:
-        return None, None
-
-    m = (TAB_CAP_RE if is_table else FIG_CAP_RE).match(cap)
-    if not m:
-        return None, None
-
-    num_raw = (m.group(1) or "").strip()
-    num_norm = _norm_label_num(num_raw)
-    # хвост — всё после номера, чистим разделители
-    tail = cap[m.end(1):].lstrip(" .—–-:\u2013\u2014")
-    if not tail:
-        tail = None
-    # caption_num теперь сразу в каноническом виде ("2.3")
-    return num_norm or num_raw or None, tail
-
 
 def build_index(docx_path: str) -> Dict:
     doc_id = uuid.uuid4().hex[:8]
     _ensure_dir(MEDIA_ROOT)
     _ensure_dir(INDEX_ROOT)
+
     with ZipFile(docx_path) as z:
         doc = _read_xml(z, "word/document.xml")
         docrels = _doc_rels(z, "word/_rels/document.xml.rels")
@@ -999,7 +998,9 @@ def build_index(docx_path: str) -> Dict:
                 lvl = _extract_heading_level(node)
                 if lvl and txt:
                     headings.append(Heading(level=lvl, text=txt))
+
                 if txt:
+                    # подписи к рисункам
                     m_fig = FIG_CAP_RE.match(txt)
                     if m_fig:
                         raw_num = (m_fig.group(1) or "").strip()
@@ -1014,6 +1015,7 @@ def build_index(docx_path: str) -> Dict:
                             # запоминаем не только номер, но и индекс параграфа
                             fig_captions.append((p_index, num_int, txt))
 
+                    # подписи к таблицам
                     m_tab = TAB_CAP_RE.match(txt)
                     if m_tab:
                         raw_num = (m_tab.group(1) or "").strip()
@@ -1026,16 +1028,18 @@ def build_index(docx_path: str) -> Dict:
                         if num_int is not None:
                             tab_captions.append((p_index, num_int, txt))
 
-
+                # рисунки / диаграммы в этом параграфе
                 drawings = node.findall(".//w:drawing", namespaces=NS)
                 for d in drawings:
                     kind: Optional[str] = None
                     image_path: Optional[str] = None
                     chart_block: Optional[Dict[str, Any]] = None
+
                     gdata = d.find(".//a:graphic/a:graphicData", namespaces=NS)
                     if gdata is None:
                         continue
                     uri = gdata.get("uri", "")
+
                     if uri.endswith("/chart"):
                         cnode = gdata.find(".//c:chart", namespaces=NS)
                         if cnode is not None:
@@ -1046,14 +1050,10 @@ def build_index(docx_path: str) -> Dict:
                                     os.path.join("word", tgt)
                                 ).replace("\\", "/")
                                 if chart_xml in z.namelist():
-                                    chart_block = _parse_chart_data(
-                                        z, chart_xml
-                                    )
+                                    chart_block = _parse_chart_data(z, chart_xml)
                                     kind = "chart"
                     else:
-                        blip = d.find(
-                            ".//pic:pic/pic:blipFill/a:blip", namespaces=NS
-                        )
+                        blip = d.find(".//pic:pic/pic:blipFill/a:blip", namespaces=NS)
                         if blip is None:
                             blip = d.find(".//a:blip", namespaces=NS)
                         rid = (
@@ -1066,6 +1066,7 @@ def build_index(docx_path: str) -> Dict:
                             image_path = _save_image_from_rel(z, tgt, doc_id)
                             if image_path:
                                 kind = "image"
+
                     if kind:
                         figures.append(
                             Figure(
@@ -1078,8 +1079,10 @@ def build_index(docx_path: str) -> Dict:
                         )
                         content_seq.append(("figure", fig_idx))
                         fig_idx += 1
+
                 content_seq.append(("p", p_index))
                 p_index += 1
+
             elif node.tag.endswith("tbl"):
                 rows = _parse_tbl(node, limit_rows=MAX_TABLE_ROWS)
                 # привязываем таблицу к текущему p_index (последний параграф выше)
@@ -1088,11 +1091,8 @@ def build_index(docx_path: str) -> Dict:
                 content_seq.append(("table", tbl_idx))
                 tbl_idx += 1
 
-
-        # пронумеруем фигуры/таблицы по подписям
-                # пронумеруем фигуры/таблицы по подписям:
-        # для каждой фигуры ищем ближайшую по индексу параграфа подпись "Рисунок N"
-        used_fig_caps = set()
+        # --- пронумеруем фигуры по подписям ---
+        used_fig_caps: set[int] = set()
         for fig in figures:
             best = None
             best_dist = 10**9
@@ -1109,6 +1109,7 @@ def build_index(docx_path: str) -> Dict:
                     best_dist = dist
                     best = (cap_n, cap_txt)
                     best_idx = idx
+
             # ограничиваемся небольшой "окрестностью" по тексту, чтобы не хватать чужие подписи
             if best is not None and best_dist <= 3 and best_idx is not None:
                 cap_p_idx = fig_captions[best_idx][0]
@@ -1117,9 +1118,11 @@ def build_index(docx_path: str) -> Dict:
                     used_fig_caps.add(best_idx)
                 else:
                     fig.n = (fig.n or (fig._order + 1))
+            else:
+                fig.n = (fig.n or (fig._order + 1))
 
-
-        used_tab_caps = set()
+        # --- пронумеруем таблицы по подписям ---
+        used_tab_caps: set[int] = set()
         for tbl in tables:
             best = None
             best_dist = 10**9
@@ -1135,14 +1138,13 @@ def build_index(docx_path: str) -> Dict:
                     best_dist = dist
                     best = (cap_n, cap_txt)
                     best_idx = idx
-            if best is not None and best_dist <= 3:
+            if best is not None and best_dist <= 3 and best_idx is not None:
                 tbl.n, tbl.caption = best
                 used_tab_caps.add(best_idx)
             else:
                 tbl.n = (tbl.n or (tbl._order + 1))
 
-
-        # список литературы
+        # --- список литературы ---
         references: List[str] = []
         paras = doc.findall(".//w:p", namespaces=NS)
         ref_mode = False
@@ -1195,7 +1197,6 @@ def build_index(docx_path: str) -> Dict:
 
             index["figures"].append(entry)
 
-
         def _tbl_sort_key(t: Table):
             return (t.n if isinstance(t.n, int) else 10**9, t._order)
 
@@ -1217,6 +1218,7 @@ def build_index(docx_path: str) -> Dict:
         idx_path = os.path.join(INDEX_ROOT, f"{doc_id}.json")
         with open(idx_path, "w", encoding="utf-8") as f:
             json.dump(index, f, ensure_ascii=False, indent=2, default=_json_default)
+
         return index
 
 
@@ -1356,28 +1358,42 @@ def figure_lookup(index: Dict, n: Any) -> Optional[Dict]:
 
     figures = index.get("figures", []) or []
 
+    def _with_values_text(f: Dict[str, Any]) -> Dict[str, Any]:
+        res = dict(f)
+        rows = (
+            res.get("chart_data")
+            or (res.get("chart") or {}).get("chart_data")
+            or (res.get("chart") or {}).get("data")
+        )
+        if isinstance(rows, list) and rows:
+            res["values_text"] = _chart_rows_to_text(rows)
+        return res
+
     # 1) пробуем совпадение по caption_num (полный номер "2.3")
     if norm is not None:
         for f in figures:
             cap = f.get("caption_num")
             if _norm_label_num(cap) == norm:
-                res = dict(f)
-                rows = (
-                    res.get("chart_data")
-                    or (res.get("chart") or {}).get("chart_data")
-                    or (res.get("chart") or {}).get("data")
-                )
-                if isinstance(rows, list) and rows:
-                    res["values_text"] = _chart_rows_to_text(rows)
-                return res
+                return _with_values_text(f)
+
+    # 2) фолбэк по целой части номера (старое поведение "Рисунок 2")
+    if num_int is not None:
+        for f in figures:
+            if f.get("n") == num_int:
+                return _with_values_text(f)
 
     return None
+
 
 def table_lookup(index: Dict, n: Any) -> Optional[Dict]:
     """
     Поиск таблицы по номеру.
     Понимает и int, и строки '3.2', 'Таблица 3.2' и т.п.
     Основной ключ — caption_num, фолбэк — целая часть n.
+
+    Если обычной таблицы нет, пробуем найти рисунок/диаграмму
+    с подписью вида "Таблица 6 ..." и вернуть её как таблицу-
+    заглушку (с полями caption/image_path/chart/chart_data).
     """
     norm = _norm_label_num(n)
 
@@ -1402,13 +1418,81 @@ def table_lookup(index: Dict, n: Any) -> Optional[Dict]:
             if _norm_label_num(cap) == norm:
                 return t
 
-    # 2) фолбэк по целой части
+    # 2) фолбэк по целой части ("3" из "3.2")
     if num_int is not None:
         for t in tables:
             if t.get("n") == num_int:
                 return t
 
+    # 3) Fallback: таблица вставлена как рисунок/диаграмма
+    figures = index.get("figures", []) or []
+
+    # 3.1. Пытаемся сопоставить по нормализованному номеру из подписи
+    if norm is not None:
+        for f in figures:
+            cap = f.get("caption") or ""
+            if not cap:
+                continue
+            # Парсим подпись как "табличную"
+            cap_num, cap_tail = _split_caption_num_tail(cap, is_table=True)
+            if _norm_label_num(cap_num) == norm:
+                return {
+                    "n": f.get("n"),
+                    "label": _norm_label_num(cap_num),
+                    "caption": cap,
+                    "caption_num": cap_num,
+                    "caption_tail": cap_tail,
+                    # настоящих строк нет — это картинка/диаграмма
+                    "rows": [],
+                    # полезные поля, если захотите дальше описывать диаграмму
+                    "image_path": f.get("image_path"),
+                    "chart": f.get("chart"),
+                    "chart_data": f.get("chart_data"),
+                    "from_figure": True,
+                }
+
+    # 3.2. Фолбэк по целой части номера + слово "таблица" в подписи
+    if num_int is not None:
+        for f in figures:
+            if f.get("n") != num_int:
+                continue
+            cap = (f.get("caption") or "").lower()
+            if "таблица" in cap or "табл." in cap:
+                cap_num, cap_tail = _split_caption_num_tail(
+                    f.get("caption") or "", is_table=True
+                )
+                return {
+                    "n": f.get("n"),
+                    "label": _norm_label_num(cap_num or num_int),
+                    "caption": f.get("caption"),
+                    "caption_num": cap_num,
+                    "caption_tail": cap_tail,
+                    "rows": [],
+                    "image_path": f.get("image_path"),
+                    "chart": f.get("chart"),
+                    "chart_data": f.get("chart_data"),
+                    "from_figure": True,
+                }
+    # 🔥 4) Новый главный фолбэк — таблица как картинка БЕЗ подписи
+    # ищем фигуру рядом в потоке, предполагая таблицу по позиции
+    if num_int is not None:
+        for f in figures:
+            if f.get("n") == num_int:
+                return {
+                    "n": f.get("n"),
+                    "label": _norm_label_num(num_int),
+                    "caption": None,
+                    "caption_num": None,
+                    "caption_tail": None,
+                    "rows": [],
+                    "image_path": f.get("image_path"),
+                    "chart": f.get("chart"),
+                    "chart_data": f.get("chart_data"),
+                    "from_figure": True,
+                }
+
     return None
+
 
 
 def purge_media(doc_id: str) -> None:

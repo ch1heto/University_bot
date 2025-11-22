@@ -1230,10 +1230,12 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                 else:
                     pending_tbl_tail = None
                     awaiting_tail = True
-                if awaiting_tail and last_title_candidate and last_title_candidate_age <= 1:
+                # позволяем хвосту быть не строго следующим блоком, а с одним "посредником" (пустой абзац и т.п.)
+                if awaiting_tail and last_title_candidate and last_title_candidate_age <= 2:
                     pending_tbl_tail = consume_title_candidate()
                     awaiting_tail = False
                 continue
+
             elif kind == "figure":
                 if (not tail) and last_title_candidate and last_title_candidate_age <= 1:
                     tail = consume_title_candidate()
@@ -1386,12 +1388,13 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                 if pending_tbl_tail:
                     tail_final = pending_tbl_tail
                     caption_source = "single_line" if not awaiting_tail else "two_lines_after"
-                elif last_title_candidate and last_title_candidate_age <= 1:
+                elif last_title_candidate and last_title_candidate_age <= 2:
                     tail_final = consume_title_candidate()
                     caption_source = "two_lines_after"
-            elif last_title_candidate and last_title_candidate_age <= 1:
+            elif last_title_candidate and last_title_candidate_age <= 2:
                 tail_final = consume_title_candidate()
                 caption_source = "two_lines_before"
+
 
             t_text = _table_to_text(block) or "(пустая таблица)"
             attrs_tbl = _table_attrs(block) | {"numbers": _extract_numbers(t_text)}
@@ -1410,6 +1413,11 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
             attrs_tbl["section_scope"] = _current_scope_path()
             attrs_tbl["section_scope_id"] = _current_scope_id()
             attrs_tbl["anchor"] = f"tbl-{(num_final or table_counter)}"
+
+            # Явно помечаем происхождение таблицы
+            attrs_tbl["origin"] = "docx"
+            attrs_tbl["source"] = "docx_table"
+            attrs_tbl["is_table"] = True
 
             sections.append({
                 "title": t_title or f"Таблица {table_counter}",

@@ -56,6 +56,7 @@ try:
         chat_with_gpt,
         chat_with_gpt_stream,
         vision_extract_values,
+        vision_extract_table_values,      # ← НОВОЕ: спец-функция для таблиц-картинок
         # NEW: мультимодальные обёртки (текст + картинки)
         chat_with_gpt_multimodal,
         chat_with_gpt_stream_multimodal,
@@ -72,9 +73,14 @@ except Exception:
     from .polza_client import probe_embedding_dim, chat_with_gpt  # type: ignore
     chat_with_gpt_stream = None
     vision_extract_values = None  # фолбэк: если нет функции, не падаем
+
+    # ← НОВОЕ: если спец-функции для таблиц-картинок нет, просто отключаем её
+    vision_extract_table_values = None  # type: ignore
+
     # NEW: мягкие фолбэки
     chat_with_gpt_multimodal = None  # type: ignore
     chat_with_gpt_stream_multimodal = None  # type: ignore
+
 
     # безопасные заглушки для figures, чтобы остальной код не падал
     fig_index_document = None       # type: ignore
@@ -91,6 +97,7 @@ except Exception:
             or rec.get("num")
             or "Рисунок"
         )
+
 
 
 
@@ -144,11 +151,8 @@ MULTI_STEP_FINAL_MERGE: bool = getattr(Cfg, "MULTI_STEP_FINAL_MERGE", True)
 MULTI_STEP_PAUSE_MS: int = getattr(Cfg, "MULTI_STEP_PAUSE_MS", 120)  # м/у блоками
 MULTI_PASS_SCORE: int = getattr(Cfg, "MULTI_PASS_SCORE", 85)         # порог критика в ace
 
-# --------------------- форматирование и отправка ---------------------
 
-# Markdown → HTML (минимально-необходимое: **bold**, __bold__, *italic*, _italic_, `code`)
 # --------------------- форматирование и отправка ---------------------
-
 # Markdown → HTML (минимально-необходимое: заголовки, **bold**, *italic*, `code`)
 _MD_H_RE       = re.compile(r"(?m)^\s{0,3}#{1,6}\s+(.+?)\s*$")
 _MD_BOLD_RE    = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
@@ -457,12 +461,26 @@ def _pick_images_from_hits(hits: list[dict], limit: int = 3) -> list[str]:
     acc: list[str] = []
     for h in hits or []:
         attrs = (h.get("attrs") or {})
+
+        # 1) стандартный путь: attrs.images
         for p in (attrs.get("images") or []):
             if p and os.path.exists(p) and p not in acc:
                 acc.append(p)
             if len(acc) >= limit:
                 return acc
+
+        # 2) фолбэк: иногда путь лежит прямо в самом хите
+        for p in (
+            h.get("image_path"),
+            h.get("image"),
+        ):
+            if p and os.path.exists(p) and p not in acc:
+                acc.append(p)
+            if len(acc) >= limit:
+                return acc
+
     return acc
+
 
 def _pairs_to_bullets(pairs: list[dict]) -> str:
     """
@@ -993,6 +1011,8 @@ ACTIVE_DOC: dict[int, int] = {}  # user_id -> doc_id
 LAST_REF: dict[int, dict] = {}   # {uid: {"figure_nums": list[str], "area": "3.2"}}
 FIG_INDEX: dict[int, dict] = {}
 OOXML_INDEX: dict[int, dict] = {}
+# NEW: кеш для распознанных «таблиц-картинок» (doc_id, num) -> текстовый блок
+_OCR_TABLE_CACHE: dict[tuple[int, str], str] = {}
 
 # NEW: ждём ли от пользователя «да/нет» на предложение ответа от [модель]
 MODEL_EXTRA_PENDING: dict[int, dict] = {}   # {uid: {"question": str}}
@@ -1113,10 +1133,11 @@ _TABLE_TITLE_RE = re.compile(r"(?i)\bтаблица\s+(\d+(?:[.,]\d+)*|[a-zа-я
 _COUNT_HINT = re.compile(r"\bсколько\b|how many", re.IGNORECASE)
 _WHICH_HINT = re.compile(r"\bкаки(е|х)\b|\bсписок\b|\bперечисл\w*\b|\bназов\w*\b", re.IGNORECASE)
 
-# НОВОЕ: вытаскиваем номер таблицы из запроса вида "опиши таблицу 4", "что показывает таблица 2.3" и т.п.
+# НОВОЕ: поддерживаем "таблица 6", "табл. 6", "table 6.1" и т.п.
 _TABLE_NUM_IN_TEXT_RE = re.compile(
-    r"(?i)\bтаблиц[а-я]*\s+([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)"
+    r"(?i)\b(?:таблиц[а-я]*|табл\.?|table)\s*([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)"
 )
+
 
 def _extract_table_nums(text: str) -> list[str]:
     """Достаём все номера таблиц из фразы пользователя."""
@@ -1185,6 +1206,23 @@ def _parse_table_title(text: str) -> tuple[str | None, str | None]:
     title = (m.group(2) or "").strip() or None
     return (num, title)
 
+def _table_num_variants(num: str) -> list[str]:
+    """
+    Делаем несколько вариантов написания номера таблицы:
+    6.1 ↔ 6,1; убираем пробелы.
+    Нужны, чтобы находить таблицу даже если в вопросе точка,
+    а в тексте запятая (или наоборот).
+    """
+    raw = (str(num) or "").strip()
+    if not raw:
+        return []
+    base = raw.replace(" ", "")
+    dot = base.replace(",", ".")
+    comma = base.replace(".", ",")
+    variants = {base, dot, comma}
+    return [v for v in variants if v]
+
+
 def _shorten(s: str, limit: int = 120) -> str:
     # Ничего не режем — возвращаем как есть.
     return (s or "").strip()
@@ -1197,27 +1235,54 @@ def _distinct_table_basenames(uid: int, doc_id: int) -> list[str]:
     """
     Собираем «базовые» имена таблиц (section_path без хвоста ' [row …]').
     Работает и с новыми индексами (table_row) и со старыми.
+
+    НОВОЕ:
+    - если есть колонка attrs и парсер проставил is_table=true,
+      считаем «живыми» только такие таблицы;
+    - старые документы без attrs / без is_table продолжают учитываться как раньше.
     """
     con = get_conn()
     cur = con.cursor()
 
+    has_et    = _table_has_columns(con, "chunks", ["element_type"])
+    has_attrs = _table_has_columns(con, "chunks", ["attrs"])
+
     # сначала пробуем опереться на типы
-    if _table_has_columns(con, "chunks", ["element_type"]):
-        cur.execute(
-            """
-            SELECT DISTINCT
-                CASE
-                    WHEN instr(section_path, ' [row ')>0
-                        THEN substr(section_path, 1, instr(section_path,' [row ')-1)
-                    ELSE section_path
-                END AS base_name
-            FROM chunks
-            WHERE doc_id=? AND owner_id=? AND element_type IN ('table','table_row')
-            """,
-            (doc_id, uid),
-        )
+    if has_et:
+        if has_attrs:
+            # только "настоящие" DOCX-таблицы (или старые записи без attrs)
+            cur.execute(
+                """
+                SELECT DISTINCT
+                    CASE
+                        WHEN instr(section_path, ' [row ')>0
+                            THEN substr(section_path, 1, instr(section_path,' [row ')-1)
+                        ELSE section_path
+                    END AS base_name
+                FROM chunks
+                WHERE doc_id=? AND owner_id=?
+                  AND element_type IN ('table','table_row')
+                  AND (attrs IS NULL OR attrs LIKE '%"is_table": true%')
+                """,
+                (doc_id, uid),
+            )
+        else:
+            # очень старый индекс без attrs — поведение как раньше
+            cur.execute(
+                """
+                SELECT DISTINCT
+                    CASE
+                        WHEN instr(section_path, ' [row ')>0
+                            THEN substr(section_path, 1, instr(section_path,' [row ')-1)
+                        ELSE section_path
+                    END AS base_name
+                FROM chunks
+                WHERE doc_id=? AND owner_id=? AND element_type IN ('table','table_row')
+                """,
+                (doc_id, uid),
+            )
     else:
-        # очень старый индекс — эвристика
+        # очень старый индекс — эвристика по тексту/section_path
         cur.execute(
             """
             SELECT DISTINCT
@@ -1553,6 +1618,32 @@ def _ooxml_get_index(doc_id: int) -> dict | None:
     return None
 
 
+# Небольшой хелпер: понять, что подпись больше похожа на «таблицу», а не на обычный рисунок
+_TABLE_CAPTION_HINT_RE = re.compile(
+    r"(?i)\bтаблиц\w*|\bтабл\.\b|\bтаблица\w*|(?:^|\s)table(s)?\b"
+)
+
+def _looks_like_table_caption(rec: dict) -> bool:
+    """
+    Эвристика: запись похожа на таблицу, если:
+      — явно указаны тип/вид 'table/таблица' ИЛИ
+      — в caption/title/name есть слово «таблица»/«table».
+    Используется только для отбора кандидатов в _ooxml_find_table_image.
+    """
+    if not isinstance(rec, dict):
+        return False
+
+    kind = str(rec.get("kind") or rec.get("type") or "").lower()
+    if "table" in kind or "таблиц" in kind:
+        return True
+
+    cap = (rec.get("caption") or rec.get("title") or rec.get("name") or "").strip()
+    if not cap:
+        return False
+
+    return bool(_TABLE_CAPTION_HINT_RE.search(cap))
+
+
 def _ooxml_find_figure_by_label(idx: dict, num_str: str) -> dict | None:
     """
     Ищем запись о рисунке по номеру вида '2.3' из подписи.
@@ -1571,6 +1662,235 @@ def _ooxml_find_figure_by_label(idx: dict, num_str: str) -> dict | None:
         if cap_num == target:
             return f
     return None
+
+
+# NEW: поиск «таблицы-картинки» по подписи "Таблица N ..."
+# NEW: поиск «таблицы-картинки» по подписи "Таблица N ..."
+def _ooxml_find_table_image(idx: dict, num: str) -> dict | None:
+    """
+    Ищем запись, соответствующую таблице {num}, которая вставлена картинкой.
+    Смотрим и в figures, и в tables (если там есть image_path).
+
+    ВАЖНО:
+      — из коллекции tables берём всё;
+      — из figures берём ТОЛЬКО записи, подпись которых выглядит как таблица
+        (_looks_like_table_caption), чтобы не перепутать с «Рисунок 6».
+
+    Приоритет:
+      1) точное совпадение по числовым полям (caption_num/label/num/n)
+         ТОЛЬКО среди «табличных» кандидатов;
+      2) совпадение по подписи 'Таблица {num} ...'.
+    """
+    if not idx:
+        return None
+
+    target = str(num).replace(" ", "").replace(",", ".")
+
+    def _iter_candidates():
+        """
+        Даём (kind, rec):
+          kind == 'tables'  → всегда считаем таблицей;
+          kind == 'figures' → используем только если подпись похожа на таблицу.
+        """
+        for kind in ("figures", "tables"):
+            coll = (idx.get(kind) or [])
+            if isinstance(coll, dict):
+                coll = list(coll.values())
+            if not isinstance(coll, list):
+                continue
+            for rec in coll:
+                if not isinstance(rec, dict):
+                    continue
+                # всё из tables берём без условий,
+                # а из figures — только «табличные» подписи
+                if kind == "figures" and not _looks_like_table_caption(rec):
+                    continue
+                yield kind, rec
+
+    # 1) Сначала пробуем по числовым полям (caption_num/label/num/n)
+    for _kind, rec in _iter_candidates():
+        for fld in ("caption_num", "label", "num", "n"):
+            raw = rec.get(fld)
+            if not raw:
+                continue
+            cand = str(raw).replace(" ", "").replace(",", ".")
+            if cand == target:
+                return rec
+
+    # 2) Фолбэк — по тексту подписи
+    for _kind, rec in _iter_candidates():
+        cap = (rec.get("caption") or rec.get("title") or rec.get("name") or "").strip()
+        if not cap:
+            continue
+        # "Таблица 6", "таблица 6 – ...", "Таблица 6. ..."
+        m = re.search(r"(?i)\bтаблиц\w*\s+(\d+(?:[.,]\d+)*)", cap)
+        if not m:
+            continue
+        cap_num = (m.group(1) or "").replace(" ", "").replace(",", ".")
+        if cap_num == target:
+            return rec
+
+    return None
+
+
+# NEW: OCR-фолбэк для таблиц, вставленных картинкой
+def _ocr_table_block_from_image(uid: int, doc_id: int, num: str) -> str | None:
+    key = (doc_id, str(num))
+    cached = _OCR_TABLE_CACHE.get(key)
+    if cached is not None:
+        logging.info("TAB[img] cache hit for doc=%s, table=%s", doc_id, num)
+        return cached
+
+    # 1) сначала пробуем OOXML-индекс
+    idx = _ooxml_get_index(doc_id)
+    if not idx:
+        logging.info("TAB[img] no OOXML index for doc=%s", doc_id)
+    rec = _ooxml_find_table_image(idx, num) if idx else None
+
+    img_path: str | None = None
+    if rec:
+        # 1) стандартные поля
+        img_path = rec.get("image_path") or rec.get("image")
+
+        # 2) иногда ooxml_lite кладёт список картинок
+        if not img_path:
+            imgs = rec.get("images") or rec.get("imgs") or []
+            if isinstance(imgs, (list, tuple)) and imgs:
+                img_path = imgs[0]
+
+        logging.info(
+            "TAB[img] OOXML candidate for table %s: image_path=%r",
+            num,
+            img_path,
+        )
+
+
+    # 2) если из OOXML ничего не получилось — пробуем достать картинку через retrieve(...)
+    if not img_path:
+        try:
+            logging.info("TAB[img] fallback retrieve() for table %s", num)
+            hits = retrieve(uid, doc_id, f"Таблица {num}", top_k=6)
+        except Exception as e:
+            logging.exception("TAB[img] retrieve() failed for table %s: %s", num, e)
+            hits = []
+
+        if hits:
+            paths = _pick_images_from_hits(hits, limit=1)
+            logging.info("TAB[img] retrieve() returned image paths=%r", paths)
+            if paths:
+                img_path = paths[0]
+
+    if not img_path or not os.path.isfile(img_path):
+        logging.info(
+            "TAB[img] no image found on disk for table %s (img_path=%r)",
+            num,
+            img_path,
+        )
+        return None
+
+    # общий список всех найденных пар значений
+    all_pairs: list[dict] = []
+    # дополнительные текстовые куски с изображения (в т.ч. «Примечание»)
+    extra_text_parts: list[str] = []
+
+    def _add_pairs(pairs: list[dict] | None) -> None:
+        """Аккуратно добавляем пары без грубых дублей по (label, value, unit)."""
+        nonlocal all_pairs
+        if not pairs:
+            return
+        seen = {(str(p.get("label") or "").strip(),
+                 str(p.get("value") or "").strip(),
+                 str(p.get("unit") or "").strip())
+                for p in all_pairs}
+        for p in pairs:
+            key_p = (
+                str(p.get("label") or "").strip(),
+                str(p.get("value") or "").strip(),
+                str(p.get("unit") or "").strip(),
+            )
+            if key_p in seen:
+                continue
+            seen.add(key_p)
+            all_pairs.append(p)
+
+    # 3.a) спец-функция по таблицам-картинкам
+    if vision_extract_table_values is not None:
+        try:
+            pairs1 = vision_extract_table_values(img_path, lang="ru") or []
+            _add_pairs(pairs1)
+        except Exception as e:
+            logging.exception(
+                "ocr_table_block_from_image: vision_extract_table_values failed for %s (table %s): %s",
+                img_path,
+                num,
+                e,
+            )
+
+    # 3.b) общий vision-анализ: и пары, и текст (часто содержит «Примечание»)
+    if va_analyze_figure is not None:
+        try:
+            try:
+                res = va_analyze_figure(
+                    img_path,
+                    caption_hint=f"Таблица {num}",
+                    lang="ru",
+                )
+            except TypeError:
+                res = va_analyze_figure(img_path, lang="ru")  # type: ignore
+
+            if isinstance(res, dict):
+                pairs2 = res.get("data") or []
+                _add_pairs(pairs2)
+                txt2 = (res.get("text") or "").strip()
+                if txt2:
+                    extra_text_parts.append(txt2)
+            else:
+                txt2 = (str(res) or "").strip()
+                if txt2:
+                    extra_text_parts.append(txt2)
+        except Exception as e:
+            logging.exception(
+                "ocr_table_block_from_image: va_analyze_figure failed for %s (table %s): %s",
+                img_path,
+                num,
+                e,
+            )
+
+    # 3.c) общий extractor пар label/value
+    if vision_extract_values is not None:
+        try:
+            pairs3 = vision_extract_values(img_path, lang="ru") or []
+            _add_pairs(pairs3)
+        except Exception as e:
+            logging.exception(
+                "ocr_table_block_from_image: vision_extract_values failed for %s (table %s): %s",
+                img_path,
+                num,
+                e,
+            )
+
+
+
+    values_block = _pairs_to_bullets(all_pairs) if all_pairs else ""
+    values_block = (values_block or "").strip()
+    extra_text = "\n".join(
+        t.strip() for t in extra_text_parts if t and t.strip()
+    )
+
+    if not values_block and not extra_text:
+        return None
+
+    lines: list[str] = [f"Таблица {num} (распознана по изображению):"]
+    if values_block:
+        lines.append(values_block)
+    if extra_text:
+        lines.append("")  # пустая строка
+        lines.append("[Текст с изображения]")
+        lines.append(extra_text)
+
+    out = "\n".join(lines).strip()
+    _OCR_TABLE_CACHE[key] = out
+    return out
 
 
 # ---------- verbatim fallback по цитате (шинглы + LIKE/NOCASE) ----------
@@ -2491,7 +2811,7 @@ def _build_figure_records(uid: int, doc_id: int, nums: list[str]) -> list[dict]:
                 if path and path not in rec["images"]:
                     rec["images"].append(path)
 
-        # --- 3) локальный индекс figures.py: путь к картинке + подпись ---
+                # --- 3) локальный индекс figures.py: путь к картинке + подпись ---
         if fig_idx:
             try:
                 recs = fig_find(fig_idx, number=orig) or fig_find(fig_idx, number=norm) or []
@@ -2509,8 +2829,7 @@ def _build_figure_records(uid: int, doc_id: int, nums: list[str]) -> list[dict]:
                 if not rec["near_text"] and cap_text:
                     rec["near_text"].append(cap_text)
 
-        # --- 4) chart_data из attrs (точные числовые значения) ---
-                # --- 4) chart_data из attrs (ТОЧНЫЕ числовые значения из OOXML) ---
+        # --- 4) chart_data из attrs (ТОЧНЫЕ числовые значения из OOXML) ---
         row = _fetch_figure_row_by_num(uid, doc_id, orig)
         if not row and norm != orig:
             row = _fetch_figure_row_by_num(uid, doc_id, norm)
@@ -2532,7 +2851,10 @@ def _build_figure_records(uid: int, doc_id: int, nums: list[str]) -> list[dict]:
             if not rec.get("raw_values"):
                 cd, _ctype, _attrs = _parse_chart_data(attrs_json)
                 if cd:
-                    categories = [str(r.get("label") or r.get("name") or r.get("category") or "") for r in cd]
+                    categories = [
+                        str(r.get("label") or r.get("name") or r.get("category") or "")
+                        for r in cd
+                    ]
                     values = []
                     for r in cd:
                         v = r.get("value")
@@ -2858,7 +3180,7 @@ def _ooxml_table_block(uid: int, doc_id: int, num: str) -> str | None:
             if body:
                 return f"Таблица {num} (сырые данные из документа):\n{body}"
 
-    # --- 2. Фолбэк: chunks из БД ---
+        # --- 2. Фолбэк: chunks из БД ---
     con = get_conn()
     cur = con.cursor()
 
@@ -2886,19 +3208,39 @@ def _ooxml_table_block(uid: int, doc_id: int, num: str) -> str | None:
 
         if not rows:
             # фолбэк по section_path / тексту, работает даже на старых индексах
-            cur.execute(
+            variants = _table_num_variants(num)
+            sec_patterns = []
+            txt_patterns = []
+
+            for v in variants:
+                # "Таблица 6", "таблица 6", "табл. 6"
+                sec_patterns.append(f"%Таблица {v}%")
+                sec_patterns.append(f"%таблица {v}%")
+                sec_patterns.append(f"%табл. {v}%")
+                # текстовый вариант типа "[Таблица] 6" и "[табл.] 6"
+                txt_patterns.append(f"[Таблица]%{v}%")
+                txt_patterns.append(f"[табл.]%{v}%")
+
+            if not sec_patterns and not txt_patterns:
+                rows = []
+            else:
+                conds_sec = " OR ".join(["section_path LIKE ? COLLATE NOCASE"] * len(sec_patterns)) if sec_patterns else "0"
+                conds_txt = " OR ".join(["text LIKE ? COLLATE NOCASE"] * len(txt_patterns)) if txt_patterns else "0"
+
+                sql = f"""
+                    SELECT section_path, text
+                    FROM chunks
+                    WHERE owner_id=? AND doc_id=?
+                      AND ( ({conds_sec}) OR ({conds_txt}) )
+                    ORDER BY page ASC, id ASC
                 """
-                SELECT section_path, text
-                FROM chunks
-                WHERE owner_id=? AND doc_id=?
-                  AND (section_path LIKE ? OR text LIKE ?)
-                ORDER BY id ASC
-                """,
-                (uid, doc_id, f'%Таблица {num}%', f'[Таблица]%{num}%'),
-            )
-            rows = cur.fetchall() or []
+
+                params = [uid, doc_id] + sec_patterns + txt_patterns
+                cur.execute(sql, params)
+                rows = cur.fetchall() or []
     finally:
         con.close()
+
 
     if not rows:
         return None
@@ -2939,31 +3281,43 @@ def _table_related_context(
     cur = con.cursor()
     has_et = _table_has_columns(con, "chunks", ["element_type"])
 
-    like1 = f"%Таблица {num}%"
-    like2 = f"%таблица {num}%"
+    variants = _table_num_variants(num)
+    txt_patterns = []
+    for v in variants:
+        txt_patterns.append(f"%Таблица {v}%")
+        txt_patterns.append(f"%таблица {v}%")
+        txt_patterns.append(f"%табл. {v}%")
+
+    if not txt_patterns:
+        cur.close()
+        con.close()
+        return ""
+
+    conds_txt = " OR ".join(["text LIKE ? COLLATE NOCASE"] * len(txt_patterns))
 
     if has_et:
         cur.execute(
-            """
+            f"""
             SELECT page, section_path, text, element_type
             FROM chunks
             WHERE owner_id=? AND doc_id=?
-              AND (text LIKE ? OR text LIKE ?)
+              AND ({conds_txt})
             ORDER BY page ASC, id ASC
             """,
-            (uid, doc_id, like1, like2),
+            (uid, doc_id, *txt_patterns),
         )
     else:
         cur.execute(
-            """
+            f"""
             SELECT page, section_path, text
             FROM chunks
             WHERE owner_id=? AND doc_id=?
-              AND (text LIKE ? OR text LIKE ?)
+              AND ({conds_txt})
             ORDER BY page ASC, id ASC
             """,
-            (uid, doc_id, like1, like2),
+            (uid, doc_id, *txt_patterns),
         )
+
 
     rows = cur.fetchall() or []
     con.close()
@@ -3042,42 +3396,70 @@ async def _answer_table_query(
     missing: list[str] = []
 
     for n in nums:
+        # 1) обычный путь: таблица из OOXML
         blk = _ooxml_table_block(uid, doc_id, n)
         if blk:
             blocks.append(blk)
+            continue
+
+        # 1a) НОВОЕ: попробуем найти "таблицу-рисунок" как диаграмму/рисунок
+        fig_records = _build_figure_records(uid, doc_id, [n])
+        logging.info(
+            "TAB[query] table %s as figure: %d records",
+            n,
+            len(fig_records) if fig_records else 0,
+        )
+        if fig_records:
+            # достаём точные значения как в документе
+            values_text = _fig_values_text_from_records(fig_records, need_values=True)
+            if values_text:
+                blocks.append(
+                    f"Таблица {n} (в документе оформлена как диаграмма/рисунок):\n"
+                    f"{values_text}"
+                )
+                # и сразу обновим LAST_REF, чтобы «опиши подробнее» понималось
+                try:
+                    LAST_REF.setdefault(uid, {})["figure_nums"] = [r["num"] for r in fig_records]
+                except Exception:
+                    pass
+                continue
+
+        # 2) fallback: настоящая OCR по картинке (если никаких chart_data нет)
+        ocr_blk = _ocr_table_block_from_image(uid, doc_id, n)
+        if ocr_blk:
+            blocks.append(ocr_blk)
         else:
             missing.append(n)
 
-    # если вообще ничего не нашли — честно говорим, что № нет в индексе,
-    # и НЕ перекладываем это на модель
-    if not blocks and missing:
-        await _send(
-            m,
-            "В OOXML-индексе документа не найдено таблиц с номерами: "
-            + ", ".join(missing)
-        )
-        return True
 
+    # Если по указанным номерам не удалось собрать структурированные данные
+    # (ни OOXML, ни картинка), не отвечаем «таблица не найдена», а
+    # отдаём вопрос в общий RAG-пайплайн.
     if not blocks:
-        # ничего не нашли и ничего не знаем — отдаём на обычный пайплайн
         return False
+
 
     ctx_tables = "\n\n---\n\n".join(blocks)
 
-    # Дополнительный текст по таблицам (для режима "подробнее")
+    # Дополнительный текст по таблицам (для обычного режима и "подробнее")
+    # В обычном ответе берём поменьше символов, в "подробнее" — побольше.
     extra_ctx_parts: list[str] = []
-    if mode == "more":
-        for n in nums:
-            extra = _table_related_context(uid, doc_id, n, max_chars=4000)
-            if extra:
-                extra_ctx_parts.append(
-                    f"[Дополнительный текст по таблице {n}]\n{extra}"
-                )
+    for n in nums:
+        extra = _table_related_context(
+            uid,
+            doc_id,
+            n,
+            max_chars=4000 if mode == "more" else 2000,
+        )
+        if extra:
+            extra_ctx_parts.append(
+                f"[Дополнительный текст по таблице {n}]\n{extra}"
+            )
 
     extra_ctx = "\n\n---\n\n".join(extra_ctx_parts).strip()
 
     # Если это запрос «подробнее», но в самой работе НЕТ доп. текста про эту таблицу,
-    # мы сохраняем сырые данные таблицы и предлагаем расширенный ответ от [модель],
+    # мы сохраняем сырые данные таблиц и предлагаем расширенный ответ от [модель],
     # который будет опираться на ЭТИ данные.
     if mode == "more" and not extra_ctx:
         nums_str = ", ".join(nums)
@@ -3085,7 +3467,7 @@ async def _answer_table_query(
             "kind": "table_more",
             # сам вопрос пользователя (чаще всего «опиши подробнее (таблица N)»)
             "question": text,
-            # сырые данные таблиц из OOXML — чтобы [модель] их видела
+            # сырые данные таблиц из OOXML/картинки — чтобы [модель] их видела
             "ctx_tables": ctx_tables,
             "nums": nums,
         }
@@ -3097,6 +3479,7 @@ async def _answer_table_query(
             "Если нужно — напиши «да», если не нужно — «нет»."
         )
         return True
+
 
     # Общий контекст для GPT: сырые данные таблиц +, при наличии, доп. текст
     full_ctx = ctx_tables
@@ -3402,11 +3785,12 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
                 })
             con.close()
 
-        # запишем даже если список пустой — генератор ответа это учтёт
+        # Общий список таблиц с кратким описанием
         facts["tables"]["describe"] = desc_cards
-        # describe по конкретным номерам + точные расчеты
-        desc_cards = []
+
+        # describe по конкретным номерам + точные расчеты (перезаписываем describe, если запрос конкретный)
         if intents.get("tables", {}).get("describe"):
+            desc_cards = []
             con = get_conn()
             cur = con.cursor()
             for num in intents["tables"]["describe"]:
@@ -3513,6 +3897,11 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
                     lang="ru",
                     vision_first_image_only=True,
                 ) or []
+                logging.info(
+                    "FIG: получено %d рисунков для номеров %s",
+                    len(cards),
+                    ", ".join(map(str, nums)),
+                )
 
                 if not cards:
                     figs_block["describe_lines"] = ["Данного рисунка нет в работе."]
@@ -3624,12 +4013,14 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
     # ----- Общий контекст / цитаты -----
     # app/bot.py (_gather_facts: общий контекст / цитаты)
     if intents.get("general_question"):
-        vb = verbatim_find(uid, doc_id, intents["general_question"], max_hits=3)
+        question_text = intents.get("general_question") or ""
+
+        vb = verbatim_find(uid, doc_id, question_text, max_hits=3)
 
         cov = retrieve_coverage(
             owner_id=uid,
             doc_id=doc_id,
-            question=intents["general_question"],
+            question=question_text,
         )
         ctx = ""
         if cov and cov.get("snippets"):
@@ -3639,9 +4030,9 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
             )
 
         if not ctx:
-            ctx = best_context(uid, doc_id, intents["general_question"], max_chars=6000)
+            ctx = best_context(uid, doc_id, question_text, max_chars=6000)
         if not ctx:
-            hits = retrieve(uid, doc_id, intents["general_question"], top_k=12)
+            hits = retrieve(uid, doc_id, question_text, top_k=12)
             if hits:
                 ctx = build_context(hits)
         if not ctx:
@@ -3658,12 +4049,12 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
                 for i, s in enumerate(cov["items"])
             ]
 
-                # --- [VISION] второй проход: числа из диаграмм/картинок (подмешиваем в контекст) ---
+        # --- [VISION] второй проход: числа из диаграмм/картинок (подмешиваем в контекст) ---
         try:
             vision_block = ""
-            if Cfg.vision_active():
+            if getattr(Cfg, "vision_active", lambda: False)():
                 # 1) берём топ-хиты специально для картинок
-                hits_v = retrieve(uid, doc_id, intents["general_question"], top_k=10) or []
+                hits_v = retrieve(uid, doc_id, question_text, top_k=10) or []
 
                 # 1а) если в хитах есть chart_data (DOCX-диаграммы) — используем точные числа, без vision
                 chart_lines: list[str] = []
@@ -3689,7 +4080,7 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
                     )
                     if img_paths and va_analyze_figure:
                         chunks: list[str] = []
-                        hint = (hits_v[0].get("text") or "")[:300]
+                        hint = question_text[:300]
                         for p in img_paths:
                             try:
                                 res = va_analyze_figure(p, caption_hint=hint, lang="ru")
@@ -3698,7 +4089,6 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
 
                             text_block = ""
                             if isinstance(res, dict):
-                                # ожидаемый формат: {"text": "...", "data": [...]}
                                 pairs = res.get("data") or []
                                 text_block = (res.get("text") or "").strip() or _pairs_to_bullets(pairs)
                             else:
@@ -3710,7 +4100,6 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
                         if chunks:
                             vision_block = "\n\n".join(chunks)
                         elif FIG_STRICT:
-                            # нет надёжных чисел с картинки — явно помечаем
                             vision_block = "[No precise data]"
 
             if vision_block:
@@ -3720,6 +4109,7 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
         except Exception:
             # не ломаем основной ответ, если vision дал сбой
             pass
+
         # --- [/VISION] ---
 
 
@@ -4217,9 +4607,12 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
     if await _maybe_run_gost(m, uid, doc_id, q_text):
         return
 
-    # NEW: подставляем последний объект (таблица/рисунок/пункт)
     # для коротких реплик вида «опиши подробнее», «расскажи про него»
     q_text = _expand_with_last_referent(uid, q_text)
+
+    # флаг: пытались ли мы обработать запрос как «чисто табличный»,
+    # но спец-обработчик _answer_table_query ничего не нашёл
+    force_general_from_table = False
 
     # НОВОЕ: быстрый путь для запросов про таблицы
     # Примеры: "опиши таблицу 4", "что показывает таблица 2.3", "сделай выводы по таблице 4"
@@ -4231,6 +4624,9 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
         )
         if handled:
             return
+        # сюда попадаем, если _answer_table_query НЕ смог ответить (таблица не нашлась
+        # ни в OOXML, ни как картинка) — дальше будем резать табличный интент
+        force_general_from_table = True
 
     # быстрый путь для запросов про рисунки
     if _is_pure_figure_request(q_text):
@@ -4238,6 +4634,7 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
         handled = await _answer_figure_query(m, uid, doc_id, q_text, verbosity=verbosity)
         if handled:
             return
+
 
     # РАНО в respond_with_answer, до detect_intents:
         # РАНО в respond_with_answer, до detect_intents:
@@ -4309,10 +4706,18 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
         except Exception:
             pass
 
-    # NEW: быстрый детерминированный путь для «поясни рисунок 2.1/3.4 …»
-    # --- Определяем интенты заранее
+        # --- Определяем интенты заранее
     intents = detect_intents(q_text)
     verbosity = _detect_verbosity(q_text)
+
+    # как до появления спец-обработчика таблиц.
+    if force_general_from_table and "tables" in intents:
+        try:
+            intents["tables"]["describe"] = []
+            intents["tables"]["want"] = False
+        except Exception:
+            # на всякий случай, чтобы не уронить пайплайн, если структура интентов другая
+            intents["tables"] = {"want": False, "describe": []}
 
     # Чистый запрос про конкретные рисунки (нет секций/таблиц/источников/общего вопроса)
     pure_figs = intents["figures"]["want"] and not (
@@ -4321,8 +4726,6 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
         _SECTION_NUM_RE.search(q_text)
     )
 
-    # Если запрос только про рисунки (например: «опиши рисунок 6» или «рисунки 5 и 6»),
-    # отключаем общий RAG-вопрос, чтобы в промпт не попали лишние куски текста
     # с упоминаниями других рисунков. Далее всё идёт через facts → answer_builder.
     if pure_figs and "general_question" in intents:
         intents["general_question"] = None
@@ -4452,24 +4855,6 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
             elif err:
                 await _send(m, err)
                 return
-
-
-    # ====== FULLREAD: direct ======
-    if fr_mode == "direct" and not pure_figs:
-        fr = _fullread_try_answer(uid, doc_id, q_text)
-        if isinstance(fr, tuple) and fr and fr[0] == "__STREAM__":
-            messages = json.loads(fr[1])
-            try:
-                stream = chat_with_gpt_stream(messages, temperature=0.2, max_tokens=FINAL_MAX_TOKENS)  # type: ignore
-                await _stream_to_telegram(m, stream)
-                return
-            except Exception as e:
-                logging.exception("direct fullread stream failed: %s", e)
-                # тихо падаем в обычный пайплайн
-        elif isinstance(fr, str) and fr:
-            await _send(m, _strip_unwanted_sections(fr))
-            return
-        # иначе — RAG ниже
 
     # ====== FULLREAD: iterative/digest ======
     if fr_mode in {"iterative", "digest"} and not pure_figs:
