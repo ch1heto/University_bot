@@ -129,7 +129,7 @@ STREAM_ENABLED: bool = getattr(Cfg, "STREAM_ENABLED", True)
 STREAM_EDIT_INTERVAL_MS: int = getattr(Cfg, "STREAM_EDIT_INTERVAL_MS", 900)  # как часто редактировать сообщение
 STREAM_MIN_CHARS: int = getattr(Cfg, "STREAM_MIN_CHARS", 120)               # мин. приращение между апдейтами
 STREAM_MODE: str = getattr(Cfg, "STREAM_MODE", "edit")                       # "edit" | "multi"
-TG_MAX_CHARS: int = getattr(Cfg, "TG_MAX_CHARS", 3900)
+TG_MAX_CHARS: int = getattr(Cfg, "TG_MAX_CHARS", 3400)
 FIG_MEDIA_LIMIT: int = getattr(Cfg, "FIG_MEDIA_LIMIT", 12)
 
 # ↓ Новое: управляем «много сообщений» даже когда не упираемся в 4096
@@ -608,15 +608,46 @@ async def _stream_to_telegram(m: types.Message, stream, head_text: str = "⌛️
                 except TelegramBadRequest:
                     pass
 
-        # финальный хвост
+
+            # финальный хвост
         if current_text:
-            try:
-                if STREAM_MODE == "multi" and sent_parts > 0:
-                    await m.answer(_to_html(current_text), parse_mode="HTML", disable_web_page_preview=True)
-                else:
-                    await initial.edit_text(_to_html(current_text), parse_mode="HTML", disable_web_page_preview=True)
-            except TelegramBadRequest:
-                await m.answer(_to_html(current_text), parse_mode="HTML", disable_web_page_preview=True)
+            # аккуратно режем остаток так же, как в нестримовом режиме
+            tail_parts = _split_multipart(current_text or "")
+
+            if STREAM_MODE == "multi" and sent_parts > 0:
+                # в multi-режиме после первой части всё остальное — отдельными сообщениями
+                for part in tail_parts:
+                    await m.answer(
+                        _to_html(part),
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+            else:
+                # в edit-режиме (или когда ещё не было частей) первый кусок пытаемся
+                # положить в initial, а остальное — отдельными сообщениями
+                first = True
+                for part in tail_parts:
+                    html_part = _to_html(part)
+                    if first:
+                        try:
+                            await initial.edit_text(
+                                html_part,
+                                parse_mode="HTML",
+                                disable_web_page_preview=True,
+                            )
+                        except TelegramBadRequest:
+                            await m.answer(
+                                html_part,
+                                parse_mode="HTML",
+                                disable_web_page_preview=True,
+                            )
+                        first = False
+                    else:
+                        await m.answer(
+                            html_part,
+                            parse_mode="HTML",
+                            disable_web_page_preview=True,
+                        )
 
     finally:
         stop_typer.set()
@@ -624,6 +655,7 @@ async def _stream_to_telegram(m: types.Message, stream, head_text: str = "⌛️
             await typer_task
         except Exception:
             pass
+
 
 def _plan_subtasks_via_gpt(question: str, max_items: int = 8) -> list[dict]:
     """
