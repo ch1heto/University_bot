@@ -212,6 +212,348 @@ def _is_greeting(text: str) -> bool:
     # короткие приветствия или фразы, где встречается ключевое слово
     return bool(_GREET_RE.search(t))
 
+# --- разбор ссылок вида "таблица 1.2", "рис. 3", "глава 2" в вопросе пользователя ---
+
+# Поддерживаем все русские падежи ("таблицу", "таблице", "главу" и т.п.),
+# а также варианты с № и буквенным префиксом (A.1, П2.3).
+_STRUCT_REF_RE = re.compile(
+    r"(?i)\b("                       # ключевое слово
+    r"рис\.?|рисун[а-я]*|figure|fig\.?|"
+    r"табл\.?|таблиц[а-я]*|table|tbl\.?|"
+    r"глав[а-я]*|chapter|раздел[а-я]*|section"
+    r")\s*(?:№\s*)?"                 # необязательное "№"
+    r"((?:[A-Za-zА-Яа-я](?=[\.\d]))?\s*\d+(?:[.,]\d+)*)"  # номер: 2, 2.1, A.1 и т.п.
+)
+
+
+def extract_struct_refs(question: str) -> list[dict]:
+    """
+    Ищет в тексте ссылки на таблицы/рисунки/главы с номером.
+    Возвращает список словарей:
+      {"kind": "table"|"figure"|"chapter", "num": "2.1", "raw": "таблица 2.1"}
+    """
+    result: list[dict] = []
+    if not question:
+        return result
+
+    for m in _STRUCT_REF_RE.finditer(question):
+        raw = m.group(0)
+        kw = (m.group(1) or "").lower()
+        num = (m.group(2) or "").strip()
+
+        if not num:
+            continue
+
+        if kw.startswith(("табл", "table", "tbl")):
+            kind = "table"
+        elif kw.startswith(("рис", "fig", "figure")):
+            kind = "figure"
+        else:
+            # глава / раздел / chapter / section
+            kind = "chapter"
+
+        result.append({"kind": kind, "num": num, "raw": raw})
+
+    return result
+
+
+async def _answer_structured_multi(
+    m: types.Message,
+    uid: int,
+    doc_id: int,
+    q_text: str,
+    refs: list[dict],
+) -> bool:
+    """
+    Мультирежим: в вопросе одновременно упомянуты таблицы/рисунки/разделы.
+
+    В НОВОЙ версии вместо одного большого вызова GPT мы:
+      * по каждому объекту делаем отдельный GPT-разбор (как в одиночных режимах);
+      * собираем все кусочки в один текст и шлём одним сообщением.
+    """
+    if not refs:
+        return False
+
+    # без GPT этот режим не имеет смысла
+    if "chat_with_gpt" not in globals() or chat_with_gpt is None:
+        return False
+
+    verbosity = _detect_verbosity(q_text)
+
+    # пройдёмся по объектам в ТОМ ЖЕ ПОРЯДКЕ, как они идут в вопросе
+    parts: list[str] = []
+    used_tables: set[str] = set()
+    used_figs: set[str] = set()
+    used_sections: set[str] = set()
+
+    for r in refs:
+        kind = (r.get("kind") or "").lower()
+        raw_num = str(r.get("num") or "").strip()
+        if not raw_num:
+            continue
+
+        norm_num = raw_num.replace(" ", "").replace(",", ".")
+
+        # --- таблицы ---
+        if kind == "table":
+            if norm_num in used_tables:
+                continue
+            used_tables.add(norm_num)
+
+            text = await _describe_table_for_multi(uid, doc_id, norm_num, q_text, verbosity)
+            if not text:
+                parts.append(f"- Таблица {raw_num}: данной таблицы нет в работе.")
+            else:
+                parts.append(f"**Таблица {raw_num}**\n{text}")
+
+        # --- рисунки ---
+        elif kind in ("figure", "fig"):
+            if norm_num in used_figs:
+                continue
+            used_figs.add(norm_num)
+
+            text = await _describe_figure_for_multi(uid, doc_id, norm_num, q_text, verbosity)
+            if not text:
+                parts.append(f"- Рисунок {raw_num}: данного рисунка нет в работе.")
+            else:
+                parts.append(f"**Рисунок {raw_num}**\n{text}")
+
+        # --- разделы/главы ---
+        elif kind in ("chapter", "section", "area"):
+            if norm_num in used_sections:
+                continue
+            used_sections.add(norm_num)
+
+            text = await _describe_section_for_multi(uid, doc_id, norm_num, q_text, verbosity)
+            if not text:
+                parts.append(f"- Глава/раздел {raw_num}: данный раздел в явном виде не найден в работе.")
+            else:
+                parts.append(f"**Глава/раздел {raw_num}**\n{text}")
+
+    if not parts:
+        # вообще ничего осмысленного собрать не удалось — пусть дальше отработает обычный пайплайн
+        return False
+
+    final_answer = "\n\n".join(parts)
+
+    # обновим "последние упомянутые" объекты для follow-up вопросов
+    try:
+        if used_tables:
+            LAST_REF.setdefault(uid, {})["table_nums"] = list(used_tables)
+        if used_figs:
+            LAST_REF.setdefault(uid, {})["figure_nums"] = list(used_figs)
+        if used_sections:
+            # берём первый как текущую область
+            LAST_REF.setdefault(uid, {})["area"] = next(iter(used_sections))
+    except Exception:
+        pass
+
+    await _send(m, final_answer)
+    return True
+
+
+async def _describe_table_for_multi(
+    uid: int,
+    doc_id: int,
+    num: str,
+    question: str,
+    verbosity: str,
+) -> str:
+    """
+    Вспомогательный помощник: делает отдельный GPT-разбор одной таблицы
+    (для мультирежима), но ничего не шлёт в Телеграм — просто возвращает текст.
+    """
+    num = (num or "").strip()
+    if not num:
+        return ""
+    # забираем те же данные, что и в одиночном режиме
+    tbl_block = _ooxml_table_block(uid, doc_id, num)
+    extra = _table_related_context(uid, doc_id, num, max_chars=2000)
+    if not tbl_block and not extra:
+        # вообще ничего не нашли — пусть об этом скажет вызывающий код
+        return ""
+
+    ctx_tables = (tbl_block or "").strip()
+    full_ctx = ctx_tables
+    if extra:
+        full_ctx += "\n\n[Дополнительный текст по таблице]\n" + extra
+
+    system_prompt = (
+        "Ты репетитор по дипломным работам. Ниже дана таблица из диплома в машинно-читаемом виде "
+        "и, возможно, фрагменты текста рядом с ней. Отвечай строго по этим данным: "
+        "не придумывай новые строки, столбцы и значения, не придумывай предметную область и термины, "
+        "если их нет в заголовках или тексте."
+    )
+
+    user_prompt = (
+        f"Вопрос пользователя: {question}\n\n"
+        f"Сделай понятное человеку объяснение по таблице {num}: что в ней сравнивается, "
+        "какие значения выше/ниже и какие 2–3 вывода можно сделать. "
+        "Не пересчитывай проценты и не добавляй новых чисел.\n\n"
+        "[Таблица и связанный текст из документа]\n"
+        f"{full_ctx}"
+        f"{_verbosity_addendum(verbosity, 'объяснения таблицы')}"
+    )
+
+    try:
+        answer = chat_with_gpt(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+            max_tokens=FINAL_MAX_TOKENS,
+        )
+    except Exception as e:
+        logging.exception("describe_table_for_multi failed: %s", e)
+        return ""
+
+    answer = (answer or "").strip()
+    if not answer:
+        return ""
+    return _strip_unwanted_sections(answer)
+
+
+async def _describe_figure_for_multi(
+    uid: int,
+    doc_id: int,
+    num: str,
+    question: str,
+    verbosity: str,
+) -> str:
+    """
+    Вспомогательный помощник для мультирежима: делает GPT-разбор одного рисунка.
+    """
+    num = (num or "").strip()
+    if not num:
+        return ""
+
+    # берём те же данные, что и в одиночном режиме
+    try:
+        records = _build_figure_records(uid, doc_id, [num]) or []
+    except Exception as e:
+        logging.exception("build_figure_records in _describe_figure_for_multi failed: %s", e)
+        records = []
+
+    if not records:
+        return ""
+
+    rec = records[0]
+    parts = []
+
+    disp = rec.get("display") or f"Рисунок {rec.get('num') or ''}".strip()
+    caption = (rec.get("caption") or "").strip()
+    if caption:
+        parts.append(f"Подпись: {caption}")
+
+    near = rec.get("near_text") or []
+    if near:
+        joined = " ".join((t or "").strip() for t in near if t).strip()
+        if joined:
+            # чуть ограничим длину, чтобы не раздувать контекст
+            joined = joined[:1200]
+            parts.append("Текст рядом: " + joined)
+
+    vision = (rec.get("vision_desc") or "").strip()
+    if vision:
+        parts.append("Описание по изображению: " + vision)
+
+    values_text = (rec.get("values_text") or rec.get("values") or "").strip()
+    if values_text:
+        parts.append("Точные значения (как в документе):\n" + values_text[:1500])
+
+    if not parts:
+        return ""
+
+    ctx = f"{disp}\n\n" + "\n\n".join(parts)
+
+    system_prompt = (
+        "Ты репетитор по дипломным работам. Ниже даны подпись к рисунку, текст рядом с ним "
+        "и, возможно, извлечённые из диаграммы значения. На основе этих данных объясни, "
+        "что показывает рисунок, какие тенденции и различия видно. "
+        "Не придумывай новых чисел и не вводи предметную область, если её нет в подписи/тексте."
+    )
+
+    user_prompt = (
+        f"Вопрос пользователя: {question}\n\n"
+        f"Сделай понятное пояснение по рисунку {num}: что на нём изображено и какие 2–3 вывода можно сделать.\n\n"
+        "[Данные по рисунку]\n"
+        f"{ctx}"
+        f"{_verbosity_addendum(verbosity, 'объяснения рисунка')}"
+    )
+
+    try:
+        answer = chat_with_gpt(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+            max_tokens=FINAL_MAX_TOKENS,
+        )
+    except Exception as e:
+        logging.exception("describe_figure_for_multi failed: %s", e)
+        return ""
+
+    answer = (answer or "").strip()
+    if not answer:
+        return ""
+    return _strip_unwanted_sections(answer)
+
+
+async def _describe_section_for_multi(
+    uid: int,
+    doc_id: int,
+    num: str,
+    question: str,
+    verbosity: str,
+) -> str:
+    """
+    Вспомогательный помощник: GPT-разбор одного раздела/главы.
+    """
+    sec = (num or "").strip()
+    if not sec:
+        return ""
+    # нормализуем так же, как в основном пайплайне
+    sec = re.sub(r"^[A-Za-zА-Яа-я]\s+(?=\d)", "", sec)
+    sec = sec.replace(" ", "").replace(",", ".")
+    ctx = _section_context(uid, doc_id, sec, max_chars=4000)
+    if not ctx:
+        return ""
+
+    system_prompt = (
+        "Ты репетитор по ВКР. Ниже фрагмент одного раздела/главы диплома. "
+        "Кратко и по делу перескажи его содержание простым языком: о чём речь, какие основные идеи, "
+        "какие выводы делает автор. Не добавляй новых фактов, которых нет в тексте."
+    )
+
+    user_prompt = (
+        f"Вопрос пользователя: {question}\n\n"
+        f"Сделай пояснение по разделу/главе {sec}.\n\n"
+        "[Фрагмент раздела]\n"
+        f"{ctx}"
+        f"{_verbosity_addendum(verbosity, 'объяснения раздела')}"
+    )
+
+    try:
+        answer = chat_with_gpt(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+            max_tokens=FINAL_MAX_TOKENS,
+        )
+    except Exception as e:
+        logging.exception("describe_section_for_multi failed: %s", e)
+        return ""
+
+    answer = (answer or "").strip()
+    if not answer:
+        return ""
+    return _strip_unwanted_sections(answer)
+
+
 
 def _split_multipart(text: str,
                      *,
@@ -1184,7 +1526,17 @@ OOXML_INDEX: dict[int, dict] = {}
 _OCR_TABLE_CACHE: dict[tuple[int, str], str] = {}
 
 # NEW: ждём ли от пользователя «да/нет» на предложение ответа от [модель]
-MODEL_EXTRA_PENDING: dict[int, dict] = {}   # {uid: {"question": str}}
+MODEL_EXTRA_PENDING: dict[int, dict] = {}   # {uid: {...}}
+
+# --- helpers для ответов "да/нет" на уточняющий вопрос про [модель] ---
+_YES_RE = re.compile(r"(?i)^(да|ага|угу|yes|yep|ok|окей|ладно|хорошо)\b")
+_NO_RE  = re.compile(r"(?i)^(нет|неа|no|nope)\b")
+
+def _is_yes_answer(text: str) -> bool:
+    return bool(_YES_RE.search((text or "").strip()))
+
+def _is_no_answer(text: str) -> bool:
+    return bool(_NO_RE.search((text or "").strip()))
 
 # NEW: для подстановки номера раздела из вопроса и для анафоры «этот пункт/рисунок»
 # NEW: для подстановки номера раздела из вопроса и для анафоры «этот пункт/рисунок»
@@ -4894,6 +5246,82 @@ async def handle_doc(m: types.Message):
         logging.exception("drain pending queue failed: %s", e)
 
 
+# ------------------------------ обработчик обычных текстовых сообщений ------------------------------
+
+# @dp.message(F.text & ~F.document)
+# async def handle_text_message(m: types.Message):
+#     uid = ensure_user(str(m.from_user.id))
+#     text = (m.text or m.caption or "").strip()
+
+#     if not text:
+#         await _send(m, "Сообщение пустое. Напиши, что именно тебя интересует по ВКР.")
+#         return
+
+#     # 1) Если ждём «да/нет» на предложение ответа от [модель] — обрабатываем в первую очередь
+#     pending = MODEL_EXTRA_PENDING.get(uid)
+#     if pending and (_is_yes_answer(text) or _is_no_answer(text)):
+#         if _is_yes_answer(text):
+#             kind = pending.get("kind") or "generic"
+#             try:
+#                 if kind == "table_more":
+#                     await _answer_with_model_extra_table(
+#                         m,
+#                         uid,
+#                         pending.get("doc_id"),
+#                         pending.get("question") or text,
+#                         pending.get("ctx_tables") or "",
+#                         pending.get("nums") or [],
+#                     )
+#                 else:
+#                     await _answer_with_model_extra(
+#                         m,
+#                         uid,
+#                         pending.get("question") or text,
+#                     )
+#             finally:
+#                 MODEL_EXTRA_PENDING.pop(uid, None)
+#         else:
+#             # пользователь отказался от дополнительного ответа
+#             MODEL_EXTRA_PENDING.pop(uid, None)
+#             await _send(
+#                 m,
+#                 "Ок, тогда буду опираться только на текст твоей работы. "
+#                 "Если есть другой вопрос — просто напиши его."
+#             )
+#         return
+
+#     # 2) Определяем активный документ и состояние обработки файла
+#     doc_id = ACTIVE_DOC.get(uid) or get_user_active_doc(uid)
+#     state = get_processing_state(uid)
+
+#     # 2а) Документ ещё в процессе скачивания/индексации — ставим вопрос в очередь
+#     if doc_id and state in (ProcessingState.DOWNLOADING, ProcessingState.INDEXING):
+#         enqueue_pending_query(uid, text)
+#         await _send(
+#             m,
+#             "Я ещё обрабатываю файл ВКР. Я запомнил этот вопрос и отвечу на него, "
+#             "как только закончу с документом. Можно пока писать ещё вопросы — их тоже сохраню."
+#         )
+#         return
+
+#     # 2б) Документа ещё нет — можем дать общий совет либо попросить прислать файл
+#     if not doc_id:
+#         hint = topical_check(text)
+#         if hint:
+#             await _send(m, hint + " Пока файла нет, могу дать только общий совет.")
+#         if chat_with_gpt:
+#             # общий ответ как [модель] без привязки к конкретной работе
+#             await _answer_with_model_extra(m, uid, text)
+#         else:
+#             await _send(
+#                 m,
+#                 "Сначала пришли файл ВКР в виде .doc или .docx. "
+#                 "Тогда я смогу отвечать прямо по тексту твоей работы."
+#             )
+#         return
+
+#     # 3) Нормальный случай: документ есть и он уже проиндексирован — отвечаем как раньше
+#     await respond_with_answer(m, uid, doc_id, text)
 
 # ------------------------------ основной ответчик ------------------------------
 
@@ -5119,6 +5547,7 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
 
 
     # быстрый путь для запросов про рисунки
+        # быстрый путь для запросов про рисунки
     if _is_pure_figure_request(q_text):
         verbosity = _detect_verbosity(q_text)
         logger.info(
@@ -5206,9 +5635,51 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
             await _send(m, "Не удалось описать рисунки." + suffix)
         return
 
+    # NEW: мультинумерная ветка — как только увидели номера таблиц/рисунков/глав,
+    # проходимся по ним циклом и, если это действительно мультийнтент,
+    # даём один собранный ответ и НЕ идём в generic-ветки ниже.
+    refs = extract_struct_refs(q_text)
+    logger.info(
+        "ANSWER: struct refs for %r -> %r",
+        q_text,
+        refs,
+    )
+    if refs:
+        kinds = {r["kind"] for r in refs}
+        nums = {(r["kind"], r["num"]) for r in refs}
+
+        # Один объект одного типа (например, «таблица 2.1») по-прежнему
+        # обрабатывают pure-ветки выше/ниже.
+        is_single_ref = len(nums) == 1
+
+        # Если несколько номеров или смешанные типы (таблицы + рисунки + главы),
+        # считаем это мультийнтентом и обрабатываем централизованно.
+        if not is_single_ref or len(kinds) > 1:
+            logger.info(
+                "ANSWER: structured-multi pipeline (uid=%s, doc_id=%s, refs=%r)",
+                uid,
+                doc_id,
+                refs,
+            )
+            handled = await _answer_structured_multi(m, uid, doc_id, q_text, refs)
+            if handled:
+                # КРИТИЧЕСКОЕ МЕСТО:
+                # раз уж увидели явные номера и отработали их,
+                # НИ FULLREAD, НИ generic-ответы внизу НЕ вызываем.
+                return
+            else:
+                logger.info(
+                    "ANSWER: structured-multi not handled, falling back to regular pipeline "
+                    "(uid=%s, doc_id=%s)",
+                    uid,
+                    doc_id,
+                )
+        # если is_single_ref и один kind — просто идём дальше:
+        # чистые таблицы/рисунки/главы разрулятся существующими спец-ветками.
 
     # NEW: если в вопросе явно указан раздел/пункт — запоминаем его как последний
     m_area = _SECTION_NUM_RE.search(q_text)
+
     if m_area:
         try:
             area = (m_area.group(1) or "").replace(" ", "").replace(",", ".")
@@ -5574,6 +6045,23 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
 
     await _send(m, _strip_unwanted_sections(answer))
 
+async def _qa_worker(m: types.Message, uid: int, doc_id: int, text: str):
+    """
+    Фоновый воркер: отвечает на вопрос пользователя, чтобы не блокировать обработку апдейта.
+    """
+    try:
+        await respond_with_answer(m, uid, doc_id, text)
+    except Exception:
+        logger.exception("QA worker failed (uid=%s, doc_id=%s)", uid, doc_id)
+        try:
+            await _send(
+                m,
+                "Во время подготовки ответа что-то пошло не так. Попробуй задать вопрос ещё раз."
+            )
+        except Exception:
+            logger.exception("Failed to send fallback message from QA worker")
+
+
 
 # ------------------------------ эмбеддинг-профиль ------------------------------
 
@@ -5706,4 +6194,14 @@ async def qa(m: types.Message):
         await _send(m, Cfg.MSG_NEED_FILE_QUEUED)
         return
 
-    await respond_with_answer(m, uid, doc_id, text)
+    # ⬇⬇⬇ НОВОЕ: вместо прямого await respond_with_answer
+
+    # при длинном вопросе даём быстрый квиток, чтобы пользователь видел, что работа началась
+    if len(text) > 200:
+        await _send(
+            m,
+            "Запрос большой, я готовлю подробный ответ. Это может занять немного времени 🙂"
+        )
+
+    # запускаем тяжёлый пайплайн в фоне, не блокируя обработку апдейта
+    asyncio.create_task(_qa_worker(m, uid, doc_id, text))
