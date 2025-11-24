@@ -318,7 +318,14 @@ def _classify_item(text: str) -> Dict[str, any]:
 
     rows_limit, include_all = _extract_rows_limit_and_full(item)
 
+    # Одна конкретная таблица (например: "таблица 2.2", "табл. 3.1")
+    single_table = False
+    if tables_want:
+        if len(table_nums) == 1 and not (COUNT_HINT_RE.search(item) or WHICH_HINT_RE.search(item)):
+            single_table = True
+
     # Один конкретный рисунок (опиши рисунок 6 / что на рисунке 2.3 / figure 4)
+        # Один конкретный рисунок (опиши рисунок 6 / что на рисунке 2.3 / figure 4)
     single_fig = False
     if figures_want:
         if len(figure_nums) == 1 and not (COUNT_HINT_RE.search(item) or WHICH_HINT_RE.search(item)):
@@ -336,6 +343,8 @@ def _classify_item(text: str) -> Dict[str, any]:
             ),
             "include_all_values": bool(include_all) if tables_want else False,
             "rows_limit": rows_limit if tables_want else None,
+            "single_only": single_table,
+            "exact_numbers": bool(EXACT_NUMBERS_RE.search(item)) if tables_want else False,
         },
         "figures": {
             "want": figures_want,
@@ -351,13 +360,19 @@ def _classify_item(text: str) -> Dict[str, any]:
         },
         "sources": {
             "want": sources_want,
+            "count": bool(COUNT_HINT_RE.search(item)) and sources_want,
+            "list": bool(WHICH_HINT_RE.search(item)) and sources_want,
+            "limit": 25,
         },
         "summary": is_summary_intent(item),
         "practical": bool(PRACTICAL_RE.search(item)),
         "gost": bool(GOST_RE.search(item)),
+        "want_links": bool(LINKS_HINT_RE.search(item)),
         "exact_numbers": bool(EXACT_NUMBERS_RE.search(item)),
-        "want_links": bool(LINKS_HINT_RE.search(item)),  # new
     }
+
+
+
 
 
 # --------------------------- Главный распознаватель ---------------------------
@@ -367,13 +382,16 @@ def detect_intents(text: str, *, list_limit: int = 25) -> Dict:
     Возвращает структуру намерений:
     {
       "language": "ru" | "en",
-      "tables":  {
+    "tables":  {
          "want": bool, "count": bool, "list": bool,
          "describe": [str], "limit": int,
          "include_all_values": bool, "rows_limit": int|None,
          "section_hints": [str],
-         "from_section": bool
+         "from_section": bool,
+         "single_only": bool,   # одна конкретная таблица (например, "таблица 2.2")
+         "exact_numbers": bool, # нужны точные числа/формат как в документе
       },
+
       "figures": {
          "want": bool, "count": bool, "list": bool,
          "describe": [str], "limit": int, "want_vision": bool,
@@ -405,7 +423,10 @@ def detect_intents(text: str, *, list_limit: int = 25) -> Dict:
             "rows_limit": None,
             "section_hints": [],
             "from_section": False,
+            "single_only": False,   # одна конкретная таблица
+            "exact_numbers": False, # нужны точные числа/формат
         },
+
         "figures": {
             "want": False,
             "count": False,
@@ -430,15 +451,19 @@ def detect_intents(text: str, *, list_limit: int = 25) -> Dict:
     }
 
 
-    # ---- Многочастные запросы (план подпунктов — на будущее для пайплайна)
+        # ---- Многочастные запросы (план подпунктов — на будущее для пайплайна)
     subparts = _split_into_subitems(q)
     if len(subparts) >= 2:
         intents["multi_want"] = True
         intents["subitems"] = []
         for i, sp in enumerate(subparts, start=1):
             cls = _classify_item(sp)
+            # защита от странных случаев, когда _classify_item вернул None или не dict
+            if not isinstance(cls, dict):
+                cls = {"ask": sp}
             cls["id"] = i
             intents["subitems"].append(cls)
+
 
     # --- Таблицы (общий слой)
     if TABLE_ANY_RE.search(q):
@@ -453,10 +478,19 @@ def detect_intents(text: str, *, list_limit: int = 25) -> Dict:
         if nums:
             intents["tables"]["describe"] = nums
 
+        # одна конкретная таблица: "таблица 2.2" без "сколько/какие"
+        if nums and len(nums) == 1 and not intents["tables"]["list"] and not intents["tables"]["count"]:
+            intents["tables"]["single_only"] = True
+
         rows_limit, include_all = _extract_rows_limit_and_full(q)
         intents["tables"]["include_all_values"] = bool(include_all)
         if rows_limit is not None:
             intents["tables"]["rows_limit"] = int(rows_limit)
+
+        # запрос на точные числа/формат как в документе
+        if EXACT_NUMBERS_RE.search(q):
+            intents["tables"]["exact_numbers"] = True
+
 
         # Подсказки, в какой главе/разделе искать таблицу
         sects = extract_section_hints(q)

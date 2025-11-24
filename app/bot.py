@@ -8,6 +8,7 @@ import asyncio
 import time
 import math
 from decimal import Decimal 
+logger = logging.getLogger(__name__)
 from typing import Iterable, AsyncIterable, Optional, List, Tuple
 from .docs_handlers import register_docs_handlers
 from aiogram import Bot, Dispatcher, F, types
@@ -126,20 +127,23 @@ register_docs_handlers(dp)
 # --------------------- ПАРАМЕТРЫ СТРИМИНГА (с дефолтами) ---------------------
 
 STREAM_ENABLED: bool = getattr(Cfg, "STREAM_ENABLED", True)
-STREAM_EDIT_INTERVAL_MS: int = getattr(Cfg, "STREAM_EDIT_INTERVAL_MS", 900)  # как часто редактировать сообщение
-STREAM_MIN_CHARS: int = getattr(Cfg, "STREAM_MIN_CHARS", 120)               # мин. приращение между апдейтами
-STREAM_MODE: str = getattr(Cfg, "STREAM_MODE", "edit")                       # "edit" | "multi"
-TG_MAX_CHARS: int = getattr(Cfg, "TG_MAX_CHARS", 3400)
+STREAM_EDIT_INTERVAL_MS: int = getattr(Cfg, "STREAM_EDIT_INTERVAL_MS", 900)
+STREAM_MIN_CHARS: int = getattr(Cfg, "STREAM_MIN_CHARS", 120)
+STREAM_MODE: str = getattr(Cfg, "STREAM_MODE", "edit")
+TG_MAX_CHARS: int = getattr(Cfg, "TG_MAX_CHARS", 3900)
 FIG_MEDIA_LIMIT: int = getattr(Cfg, "FIG_MEDIA_LIMIT", 12)
 
-# ↓ Новое: управляем «много сообщений» даже когда не упираемся в 4096
-TG_SPLIT_TARGET: int = getattr(Cfg, "TG_SPLIT_TARGET", 1600)   # целевой размер части
-TG_SPLIT_MAX_PARTS: int = getattr(Cfg, "TG_SPLIT_MAX_PARTS", 3)  # не больше 3 сообщений
+TG_SPLIT_TARGET: int = getattr(Cfg, "TG_SPLIT_TARGET", 2000)
+TG_SPLIT_MAX_PARTS: int = getattr(Cfg, "TG_SPLIT_MAX_PARTS", 6)
+
+# ↓ НОВОЕ: пауза между кусками при нестримовой отправке
+MULTIPART_SLEEP_MS: int = getattr(Cfg, "MULTIPART_SLEEP_MS", 200)
+
 _SPLIT_ANCHOR_RE = re.compile(
     r"(?m)^(?:### .+|## .+|\*\*[^\n]+?\*\*|\d+[).] .+|- .+)$"
 )  # предпочитаемые границы (заголовки/списки)
 STREAM_HEAD_START_MS: int = getattr(Cfg, "STREAM_HEAD_START_MS", 250)        # первый апдейт быстрее
-FINAL_MAX_TOKENS: int = getattr(Cfg, "FINAL_MAX_TOKENS", 1600)
+FINAL_MAX_TOKENS: int = getattr(Cfg, "FINAL_MAX_TOKENS", 5000)
 TYPE_INDICATION_EVERY_MS: int = getattr(Cfg, "TYPE_INDICATION_EVERY_MS", 2000)
 # NEW: строгий режим для рисунков — не отдаём числа без надёжного источника
 FIG_STRICT: bool = getattr(Cfg, "FIG_STRICT", True)
@@ -150,6 +154,8 @@ MULTI_STEP_MAX_ITEMS: int = getattr(Cfg, "MULTI_STEP_MAX_ITEMS", 8)
 MULTI_STEP_FINAL_MERGE: bool = getattr(Cfg, "MULTI_STEP_FINAL_MERGE", True)
 MULTI_STEP_PAUSE_MS: int = getattr(Cfg, "MULTI_STEP_PAUSE_MS", 120)  # м/у блоками
 MULTI_PASS_SCORE: int = getattr(Cfg, "MULTI_PASS_SCORE", 85)         # порог критика в ace
+# минимальная длина вопроса, при которой вообще есть смысл городить подпункты
+MULTI_STEP_MIN_QUESTION_LEN: int = getattr(Cfg, "MULTI_STEP_MIN_QUESTION_LEN", 200)
 
 
 # --------------------- форматирование и отправка ---------------------
@@ -238,8 +244,38 @@ def _split_multipart(text: str,
 
 async def _send(m: types.Message, text: str):
     """Бережно отправляем длинный текст частями в HTML-режиме (нестримовый фолбэк)."""
-    for chunk in _split_multipart(text or ""):
-        await m.answer(_to_html(chunk), parse_mode="HTML", disable_web_page_preview=True)
+    chunks = _split_multipart(text or "")
+    logger.info(
+        "SEND: %d chunk(s) to chat_id=%s (message_id=%s), total_len=%d",
+        len(chunks),
+        m.chat.id,
+        getattr(m, "message_id", None),
+        len(text or ""),
+    )
+    for i, chunk in enumerate(chunks):
+        # небольшая пауза между сообщениями, чтобы не заспамить чат
+        if i > 0 and MULTIPART_SLEEP_MS > 0:
+            await asyncio.sleep(MULTIPART_SLEEP_MS / 1000)
+
+        try:
+            await m.answer(
+                _to_html(chunk),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            logger.debug(
+                "SEND: chunk %d/%d sent, len=%d",
+                i + 1,
+                len(chunks),
+                len(chunk),
+            )
+        except Exception:
+            logger.exception(
+                "SEND: failed to send chunk %d/%d (len=%d)",
+                i + 1,
+                len(chunks),
+                len(chunk),
+            )
 
 
 # ---- Verbosity helpers ----
@@ -540,9 +576,18 @@ def _pairs_to_bullets(pairs: list[dict]) -> str:
 
 
 async def _stream_to_telegram(m: types.Message, stream, head_text: str = "⌛️ Печатаю ответ…") -> None:
+    logger.info(
+        "STREAM: start for chat_id=%s message_id=%s",
+        m.chat.id,
+        getattr(m, "message_id", None),
+    )
     current_text = ""
     sent_parts = 0
-    initial = await m.answer(_to_html(head_text), parse_mode="HTML", disable_web_page_preview=True)
+    initial = await m.answer(
+        _to_html(head_text),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
     last_edit_at = _now_ms() - STREAM_HEAD_START_MS
     stop_typer = asyncio.Event()
     typer_task = asyncio.create_task(_typing_loop(m.chat.id, stop_event=stop_typer))
@@ -566,14 +611,26 @@ async def _stream_to_telegram(m: types.Message, stream, head_text: str = "⌛️
                 part = current_text[:cut].rstrip()
                 try:
                     if sent_parts == 0:
-                        await initial.edit_text(_to_html(part), parse_mode="HTML", disable_web_page_preview=True)
+                        await initial.edit_text(
+                            _to_html(part),
+                            parse_mode="HTML",
+                            disable_web_page_preview=True,
+                        )
                         freeze_initial = True  # <- больше не трогаем initial
                     else:
-                        await m.answer(_to_html(part), parse_mode="HTML", disable_web_page_preview=True)
+                        await m.answer(
+                            _to_html(part),
+                            parse_mode="HTML",
+                            disable_web_page_preview=True,
+                        )
                 except TelegramBadRequest:
-                    await m.answer(_to_html(part), parse_mode="HTML", disable_web_page_preview=True)
+                    await m.answer(
+                        _to_html(part),
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
 
-                sent_parts += 1
+                sent_parts += 1  # ### ДОБАВЛЕНО: считаем отправленные части
                 current_text = current_text[cut:].lstrip()
                 last_edit_at = _now_ms()
                 continue
@@ -585,43 +642,77 @@ async def _stream_to_telegram(m: types.Message, stream, head_text: str = "⌛️
 
                 if STREAM_MODE == "multi" and (freeze_initial or sent_parts > 0):
                     # 🔧 в multi не редактируем initial после 1-й части
-                    await m.answer(_to_html(final_part), parse_mode="HTML", disable_web_page_preview=True)
+                    await m.answer(
+                        _to_html(final_part),
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
                 else:
                     try:
-                        await initial.edit_text(_to_html(final_part), parse_mode="HTML", disable_web_page_preview=True)
+                        await initial.edit_text(
+                            _to_html(final_part),
+                            parse_mode="HTML",
+                            disable_web_page_preview=True,
+                        )
                     except TelegramBadRequest:
-                        await m.answer(_to_html(final_part), parse_mode="HTML", disable_web_page_preview=True)
+                        await m.answer(
+                            _to_html(final_part),
+                            parse_mode="HTML",
+                            disable_web_page_preview=True,
+                        )
 
+                sent_parts += 1  # ### ДОБАВЛЕНО: эта часть тоже считается отправленной
                 current_text = current_text[cut:].lstrip()
                 # 🔧 новый плейсхолдер нужен только в edit-режиме
                 if STREAM_MODE == "edit":
-                    initial = await m.answer(_to_html("…"), parse_mode="HTML", disable_web_page_preview=True)
+                    initial = await m.answer(
+                        _to_html("…"),
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
                 last_edit_at = _now_ms()
                 continue
 
             # 3.c) периодические правки — 🔧 ТОЛЬКО в режиме edit
             now = _now_ms()
-            if STREAM_MODE == "edit" and (now - last_edit_at) >= STREAM_EDIT_INTERVAL_MS and len(current_text) >= STREAM_MIN_CHARS:
+            if (
+                STREAM_MODE == "edit"
+                and (now - last_edit_at) >= STREAM_EDIT_INTERVAL_MS
+                and len(current_text) >= STREAM_MIN_CHARS
+            ):
                 try:
-                    await initial.edit_text(_to_html(current_text), parse_mode="HTML", disable_web_page_preview=True)
+                    await initial.edit_text(
+                        _to_html(current_text),
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
                     last_edit_at = now
                 except TelegramBadRequest:
                     pass
 
-
-            # финальный хвост
+        # финальный хвост
         if current_text:
+            logger.info(
+                "STREAM: finishing with tail, len=%d, sent_parts=%d",
+                len(current_text),
+                sent_parts,
+            )
             # аккуратно режем остаток так же, как в нестримовом режиме
             tail_parts = _split_multipart(current_text or "")
 
             if STREAM_MODE == "multi" and sent_parts > 0:
                 # в multi-режиме после первой части всё остальное — отдельными сообщениями
                 for part in tail_parts:
-                    await m.answer(
-                        _to_html(part),
-                        parse_mode="HTML",
-                        disable_web_page_preview=True,
-                    )
+                    html_part = _to_html(part)
+                    try:  # ### ДОБАВЛЕНО: не даём исключению убить весь хвост
+                        await m.answer(
+                            html_part,
+                            parse_mode="HTML",
+                            disable_web_page_preview=True,
+                        )
+                    except TelegramBadRequest:
+                        # если HTML/длина сломали разметку — шлём как есть
+                        await m.answer(part)
             else:
                 # в edit-режиме (или когда ещё не было частей) первый кусок пытаемся
                 # положить в initial, а остальное — отдельными сообщениями
@@ -636,25 +727,42 @@ async def _stream_to_telegram(m: types.Message, stream, head_text: str = "⌛️
                                 disable_web_page_preview=True,
                             )
                         except TelegramBadRequest:
+                            # если редактирование не удалось — шлём отдельным сообщением
+                            try:
+                                await m.answer(
+                                    html_part,
+                                    parse_mode="HTML",
+                                    disable_web_page_preview=True,
+                                )
+                            except TelegramBadRequest:
+                                await m.answer(part)
+                        first = False
+                    else:
+                        try:
                             await m.answer(
                                 html_part,
                                 parse_mode="HTML",
                                 disable_web_page_preview=True,
                             )
-                        first = False
-                    else:
-                        await m.answer(
-                            html_part,
-                            parse_mode="HTML",
-                            disable_web_page_preview=True,
-                        )
+                        except TelegramBadRequest:
+                            await m.answer(part)
 
+    except Exception:
+        logger.exception(
+            "STREAM: unexpected error for chat_id=%s",
+            m.chat.id,
+        )
     finally:
         stop_typer.set()
         try:
             await typer_task
         except Exception:
             pass
+        logger.info(
+            "STREAM: stop for chat_id=%s message_id=%s",
+            m.chat.id,
+            getattr(m, "message_id", None),
+        )
 
 
 def _plan_subtasks_via_gpt(question: str, max_items: int = 8) -> list[dict]:
@@ -748,10 +856,13 @@ def _answer_subpoint_via_gpt(
     system_prompt = (
         "Ты репетитор по дипломным работам. Тебе дали фрагмент текста диплома "
         "и один подпункт вопроса.\n"
-        "Отвечай ТОЛЬКО по этому фрагменту. Не придумывай фактов, которых в тексте нет. "
-        "Если информации недостаточно для уверенного ответа, честно скажи об этом.\n"
+        "Отвечай ТОЛЬКО по этому фрагменту. Не придумывай фактов, терминов и предметную область, "
+        "которых в тексте нет (например, не упоминай продажи, клиентов, выручку, маркетинг и т.п., "
+        "если этих слов нет во фрагменте). Если информации недостаточно для уверенного ответа, "
+        "честно скажи об этом и прямо напиши, что в этом фрагменте об этом не сказано.\n"
         "Не добавляй разделы вида «чего не хватает»."
     )
+
 
     if ctx:
         assistant_ctx = f"[Фрагмент диплома]\n{ctx}"
@@ -810,9 +921,12 @@ def _merge_subanswers_via_gpt(
         "Ты репетитор по дипломным работам. Ниже собраны ответы по отдельным подпунктам "
         "одного большого вопроса. Твоя задача — сделать один связный общий ответ.\n"
         "Не повторяй дословно все подпункты, а аккуратно их объединяй. "
-        "Не добавляй новых фактов, которых нет в подпунктах.\n"
+        "Не добавляй новых фактов, терминов и предметную область, которых нет в подпунктах "
+        "(например, не придумывай продажи, клиентов, выручку, маркетинг и т.п., если этого нет "
+        "в самих подпунктах).\n"
         "Не пиши разделы вида «чего не хватает»."
     )
+
 
     user_prompt = (
         f"Исходный общий вопрос пользователя:\n{base_question}\n\n"
@@ -962,6 +1076,29 @@ async def _run_multistep_answer(
             logging.exception("merge_subanswers_via_gpt failed: %s", e)
 
     return True
+
+def _should_use_multistep(q_text: str, discovered_items: list[dict] | None) -> bool:
+    """
+    Простая эвристика: включаем многошаговый режим, только если:
+      — мультиответ вообще разрешён конфигом;
+      — есть подпункты из coverage/general_subitems;
+      — подпунктов не меньше MULTI_STEP_MIN_ITEMS;
+      — вопрос достаточно длинный (чтобы стоило городить подпункты).
+    """
+    if not MULTI_STEP_SEND_ENABLED:
+        return False
+
+    if not discovered_items:
+        return False
+
+    if len(discovered_items) < MULTI_STEP_MIN_ITEMS:
+        return False
+
+    if len((q_text or "").strip()) < MULTI_STEP_MIN_QUESTION_LEN:
+        return False
+
+    return True
+
 
 # summarizer (мягкий импорт)
 try:
@@ -1154,8 +1291,13 @@ def _table_has_columns(con, table: str, cols: list[str]) -> bool:
     return all(c in have for c in cols)
 
 
+def _current_embedding_profile() -> str:
+    """
+    Текущий профиль эмбеддингов, который пишем в layout_profile.
+    Если в конфиге ничего не задано — используем 'default'.
+    """
+    return getattr(Cfg, "EMBEDDING_PROFILE", "default")
 
-# --------------------- Таблицы: парсинг/нормализация ---------------------
 
 # --------------------- Таблицы: парсинг/нормализация ---------------------
 
@@ -2760,6 +2902,39 @@ def _is_pure_figure_request(text: str) -> bool:
     return True
 
 
+def _is_pure_section_request(text: str, intents: dict | None = None) -> bool:
+    """
+    Эвристика: «чистый» запрос про главу/раздел/пункт:
+      — есть ссылка на главу/раздел/пункт;
+      — нет одновременного запроса про таблицы, рисунки или список источников.
+
+    Всё, что смешанное (глава + таблицы/рисунки/источники), должно идти
+    в общий мультийнтентный пайплайн, а не в отдельный секционный ответ.
+    """
+    t = (text or "").strip()
+    if not t:
+        return False
+
+    # нет указания пункта/главы — не наш случай
+    if not _SECTION_NUM_RE.search(t):
+        return False
+
+    # если в тексте явно спрашивают про таблицы/рисунки/источники — это уже микс
+    if _TABLE_ANY.search(t) or FIG_NUM_RE.search(t) or _SOURCES_HINT.search(t):
+        return False
+
+    # если detect_intents уже увидел таблицы/рисунки/источники — тоже не чистый раздел
+    if intents:
+        if (
+            intents.get("tables", {}).get("want")
+            or intents.get("figures", {}).get("want")
+            or intents.get("sources", {}).get("want")
+        ):
+            return False
+
+    return True
+
+
 def _build_figure_records(uid: int, doc_id: int, nums: list[str]) -> list[dict]:
     """
     Единая "сборка" информации о рисунках:
@@ -3103,18 +3278,25 @@ async def _explain_figures_with_gpt(
         "(диаграммы, графики) из диплома. "
         "Тебе уже даны подписи, ближайший текст и точные числовые данные диаграмм из документа. "
         "Используй эти данные как есть: не придумывай новые числа, не пересчитывай проценты "
-        "и не пытайся нормировать суммы до 100%. Не ссылайся на номера страниц."
+        "и не пытайся нормировать суммы до 100%. Не ссылайся на номера страниц.\n"
+        "Не придумывай предметную область и термины (например, продажи, клиенты, выручка, "
+        "маркетинг и т.п.), если они не упомянуты в подписях или тексте рядом с рисунком."
     )
+
 
     user_prompt = (
         f"Вопрос пользователя: {question}\n\n"
         "Числа по каждому рисунку уже перечислены выше в блоках «Точные значения (как в документе)» "
         "и/или в JSON-структуре. НЕ переписывай эти числа и НЕ изменяй проценты. "
         "Твоя задача — только смысловая интерпретация: что показывают рисунки, какие уровни выше/ниже, "
-        "какие тенденции видны, какие выводы можно сделать.\n\n"
+        "какие тенденции видны, какие выводы можно сделать.\n"
+        "Не придумывай, к какой предметной области относятся данные (например, продажи, клиенты, рынок, "
+        "маркетинг и т.п.), если это явно не указано в подписях или тексте рядом. Если по рисункам "
+        "непонятно, к чему относятся показатели, прямо напиши, что предметная область в тексте не указана.\n\n"
         f"Сконцентрируйся только на указанных рисунках, опиши их содержание и сделай интерпретацию {focus}.\n"
         f"{_verbosity_addendum(verbosity, 'описания рисунков')}"
     )
+
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -3657,6 +3839,8 @@ async def _answer_table_query(
         "Отвечай СТРОГО по этим данным:\n"
         "— не придумывай новые строки, столбцы и значения;\n"
         "— не добавляй факты, которых нет в таблицах;\n"
+        "— не придумывай предметную область и термины (например, продажи, клиенты, выручка, рынок, "
+        "маркетинг и т.п.), если они не встречаются в заголовках, подписях или строках таблиц;\n"
         "— не ссылаться на страницы, только описывай содержание.\n"
         "Если в вопросе указан номер таблицы, но такой таблицы нет в переданном контексте — "
         "напиши, что по этому номеру в контексте данных нет.\n\n"
@@ -3671,6 +3855,7 @@ async def _answer_table_query(
         "Если в контексте есть абзац, начинающийся с «Примечание», обязательно приведи его "
         "отдельным подпунктом «Примечание» и не сокращай текст."
     )
+
 
     # В режиме "подробнее" прямо говорим, что нужен более развёрнутый разбор
     if mode == "more":
@@ -3736,8 +3921,11 @@ async def _answer_table_query(
                 "из диплома (все её значения). "
                 "По этим данным опиши простыми словами, что показывает таблица, "
                 "какие значения выше/ниже и какие 2–3 вывода можно сделать. "
-                "Не придумывай новых чисел и не пересчитывай проценты."
+                "Не придумывай новых чисел и не пересчитывай проценты. "
+                "Не придумывай предметную область и термины (например, продажи, клиенты, выручка, "
+                "маркетинг и т.п.), если они не указаны в самой таблице."
             )
+
             fb_user = (
                 f"Таблица из диплома:\n{ctx_tables}\n\n"
                 f"Вопрос пользователя: {text}\n\n"
@@ -4374,15 +4562,26 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
 
 
 def _strip_unwanted_sections(s: str) -> str:
-    """Удаляем разделы 'Чего не хватает'/'Не хватает' и подобные хвосты."""
+    """
+    Аккуратно убираем служебные хвосты вроде заголовков
+    «Чего не хватает: …», но не допускаем, чтобы ответ
+    обнулился полностью — в этом случае возвращаем исходный текст.
+    """
     if not s:
         return s
+
+    original = s
+
     # вырезаем заголовок + абзац(ы) до следующего пустого разрыва
     pat = re.compile(r"(?mis)^\s*(?:чего|что)\s+не\s+хватает\s*:.*?(?:\n\s*\n|\Z)")
     s = pat.sub("", s)
     # отдельные строки-метки
     s = re.sub(r"(?mi)^\s*не\s+хватает\s*:.*$", "", s)
-    return s.strip()
+
+    s = s.strip()
+    # если после зачистки всё исчезло — лучше вернуть исходный ответ,
+    # чем отдать пользователю пустоту
+    return s or original.strip()
 
 
 # ------------------------------ FULLREAD: модель читает весь файл ------------------------------
@@ -4446,10 +4645,6 @@ def _fullread_try_answer(uid: int, doc_id: int, q_text: str) -> str | None:
         {"role": "assistant", "content": f"[Документ — полный текст]\n{full_text}"},
         {"role": "user", "content": f"{q_text}\n\n{_verbosity_addendum(verbosity)}"},
     ]
-
-
-    if STREAM_ENABLED and chat_with_gpt_stream is not None:
-        return ("__STREAM__", json.dumps(messages, ensure_ascii=False))
 
     try:
         answer = chat_with_gpt(messages, temperature=0.2, max_tokens=FINAL_MAX_TOKENS)
@@ -4569,11 +4764,15 @@ def _iterative_fullread_build_messages(uid: int, doc_id: int, question: str) -> 
     sys_reduce = (
         "Ты репетитор по ВКР. Ниже — короткие факты из разных частей документа. "
         "Собери из них связный ответ на вопрос. Не выдумывай новых цифр/таблиц и не добавляй разделов "
-        "про «чего не хватает». Отвечай только по имеющимся данным. Если запрошенного рисунка/таблицы "
-        "нет в тексте — сформулируй кратко: «данного рисунка нет в работе». Если объект есть, но он "
-        "нечитабелен, дай: «Рисунок плохого качества, не могу проанализировать», и добавь подпись/контекст из текста. "
+        "про «чего не хватает». Отвечай только по имеющимся данным. "
+        "Не придумывай предметную область и термины (например, продажи, клиенты, выручка, маркетинг и т.п.), "
+        "если они не присутствуют в фактах/цитатах.\n"
+        "Если запрошенного рисунка/таблицы нет в тексте — сформулируй кратко: «данного рисунка нет в работе». "
+        "Если объект есть, но он нечитаем, дай: «Рисунок плохого качества, не могу проанализировать», "
+        "и добавь подпись/контекст из текста. "
         "В своём ответе не ссылайся на технические метки вроде «фрагмент 1» и не используй слово «выжимка»."
     )
+
 
 
     verbosity = _detect_verbosity(question)
@@ -4596,17 +4795,14 @@ async def handle_doc(m: types.Message):
     start_downloading(uid)
     await _send(m, Cfg.MSG_ACK_DOWNLOADING)
 
-    # 1) скачиваем файл
-    file = await bot.get_file(doc.file_id)
-    stream = await bot.download_file(file.file_path)
-    try:
-        data = stream.read()
-    finally:
-        try:
-            stream.close()
-        except Exception:
-            pass
+    # 1) скачиваем файл целиком (без обрезки)
+    from io import BytesIO
 
+    file = await bot.get_file(doc.file_id)
+    buf = BytesIO()
+    await bot.download_file(file.file_path, destination=buf)
+    buf.seek(0)
+    data = buf.read()  # здесь все байты файла как есть
 
     # 2) сохраняем на диск (единственный источник правды для оркестратора)
     filename = safe_filename(f"{m.from_user.id}_{doc.file_name}")
@@ -4845,33 +5041,79 @@ async def _answer_with_model_extra_table(
 async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: str):
     q_text = (q_text or "").strip()
     orig_q_text = q_text  # запомним исходную формулировку до подстановок
-    logging.debug(f"Получен запрос от пользователя: {q_text}")
+    logger.info(
+        "ANSWER: new question (uid=%s, doc_id=%s, len=%d): %r",
+        uid,
+        doc_id,
+        len(q_text or ""),
+        q_text,
+    )
     if not q_text:
+        logger.warning(
+            "ANSWER: empty question from uid=%s, doc_id=%s",
+            uid,
+            doc_id,
+        )
         await _send(m, "Вопрос пустой. Напишите, что именно вас интересует по ВКР.")
         return
 
     viol = safety_check(q_text)
     if viol:
+        logger.warning(
+            "ANSWER: safety_check blocked question (uid=%s, doc_id=%s): %s",
+            uid,
+            doc_id,
+            viol,
+        )
         await _send(m, viol + " Задайте корректный вопрос по ВКР.")
         return
 
+    logger.debug(
+        "ANSWER: before GOST check (uid=%s, doc_id=%s)",
+        uid,
+        doc_id,
+    )
     if await _maybe_run_gost(m, uid, doc_id, q_text):
+        logger.info(
+            "ANSWER: handled by GOST validator (uid=%s, doc_id=%s)",
+            uid,
+            doc_id,
+        )
         return
 
     # для коротких реплик вида «опиши подробнее», «расскажи про него»
     q_text = _expand_with_last_referent(uid, q_text)
 
-    # Примеры: "опиши таблицу 4", "что показывает таблица 2.3", "сделай выводы по таблице 4"
+        # Примеры: "опиши таблицу 4", "что показывает таблица 2.3", "сделай выводы по таблице 4"
     if _is_pure_table_request(q_text):
         verbosity = _detect_verbosity(q_text)
         base_text = (orig_q_text or "")
-        # используем search, чтобы ловить "… опиши подробнее …" в середине фразы
         mode = "more" if _FOLLOWUP_MORE_RE.search(base_text) else "normal"
+        logger.info(
+            "ANSWER: pure table request detected (uid=%s, doc_id=%s, mode=%s)",
+            uid,
+            doc_id,
+            mode,
+        )
         handled = await _answer_table_query(
             m, uid, doc_id, q_text, verbosity=verbosity, mode=mode
         )
+        logger.info(
+            "ANSWER: _answer_table_query finished (uid=%s, doc_id=%s, handled=%s)",
+            uid,
+            doc_id,
+            handled,
+        )
         if handled:
             return
+        else:
+            logger.info(
+                "ANSWER: table pipeline did not handle request, falling back to general pipeline "
+                "(uid=%s, doc_id=%s)",
+                uid,
+                doc_id,
+            )
+
 
         # если _answer_table_query не смог ответить (таблица не нашлась в OOXML/картинке),
 
@@ -4879,14 +5121,34 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
     # быстрый путь для запросов про рисунки
     if _is_pure_figure_request(q_text):
         verbosity = _detect_verbosity(q_text)
-        handled = await _answer_figure_query(m, uid, doc_id, q_text, verbosity=verbosity)
+        logger.info(
+            "ANSWER: pure figure request detected (uid=%s, doc_id=%s)",
+            uid,
+            doc_id,
+        )
+        handled = await _answer_figure_query(
+            m,
+            uid,
+            doc_id,
+            q_text,
+            verbosity=verbosity,
+        )
+        logger.info(
+            "ANSWER: _answer_figure_query finished (uid=%s, doc_id=%s, handled=%s)",
+            uid,
+            doc_id,
+            handled,
+        )
         if handled:
             return
 
-
-    # РАНО в respond_with_answer, до detect_intents:
-        # РАНО в respond_with_answer, до detect_intents:
-    if _ALL_FIGS_HINT.search(q_text or ""):
+    # Если одновременно упоминаются главы/таблицы — даём это
+    # обработать мультийнтентному пайплайну ниже.
+    if (
+        _ALL_FIGS_HINT.search(q_text or "")
+        and not _SECTION_NUM_RE.search(q_text or "")
+        and not _TABLE_ANY.search(q_text or "")
+    ):
         meta = _list_figures_db(uid, doc_id, limit=999999)
         total = int(meta["count"])
         if total == 0:
@@ -4954,7 +5216,7 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
         except Exception:
             pass
 
-    # --- Определяем интенты заранее
+        # --- Определяем интенты заранее
     intents = detect_intents(q_text)
 
     # Чистый запрос про конкретные рисунки (нет секций/таблиц/источников/общего вопроса)
@@ -4964,13 +5226,7 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
         _SECTION_NUM_RE.search(q_text)
     )
 
-    # с упоминаниями других рисунков. Далее всё идёт через facts → answer_builder.
-    if pure_figs and "general_question" in intents:
-        intents["general_question"] = None
-
-
-    # NEW: явная обработка «по пункту/разделу/главе X.Y»
-        # NEW: явная обработка «по пункту/разделу/главе X.Y» (с защитой от «залипаний»)
+    # NEW: явная обработка «по пункту/разделу/главе X.Y» (но только для ЧИСТЫХ запросов)
     m_sec = _SECTION_NUM_RE.search(q_text)
     sec = None
     if m_sec:
@@ -4978,8 +5234,8 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
         raw_sec = re.sub(r"^[A-Za-zА-Яа-я]\s+(?=\d)", "", raw_sec)
         sec = raw_sec.replace(" ", "").replace(",", ".")
 
-    # ВСЕГДА первым делом пробуем строгий секционный ответ, если номер найден
-    if sec:
+    # Строгий секционный ответ — только если запрос не смешанный
+    if sec and _is_pure_section_request(q_text, intents):
         verbosity = _detect_verbosity(q_text)
         ctx = _section_context(uid, doc_id, sec, max_chars=9000)
         if ctx:
@@ -5034,18 +5290,48 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
             return
 
 
+
     # ====== FULLREAD: auto ======
     fr_mode = getattr(Cfg, "FULLREAD_MODE", "off")
-    if fr_mode == "auto" and not pure_figs:
+    # FULLREAD(auto) включаем только для общих вопросов по содержанию,
+    # чтобы не перебивать спец-логики по таблицам/рисункам/источникам.
+    if (
+        fr_mode == "auto"
+        and intents.get("general_question")
+        and not intents["tables"]["want"]
+        and not intents["figures"]["want"]
+        and not intents["sources"]["want"]
+    ):
+        logger.info(
+            "ANSWER: FULLREAD(auto) mode, uid=%s, doc_id=%s",
+            uid,
+            doc_id,
+        )
         _limit = int(getattr(Cfg, "DIRECT_MAX_CHARS", 80000))
-        # пробуем дать модели ПОЛНЫЙ текст, если влазит
         full_text = _full_document_text(uid, doc_id, limit_chars=_limit + 1)
-        if full_text and len(full_text) <= _limit:
+        full_len = len(full_text or "")
+        logger.debug(
+            "ANSWER: FULLREAD(auto) full_text_len=%d (limit=%d)",
+            full_len,
+            _limit,
+        )
+
+        # 1) вообще пустой текст → честно падаем в обычный RAG-пайплайн ниже
+        if not full_text.strip():
+            logger.warning(
+                "ANSWER: FULLREAD(auto) got empty full_text, falling back to RAG (uid=%s, doc_id=%s)",
+                uid,
+                doc_id,
+            )
+        # 2) документ целиком влезает в лимит → прямой FULLREAD
+        elif full_len <= _limit:
             system_prompt = (
                 "Ты ассистент по дипломным работам. Тебе дан ПОЛНЫЙ текст ВКР/документа.\n"
                 "Отвечай строго по этому тексту, без внешних фактов. Не добавляй разделов вида "
                 "«Чего не хватает» и не проси дополнительные данные.\n"
-                "Если вопрос про таблицы/рисунки — используй подписи и ближайший текст; не придумывай номера/значения.\n"
+                "Если вопрос про таблицы/рисунки — используй подписи и ближайший текст; не придумывай номера/значения. "
+                "Не придумывай также предметную область и термины (например, продажи, клиенты, выручка, маркетинг и т.п.), "
+                "если они прямо не указаны в тексте.\n"
                 "Если запрошенного рисунка/таблицы нет в тексте — ответь: «данного рисунка нет в работе».\n"
                 "Если объект есть, но он в плохом качестве/нечитаем — ответь: «Рисунок плохого качества, не могу проанализировать», "
                 "и добавь краткую подпись/контекст из текста. Цитируй коротко, без ссылок на страницы."
@@ -5060,25 +5346,39 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
 
             if STREAM_ENABLED and chat_with_gpt_stream is not None:
                 try:
-                    stream = chat_with_gpt_stream(messages, temperature=0.2, max_tokens=FINAL_MAX_TOKENS)  # type: ignore
+                    stream = chat_with_gpt_stream(
+                        messages,
+                        temperature=0.2,
+                        max_tokens=FINAL_MAX_TOKENS,
+                    )  # type: ignore
                     await _stream_to_telegram(m, stream)
                     return
                 except Exception as e:
                     logging.exception("auto fullread stream failed: %s", e)
+
             try:
-                ans = chat_with_gpt(messages, temperature=0.2, max_tokens=FINAL_MAX_TOKENS)
+                ans = chat_with_gpt(
+                    messages,
+                    temperature=0.2,
+                    max_tokens=FINAL_MAX_TOKENS,
+                )
                 if ans:
                     await _send(m, _strip_unwanted_sections(ans))
                     return
             except Exception as e:
                 logging.exception("auto fullread non-stream failed: %s", e)
+        # 3) документ длинный → итеративное чтение (map→reduce)
         else:
             # документ большой → итеративное чтение (map→reduce)
             messages, err = _iterative_fullread_build_messages(uid, doc_id, q_text)
             if messages:
                 if STREAM_ENABLED and chat_with_gpt_stream is not None:
                     try:
-                        stream = chat_with_gpt_stream(messages, temperature=0.2, max_tokens=FINAL_MAX_TOKENS)  # type: ignore
+                        stream = chat_with_gpt_stream(
+                            messages,
+                            temperature=0.2,
+                            max_tokens=FINAL_MAX_TOKENS,
+                        )  # type: ignore
                         await _stream_to_telegram(m, stream)
                         return
                     except Exception as e:
@@ -5091,8 +5391,15 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
                 except Exception as e:
                     logging.exception("auto iterative non-stream failed: %s", e)
             elif err:
-                await _send(m, err)
-                return
+                # В auto-режиме не рвём основной пайплайн, а тихо логируем
+                logging.warning(
+                    "ANSWER: FULLREAD(auto) iterative build failed, "
+                    "falling back to RAG (uid=%s, doc_id=%s): %s",
+                    uid,
+                    doc_id,
+                    err,
+                )
+                # без return — ниже спокойно отработает обычный RAG-ответ
 
     # ====== FULLREAD: iterative/digest ======
     if fr_mode in {"iterative", "digest"} and not pure_figs:
@@ -5121,6 +5428,12 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
     # ====== Стандартный мульти-интент пайплайн (RAG) ======
     await _ensure_modalities_indexed(m, uid, doc_id, intents)
     facts = _gather_facts(uid, doc_id, intents)
+    logger.info(
+        "ANSWER: RAG facts gathered (uid=%s, doc_id=%s, keys=%s)",
+        uid,
+        doc_id,
+        list(facts.keys()) if isinstance(facts, dict) else type(facts),
+    )
 
     # NEW: если по общему вопросу ничего не нашлось именно в тексте работы —
     # сначала спрашиваем, можно ли ответить в общем виде как [модель].
@@ -5138,24 +5451,41 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
         return
 
     # ↓ НОВОЕ: если есть план подпунктов — включаем многошаговую подачу
-    discovered_items = None
+        # ↓ НОВОЕ: если есть план подпунктов — включаем многошаговую подачу,
+    # но только когда это реально оправдано (есть подпункты и вопрос не слишком короткий).
+    discovered_items: list[dict] | None = None
     if isinstance(facts, dict):
-        discovered_items = (facts.get("coverage", {}).get("items")
-                            or facts.get("general_subitems"))
-    try:
-        handled = await _run_multistep_answer(
-            m, uid, doc_id, q_text, discovered_items=discovered_items  # отправит A→B→… и вернёт True
+        discovered_items = (
+            (facts.get("coverage") or {}).get("items")
+            or facts.get("general_subitems")
         )
-        if handled:
-            return
-    except Exception as e:
-        logging.exception("multistep pipeline failed, fallback to normal: %s", e)
+
+    if _should_use_multistep(q_text, discovered_items):
+        try:
+            handled = await _run_multistep_answer(
+                m,
+                uid,
+                doc_id,
+                q_text,
+                discovered_items=discovered_items,  # отправит A→B→… и вернёт True
+            )
+            if handled:
+                return
+        except Exception as e:
+            logging.exception("multistep pipeline failed, fallback to normal: %s", e)
+    # если мультишаг не подошёл — ниже идём по обычному пайплайну
+
 
 
         # обычный путь + явная инструкция по вербозности
     verbosity = _detect_verbosity(q_text)
-    SAFE_RULES = ("Отвечай строго по приведённым фактам и цитатам из контекста. "
-                "Если данных нет — так и скажи, без домыслов. Не придумывай номера/значения.")
+    SAFE_RULES = (
+        "Отвечай строго по приведённым фактам и цитатам из контекста. "
+        "Если данных нет — так и скажи, без домыслов. Не придумывай номера/значения "
+        "и не придумывай предметную область и термины (например, продажи, клиенты, выручка, "
+        "маркетинг и т.п.), если их нет в тексте."
+    )
+
     enriched_q = f"{SAFE_RULES}\n\n{q_text}\n\n{_verbosity_addendum(verbosity)}"
 
     # если хочется обновлять «последний упомянутый рисунок» — возьми из текста запроса
@@ -5163,7 +5493,7 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
     if figs_in_q:
         LAST_REF.setdefault(uid, {})["figure_nums"] = figs_in_q
 
-    # NEW: прямой мультимодальный ответ, если есть релевантные картинки из документа
+        # NEW: прямой мультимодальный ответ, если есть релевантные картинки из документа
     # (не ломает старую логику: если не получилось/нет картинок — идём в generate_answer)
     try:
         if intents.get("general_question") and getattr(Cfg, "vision_active", lambda: False)():
@@ -5176,8 +5506,11 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
                 mm_system = (
                     "Ты репетитор по ВКР. У тебя есть вопрос, краткий текстовый контекст и сами изображения "
                     "(фото/сканы/диаграммы) из документа. Отвечай по делу, используя изображения напрямую. "
-                    "Не придумывай значения и номера, пиши только то, что видно или есть в тексте."
+                    "Не придумывай значения и номера, пиши только то, что видно или есть в тексте. "
+                    "Не придумывай также предметную область и термины (например, продажи, клиенты, выручка, "
+                    "маркетинг и т.п.), если они не указаны в тексте или подписях к изображениям."
                 )
+
                 mm_prompt = (f"{q_text}\n\nКонтекст из документа:\n{ctx}" if ctx else q_text)
 
                 if STREAM_ENABLED and chat_with_gpt_stream_multimodal is not None:
@@ -5191,31 +5524,55 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
                     await _stream_to_telegram(m, stream)
                     return
                 elif chat_with_gpt_multimodal is not None:
-                    ans = chat_with_gpt_multimodal(
+                    ans_mm = chat_with_gpt_multimodal(
                         mm_prompt,
                         image_paths=img_paths,
                         system=mm_system,
                         temperature=0.2,
                         max_tokens=FINAL_MAX_TOKENS,
                     )
-                    if ans:
-                        await _send(m, _strip_unwanted_sections(ans))
+                    ans_mm = (ans_mm or "").strip()
+                    if ans_mm:
+                        await _send(m, _strip_unwanted_sections(ans_mm))
                         return
     except Exception as e:
         logging.exception("multimodal answer path failed, falling back: %s", e)
 
-    # старый путь RAG → генерация
+    # --- старый путь RAG → генерация ответа по фактам (answer_builder) ---
+
+    # 1) пробуем стримовую версию, если она есть
     if STREAM_ENABLED and generate_answer_stream is not None:
         try:
-            stream = generate_answer_stream(enriched_q, facts, language=intents.get("language", "ru"))
+            stream = generate_answer_stream(
+                enriched_q,
+                facts,
+                language=intents.get("language", "ru"),
+            )
             await _stream_to_telegram(m, stream)
             return
-        except Exception as e:
-            logging.exception("stream answer failed, fallback to non-stream: %s", e)
+        except Exception:
+            logging.exception("generate_answer_stream failed, fallback to sync")
 
-    reply = generate_answer(enriched_q, facts, language=intents.get("language", "ru"))
-    await _send(m, _strip_unwanted_sections(reply))
+    # 2) нестримовый фолбэк
+    try:
+        answer = generate_answer(
+            enriched_q,
+            facts,
+            language=intents.get("language", "ru"),
+        )
+    except Exception as e:
+        logging.exception("generate_answer failed: %s", e)
+        answer = ""
 
+    # 3) страховка от пустого ответа: всегда что-то показываем
+    answer = (answer or "").strip()
+    if not answer:
+        answer = (
+            "Не удалось получить содержательный ответ из текста работы. "
+            "Попробуй переформулировать вопрос или уточнить, какой раздел, таблицу или рисунок тебя интересует."
+        )
+
+    await _send(m, _strip_unwanted_sections(answer))
 
 
 # ------------------------------ эмбеддинг-профиль ------------------------------
@@ -5227,31 +5584,55 @@ def _current_embedding_profile() -> str:
     return f"emb={Cfg.POLZA_EMB}"
 
 def _needs_reindex_by_embeddings(con, doc_id: int) -> bool:
+    """
+    Проверяем, не пора ли переиндексировать документ из-за смены embedding-модели
+    или размерности эмбеддингов.
+
+    В layout_profile храним строку вида:
+      "emb=polza-emb-v1|dim=768"
+    """
     if not _table_has_columns(con, "documents", ["layout_profile"]):
+        # старые базы без layout_profile — лучше переиндексировать
         return True
+
     cur = con.cursor()
     cur.execute("SELECT layout_profile FROM documents WHERE id=?", (doc_id,))
     row = cur.fetchone()
     stored = (row["layout_profile"] or "") if row else ""
     if not stored:
+        # профиля нет — тоже повод переиндексировать
         return True
+
     cur_model = Cfg.POLZA_EMB.strip().lower()
     stored_model = ""
-    stored_dim = None
+    stored_dim: int | None = None
+
     for part in stored.split("|"):
         part = (part or "").strip().lower()
         if part.startswith("emb="):
+            # "emb=polza-emb-v1" → "polza-emb-v1"
             stored_model = part[4:]
-        if part.startswith("dim="):
+        elif part.startswith("dim="):
+            # "dim=768" → 768
             try:
                 stored_dim = int(part[4:])
-            except Exception:
+            except ValueError:
                 stored_dim = None
+
+    # если embedding-модель поменялась — точно переиндексировать
     if stored_model and stored_model != cur_model:
         return True
-    cur_dim = probe_embedding_dim(None)
-    if cur_dim and stored_dim and stored_dim != cur_dim:
+
+    # сверяем размерность эмбеддингов, если она известна
+    try:
+        cur_dim = probe_embedding_dim(None)
+    except Exception:
+        cur_dim = None
+
+    if cur_dim and stored_dim and cur_dim != stored_dim:
         return True
+
+    # всё совпало — можно не трогать документ
     return False
 
 

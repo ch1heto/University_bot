@@ -303,21 +303,16 @@ def infer_doc_kind(filename: str | None) -> str:
 def split_document(text: str, max_chunk_size: int = 3000) -> List[str]:
     """
     Разбивает текст на части, чтобы каждая часть не превышала max_chunk_size символов.
-    Ставит разрывы по «хорошим» границам (параграф/строка/слово), когда возможно.
+    Использует ту же логику, что и split_for_telegram, чтобы нарезка была одинаковой
+    и для Telegram, и для долгих текстов.
     """
     text = text or ""
+    if not text:
+        return []
     if len(text) <= max_chunk_size:
-        return [text] if text else []
-
-    parts: List[str] = []
-    i = 0
-    while i < len(text):
-        j = _smart_cut_point(text, i, max_chunk_size)
-        chunk = text[i:j].strip()
-        if chunk:
-            parts.append(chunk)
-        i = j
-    return parts
+        return [text]
+    # переиспользуем уже настроенный алгоритм «умной» нарезки
+    return list(split_for_telegram(text, limit=max_chunk_size))
 
 
 # ------------------------- УТИЛИТЫ ДЛЯ «Структурированного парсинга + кеша» -------------------------

@@ -218,28 +218,29 @@ class Cfg:
 
     # Лимиты/бюджеты для FULLREAD
     FULLREAD_MAX_STEPS: int = _env_int("FULLREAD_MAX_STEPS", 6)
-    FULLREAD_STEP_CHARS: int = _env_int("FULLREAD_STEP_CHARS", 20_000)
+    FULLREAD_STEP_CHARS: int = _env_int("FULLREAD_STEP_CHARS", 30_000)
     FULLREAD_CHUNK_CHARS: int = _env_int("FULLREAD_CHUNK_CHARS", FULLREAD_STEP_CHARS)
-    FULLREAD_MAX_SECTIONS: int = _env_int("FULLREAD_MAX_SECTIONS", 120)
-    FULLREAD_CONTEXT_CHARS: int = _env_int("FULLREAD_CONTEXT_CHARS", 30_000)
-    DIRECT_MAX_CHARS: int = _env_int("DIRECT_MAX_CHARS", 300_000)
+    FULLREAD_MAX_SECTIONS: int = _env_int("FULLREAD_MAX_SECTIONS", 150)
+    FULLREAD_CONTEXT_CHARS: int = _env_int("FULLREAD_CONTEXT_CHARS", 50_000)
+    DIRECT_MAX_CHARS: int = _env_int("DIRECT_MAX_CHARS", 500_000)
 
-    FULLREAD_MAP_TOKENS: int = _env_int("FULLREAD_MAP_TOKENS", 600)
-    FULLREAD_REDUCE_TOKENS: int = _env_int("FULLREAD_REDUCE_TOKENS", 2_400)
-    DIGEST_TOKENS_PER_SECTION: int = _env_int("DIGEST_TOKENS_PER_SECTION", 900)
+    FULLREAD_MAP_TOKENS: int = _env_int("FULLREAD_MAP_TOKENS", 900)
+    FULLREAD_REDUCE_TOKENS: int = _env_int("FULLREAD_REDUCE_TOKENS", 8_000)
+    DIGEST_TOKENS_PER_SECTION: int = _env_int("DIGEST_TOKENS_PER_SECTION", 1_400)
+
 
     FULLREAD_ENABLE_VISION: bool = _env_bool("FULLREAD_ENABLE_VISION", True)
 
     # --- Бюджеты генерации ---
-    ANSWER_MAX_TOKENS: int = _env_int("ANSWER_MAX_TOKENS", 2_400)
-    EDITOR_MAX_TOKENS: int = _env_int("EDITOR_MAX_TOKENS", 1_800)
-    CRITIC_MAX_TOKENS: int = _env_int("CRITIC_MAX_TOKENS", 600)
-    EXPLAIN_MAX_TOKENS: int = _env_int("EXPLAIN_MAX_TOKENS", 2_400)
-    EXPAND_MAX_TOKENS: int = _env_int("EXPAND_MAX_TOKENS", 2_400)
-    PLANNER_MAX_TOKENS: int = _env_int("PLANNER_MAX_TOKENS", 500)
-    PART_MAX_TOKENS: int = _env_int("PART_MAX_TOKENS", 900)
-    MERGE_MAX_TOKENS: int = _env_int("MERGE_MAX_TOKENS", 2_400)
-    FINAL_MAX_TOKENS: int = _env_int("FINAL_MAX_TOKENS", 2_400)
+    ANSWER_MAX_TOKENS: int = _env_int("ANSWER_MAX_TOKENS", 8_000)
+    EDITOR_MAX_TOKENS: int = _env_int("EDITOR_MAX_TOKENS", 2_600)
+    CRITIC_MAX_TOKENS: int = _env_int("CRITIC_MAX_TOKENS", 900)
+    EXPLAIN_MAX_TOKENS: int = _env_int("EXPLAIN_MAX_TOKENS", 8_000)
+    EXPAND_MAX_TOKENS: int = _env_int("EXPAND_MAX_TOKENS", 10_000)
+    PLANNER_MAX_TOKENS: int = _env_int("PLANNER_MAX_TOKENS", 800)
+    PART_MAX_TOKENS: int = _env_int("PART_MAX_TOKENS", 1_500)
+    MERGE_MAX_TOKENS: int = _env_int("MERGE_MAX_TOKENS", 8_000)
+    FINAL_MAX_TOKENS: int = _env_int("FINAL_MAX_TOKENS", 10_000)
 
     # --- Полные выгрузки таблиц (TablesRaw) ---
     FULL_TABLE_MAX_ROWS: int = _env_int("FULL_TABLE_MAX_ROWS", 500)
@@ -267,7 +268,7 @@ class Cfg:
     STREAM_EDIT_INTERVAL_MS: int = _env_int("STREAM_EDIT_INTERVAL_MS", 1_200)
     STREAM_MIN_CHARS: int = _env_int("STREAM_MIN_CHARS", 700)
     STREAM_MODE: str = _env_str("STREAM_MODE", "multi")  # "edit" | "multi"
-    TG_MAX_CHARS: int = _env_int("TG_MAX_CHARS", 3_900)
+    TG_MAX_CHARS: int = _env_int("TG_MAX_CHARS", 4_000)
     STREAM_HEAD_START_MS: int = _env_int("STREAM_HEAD_START_MS", 250)
     TYPE_INDICATION_EVERY_MS: int = _env_int("TYPE_INDICATION_EVERY_MS", 2_000)
 

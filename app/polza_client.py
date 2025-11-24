@@ -45,9 +45,9 @@ __all__ = [
     "vision_describe",
     "vision_describe_many",
     "vision_extract_values",
+    "vision_extract_table_values",  # <— добавили
     "vision_describe_with_values",  # новый режим: описание + попытка вытащить числа
 ]
-
 
 # -----------------------------
 # Внутренние хелперы
@@ -1088,3 +1088,28 @@ def vision_extract_values(
     _VISION_CACHE[cache_key] = obj
     _vcache_put(cache_key, obj)
     return obj
+
+
+def vision_extract_table_values(
+    image_or_images: Union[str, List[str]],
+    *,
+    caption_hint: Optional[str] = None,
+    ocr_hint: Optional[str] = None,
+    temperature: float = 0.0,
+    max_tokens: int = 1400,
+    lang: str = "ru",
+) -> Dict[str, Any]:
+    """
+    Обёртка над vision_extract_values, которую ждёт bot.py
+    для извлечения табличных данных с изображений.
+    Пока используем общую логику vision_extract_values.
+    """
+    return vision_extract_values(
+        image_or_images=image_or_images,
+        caption_hint=caption_hint,
+        ocr_hint=ocr_hint,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        lang=lang,
+    )
+

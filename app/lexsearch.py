@@ -205,15 +205,16 @@ def _load_sections(owner_id: int, doc_id: int, *, kind: Optional[str] = None) ->
             attrs = {}
         out.append({
             "ord": r["ord"],
-            "title": r.get("title") or "",
-            "level": r.get("level"),
+            "title": r["title"] or "",
+            "level": r["level"],
             "page": r["page"],
             "section_path": r["section_path"] or "",
-            "element_type": (r.get("element_type") or "").lower(),
+            "element_type": (r["element_type"] or "").lower(),
             "text": r["text"] or "",
             "attrs": attrs,
         })
     return out
+
 
 def _find_area_prefix(owner_id: int, doc_id: int, area_num: str) -> Optional[str]:
     """
@@ -511,8 +512,11 @@ def id_aware_search(owner_id: int,
     """
     meta = parse_query_ids(query)
     area_prefix: Optional[str] = None
-    if meta.get("area_num"):
-        area_prefix = _find_area_prefix(owner_id, doc_id, meta["area_num"])
+
+    # сначала пробуем area_num из parse_query_ids, затем fallback на детерминированный парсер _parse_section_scope
+    area_num = meta.get("area_num") or _parse_section_scope(query)
+    if area_num:
+        area_prefix = _find_area_prefix(owner_id, doc_id, area_num)
 
     # Приоритет: если явно указан ID рисунка/таблицы — находим его
     tkind = meta.get("target_kind")
@@ -524,37 +528,39 @@ def id_aware_search(owner_id: int,
             attrs = sec.get("attrs") or {}
             scope = attrs.get("section_scope") or sec.get("section_path") or ""
 
-            # Якорный чанк той же секции (если есть)
+            # Якорный чанк той же секции (если есть) + локальный контекст вокруг него
             anchor_hits: List[Dict[str, Any]] = []
+            neighbor_hits: List[Dict[str, Any]] = []
+            heading_hits: List[Dict[str, Any]] = []
+            mention_hits: List[Dict[str, Any]] = []
+
             con = get_conn()
-            cur = con.cursor()
             try:
+                cur = con.cursor()
                 cur.execute(
                     "SELECT id, page, section_path, text FROM chunks WHERE owner_id=? AND doc_id=? AND section_path=? LIMIT 1",
                     (owner_id, doc_id, sec.get("section_path") or "")
                 )
                 row = cur.fetchone()
+                anchor_id: Optional[int] = None
+                if row:
+                    anchor_id = int(row["id"])
+                    anchor_hits.append({
+                        "id": row["id"],
+                        "page": row["page"],
+                        "section_path": row["section_path"],
+                        "text": row["text"] or "",
+                        "score": 1.0,
+                    })
+
+                if anchor_id is not None:
+                    neighbor_hits = _gather_neighbors(con, owner_id, doc_id, anchor_id, before=3, after=3)
+                    heading_hits = _nearest_heading(con, owner_id, doc_id, anchor_id)
+
+                # упоминания "Рисунок/Таблица N.M" по всему документу (пара абзацев)
+                mention_hits = _gather_mentions(con, owner_id, doc_id, tnum, tkind, limit=4)
             finally:
                 con.close()
-                anchor_id = int(row["id"]) if row else None
-            if row:
-                anchor_hits.append({
-                    "id": row["id"],
-                    "page": row["page"],
-                    "section_path": row["section_path"],
-                    "text": row["text"] or "",
-                    "score": 1.0
-                })
-
-            # NEW: расширяем локальный контекст вокруг найденной секции
-            neighbor_hits: List[Dict[str, Any]] = []
-            heading_hits: List[Dict[str, Any]] = []
-            mention_hits: List[Dict[str, Any]] = []
-            if anchor_id is not None:
-                neighbor_hits = _gather_neighbors(con, owner_id, doc_id, anchor_id, before=3, after=3)
-                heading_hits = _nearest_heading(con, owner_id, doc_id, anchor_id)
-            # упоминания "Рисунок/Таблица N.M" по всему документу (пара абзацев)
-            mention_hits = _gather_mentions(con, owner_id, doc_id, tnum, tkind, limit=4)
 
             area_hits = hybrid_search(
                 owner_id, doc_id, query, sem_top_k=6, lex_top_k=12, merge_top_k=10,
@@ -572,22 +578,62 @@ def id_aware_search(owner_id: int,
 
             return {
                 "found": True, "context": ctx, "kind": tkind, "label": tnum,
-                "area_prefix": scope, "suggestions": None
+                "area_prefix": scope, "suggestions": None,
             }
 
         return {
             "found": False, "context": "", "kind": tkind, "label": tnum,
-            "area_prefix": area_prefix, "suggestions": sugg or []
+            "area_prefix": area_prefix, "suggestions": sugg or [],
         }
 
+
     # Если область задана, но без ID — ограничим поиск ей
+        # Если область задана, но без ID — сначала пробуем ограничиться ей,
+    # а при полном отсутствии хитов делаем обычный поиск по всему документу.
     if area_prefix:
-        hits = hybrid_search(owner_id, doc_id, query, sem_top_k=6, lex_top_k=12, merge_top_k=8,
-                             section_prefix=area_prefix)
+        hits = hybrid_search(
+            owner_id,
+            doc_id,
+            query,
+            sem_top_k=6,
+            lex_top_k=12,
+            merge_top_k=8,
+            section_prefix=area_prefix,
+        )
+
         if not hits:
-            return {"found": False, "context": "", "kind": None, "label": None, "area_prefix": area_prefix, "suggestions": []}
+            # Fallback: игнорируем подсказку области и ищем по всему документу
+            hits = hybrid_search(owner_id, doc_id, query, sem_top_k=6, lex_top_k=12, merge_top_k=8)
+            if not hits:
+                return {
+                    "found": False,
+                    "context": "",
+                    "kind": None,
+                    "label": None,
+                    "area_prefix": area_prefix,
+                    "suggestions": [],
+                }
+            ctx = build_context(hits, max_chars=max_ctx_chars)
+            return {
+                "found": True,
+                "context": ctx,
+                "kind": None,
+                "label": None,
+                # область не сработала, контекст общий
+                "area_prefix": None,
+                "suggestions": None,
+            }
+
         ctx = build_context(hits, max_chars=max_ctx_chars)
-        return {"found": True, "context": ctx, "kind": None, "label": None, "area_prefix": area_prefix, "suggestions": None}
+        return {
+            "found": True,
+            "context": ctx,
+            "kind": None,
+            "label": None,
+            "area_prefix": area_prefix,
+            "suggestions": None,
+        }
+
 
     # Обычный путь — без области/ID
     hits = hybrid_search(owner_id, doc_id, query, sem_top_k=6, lex_top_k=12, merge_top_k=8)

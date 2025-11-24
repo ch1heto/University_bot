@@ -391,8 +391,27 @@ def retrieve(
     Возвращает top-k чанков по косинусному сходству с вопросом (с лёгким переранжированием).
     Можно ограничивать областью (section_prefix) и/или типами чанков (element_types).
     Каждый элемент: {id, page, section_path, text, score}.
+
+    NEW:
+      - перед обычным семантическим поиском пробуем подтянуть «специальные» источники
+        для явных ссылок вида «Таблица 2.2», «все значения таблицы 3.1», «Рисунок 6» —
+        через _inject_special_sources_for_item();
+      - все источники (спец + обычные + синтетические по рисункам) дедуплицируем по id.
     """
     pack = _load_doc(owner_id, doc_id)
+
+    # Специальные источники: таблицы/рисунки, если явно упомянуты в вопросе
+    used_ids: set[int] = set()
+    special: List[Dict[str, Any]] = _inject_special_sources_for_item(
+        pack,
+        query,
+        used_ids,
+        doc_id=doc_id,
+    )
+    # for_item для одиночного вопроса нам не нужен
+    for sp in special:
+        sp["for_item"] = None
+
     rescored = _score_and_rank(
         pack,
         query,
@@ -400,7 +419,9 @@ def retrieve(
         section_prefix=section_prefix,
         element_types=element_types,
     )
-    if not rescored:
+
+    # Если ни семантики, ни спец-источников не нашли — выходим
+    if not rescored and not special:
         return []
 
     # Фильтр источников если их явно не просили
@@ -416,25 +437,43 @@ def retrieve(
 
     out: List[Dict] = []
 
-    # NEW: если вопрос ссылается на «Рисунок N» — добавляем синтетические сниппеты с анализом рисунков
-    fig_snips = _figure_context_snippets_for_query(doc_id, query, max_items=2)
-    out.extend(fig_snips)
+    # 1) сначала добавляем спец-фрагменты (таблицы/рисунки, «все значения таблицы» и т.п.)
+    for sp in special:
+        if sp["id"] in used_ids:
+            continue
+        out.append(sp)
+        used_ids.add(sp["id"])
 
-    # затем добираем обычные чанки до top_k
+    # 2) если вопрос ссылается на «Рисунок N» — добавляем синтетические сниппеты с анализом рисунков
+    fig_snips = _figure_context_snippets_for_query(doc_id, query, max_items=2)
+    for fs in fig_snips:
+        fid = int(fs.get("id", 0))
+        if fid in used_ids:
+            continue
+        out.append(fs)
+        used_ids.add(fid)
+
+    # 3) затем добираем обычные чанки до top_k
     for i, sc in best:
         if len(out) >= top_k:
             break
         m = pack["meta"][int(i)]
+        mid = m["id"]
+        if mid in used_ids:
+            continue
         out.append(
             {
-                "id": m["id"],
+                "id": mid,
                 "page": m["page"],
                 "section_path": m["section_path"],
                 "text": (m["text"] or "").strip(),
                 "score": float(sc),
             }
         )
+        used_ids.add(mid)
+
     return out
+
 
 # --- NEW: chart_matrix/chart_data → rows/values_str (для диаграмм в DOCX)
 def _chart_rows_from_attrs(attrs: str | dict | None) -> list[dict] | None:
