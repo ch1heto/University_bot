@@ -44,7 +44,7 @@ FIG_NUM_RE = re.compile(
 
 # Секции/главы — подсказки, где искать («глава 2.2», «раздел 3», «§ 1.4», «section 4.1», «appendix A.1»)
 SECTION_HINT_RE = re.compile(
-    r"(?i)\b(глава|раздел|пункт|подраздел|§|section|subsection|chapter|clause|appendix)\s*([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)"
+    r"(?i)\b(глав\w*|раздел\w*|пункт\w*|подраздел\w*|§|section|subsection|chapter|clause|appendix)\s*([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)"
 )
 
 # «в главе есть таблица» (ранее)
@@ -123,9 +123,15 @@ LINKS_HINT_RE = re.compile(
 BULLET_SPLIT_RE = re.compile(
     r"(?m)^\s*(?:\d{1,2}[.)]\s+|\(\d{1,2}\)\s+|[-–—•●▪︎►»]\s+)"
 )
-# Разделители в одну строку ";", " ; ", " | " и множественные "?".
+# Разделители в одну строку ";", " ; ", " | " и множественные "?". 
 INLINE_SPLIT_RE = re.compile(r"(?:\s*;\s*|\s*\|\s*|\?\s+)(?!\d)")
 
+# Новый разделитель: несколько объектов документа в одной фразе
+# "рисунок 2.2, таблицу 2.1 и главу 1"
+DOC_OBJECT_SPLIT_RE = re.compile(
+    r"\s*(?:,|\s+и\s+)\s*(?=(рисунк\w*|таблиц\w*|табл\.|глав\w*|раздел\w*|section|chapter))",
+    re.IGNORECASE,
+)
 
 # --------------------------- Вспомогалки ---------------------------
 
@@ -273,7 +279,7 @@ def _split_into_subitems(text: str) -> List[str]:
         if len(" ".join(cand)) >= 20 and len(cand) >= 2:
             return [_clean_piece(p) for p in cand]
 
-    # 2) В одну строку — ';', '|', '? ' (несколько вопросов подряд)
+        # 2) В одну строку — ';', '|', '? ' (несколько вопросов подряд)
     inline = [p for p in INLINE_SPLIT_RE.split(t) if p and not re.fullmatch(r"(;|\||\?)", p)]
     if len(inline) >= 2:
         # склеим короткие хвосты обратно (например, аббревиатуры)
@@ -290,8 +296,18 @@ def _split_into_subitems(text: str) -> List[str]:
         if len(items) >= 2:
             return items
 
-    # 3) По нескольким '?'
+    # 3) Несколько объектов документа в одной фразе:
+    #    "опиши рисунок 2.2, таблицу 2.1 и главу 1"
+    doc_parts = [
+        p for p in DOC_OBJECT_SPLIT_RE.split(t)
+        if p and not re.fullmatch(r"(,|и)", p, re.IGNORECASE)
+    ]
+    if len(doc_parts) >= 2:
+        return [_clean_piece(p) for p in doc_parts]
+
+    # 4) По нескольким '?'
     q_splits = [s for s in re.split(r"\?\s*", t) if s]
+
     if len(q_splits) >= 2:
         items = [_clean_piece(s + "?") for s in q_splits[:-1]]
         tail = _clean_piece(q_splits[-1])
@@ -325,11 +341,15 @@ def _classify_item(text: str) -> Dict[str, any]:
             single_table = True
 
     # Один конкретный рисунок (опиши рисунок 6 / что на рисунке 2.3 / figure 4)
-        # Один конкретный рисунок (опиши рисунок 6 / что на рисунке 2.3 / figure 4)
     single_fig = False
     if figures_want:
         if len(figure_nums) == 1 and not (COUNT_HINT_RE.search(item) or WHICH_HINT_RE.search(item)):
             single_fig = True
+
+    # Одна конкретная секция/глава (например: "глава 1", "раздел 2.3")
+    single_section = False
+    if sect_hints and len(sect_hints) == 1 and not tables_want and not figures_want:
+        single_section = True
 
     return {
         "ask": item,
@@ -338,8 +358,9 @@ def _classify_item(text: str) -> Dict[str, any]:
             "describe": table_nums,
             "section_hints": sect_hints if tables_want else [],
             "from_section": (
-                tables_want and not table_nums and
-                (bool(sect_hints) and (bool(SECTION_HAS_TABLE_RE.search(item)) or bool(TABLE_IN_SECTION_RE.search(item))))
+                tables_want and not table_nums
+                and bool(sect_hints)
+                and (bool(SECTION_HAS_TABLE_RE.search(item)) or bool(TABLE_IN_SECTION_RE.search(item)))
             ),
             "include_all_values": bool(include_all) if tables_want else False,
             "rows_limit": rows_limit if tables_want else None,
@@ -351,12 +372,18 @@ def _classify_item(text: str) -> Dict[str, any]:
             "describe": figure_nums,
             "section_hints": sect_hints if figures_want else [],
             "from_section": (
-                figures_want and not figure_nums and
-                (bool(sect_hints) and (bool(SECTION_HAS_FIG_RE.search(item)) or bool(FIG_IN_SECTION_RE.search(item))))
+                figures_want and not figure_nums
+                and bool(sect_hints)
+                and (bool(SECTION_HAS_FIG_RE.search(item)) or bool(FIG_IN_SECTION_RE.search(item)))
             ),
             "want_vision": bool(FIG_VISION_HINT_RE.search(item)) if figures_want else False,
             "single_only": single_fig,
             "exact_numbers": bool(EXACT_NUMBERS_RE.search(item)) if figures_want else False,
+        },
+        "section": {
+            # подсказки по разделам, даже если нет явного слова "таблица/рисунок"
+            "hints": sect_hints,
+            "single_only": single_section,
         },
         "sources": {
             "want": sources_want,
@@ -370,9 +397,6 @@ def _classify_item(text: str) -> Dict[str, any]:
         "want_links": bool(LINKS_HINT_RE.search(item)),
         "exact_numbers": bool(EXACT_NUMBERS_RE.search(item)),
     }
-
-
-
 
 
 # --------------------------- Главный распознаватель ---------------------------
@@ -448,19 +472,51 @@ def detect_intents(text: str, *, list_limit: int = 25) -> Dict:
         "general_question": q,
         "subitems": [],
         "multi_want": False,
+        "id_specific": None,
+
+        # Унифицированный список целей: чем именно интересуется пользователь
+        "targets": {
+            "tables": [],
+            "figures": [],
+            "sections": [],
+        },
     }
 
-
-        # ---- Многочастные запросы (план подпунктов — на будущее для пайплайна)
+    # ---- Многочастные запросы (план подпунктов — на будущее для пайплайна)
     subparts = _split_into_subitems(q)
     if len(subparts) >= 2:
         intents["multi_want"] = True
         intents["subitems"] = []
         for i, sp in enumerate(subparts, start=1):
             cls = _classify_item(sp)
-            # защита от странных случаев, когда _classify_item вернул None или не dict
             if not isinstance(cls, dict):
                 cls = {"ask": sp}
+
+            # определяем id_specific для этого подпункта
+            candidates = []
+
+            # таблица
+            t_info = cls.get("tables") or {}
+            if t_info.get("single_only") and t_info.get("describe"):
+                candidates.append(("table", t_info["describe"][0]))
+
+            # рисунок
+            f_info = cls.get("figures") or {}
+            if f_info.get("single_only") and f_info.get("describe"):
+                candidates.append(("figure", f_info["describe"][0]))
+
+            # секция/глава
+            s_info = cls.get("section") or {}
+            if s_info.get("single_only") and s_info.get("hints"):
+                candidates.append(("section", s_info["hints"][0]))
+
+            if len(candidates) == 1:
+                kind, num = candidates[0]
+                cls["id_specific"] = {"kind": kind, "num": num}
+            else:
+                # либо несколько объектов в подпункте, либо ни одного — ID-режим для него отключаем
+                cls["id_specific"] = None
+
             cls["id"] = i
             intents["subitems"].append(cls)
 
@@ -543,6 +599,41 @@ def detect_intents(text: str, *, list_limit: int = 25) -> Dict:
         if (not nums_f) and sects_f and (SECTION_HAS_FIG_RE.search(q) or FIG_IN_SECTION_RE.search(q)):
             intents["figures"]["from_section"] = True
 
+    # Собираем унифицированный список целей (таблицы/рисунки/главы),
+    # чтобы answer_builder мог легко понять, что запрос многотаргетный.
+    intents["targets"]["tables"] = intents["tables"]["describe"][:]
+    intents["targets"]["figures"] = intents["figures"]["describe"][:]
+
+    sections_all = (intents["tables"]["section_hints"] or []) + (intents["figures"]["section_hints"] or [])
+    seen_sec = set()
+    sec_uniq: List[str] = []
+    for s in sections_all:
+        if s not in seen_sec:
+            seen_sec.add(s)
+            sec_uniq.append(s)
+    intents["targets"]["sections"] = sec_uniq
+
+    # Если явных подпунктов нет, но пользователь в одной фразе упомянул
+    # сразу несколько типов объектов (таблица + рисунок + глава),
+    # помечаем запрос как многотаргетный.
+    if not intents["multi_want"]:
+        targets_cnt = sum(
+            1
+            for xs in (
+                intents["targets"]["tables"],
+                intents["targets"]["figures"],
+                intents["targets"]["sections"],
+            )
+            if xs
+        )
+        if targets_cnt >= 2:
+            intents["multi_want"] = True
+
+    # Если запрос многочастный, не используем глобальный single_only для ID-режима —
+    # ID-таргеты берём только из subitems[i]["id_specific"]
+    if intents["multi_want"]:
+        intents["tables"]["single_only"] = False
+        intents["figures"]["single_only"] = False
 
     logging.debug("INTENTS: %s", json.dumps(intents, ensure_ascii=False))
     return intents

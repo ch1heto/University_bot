@@ -484,16 +484,21 @@ CAPTION_RE_FIG = re.compile(
 )
 
 def _classify_caption(text: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """Возвращает (kind, number_label, tail) или (None, None, None)."""
+    """Возвращает (kind, number_label, tail) или (None, None, None).
+
+    number_label всегда в нормализованном виде (без буквенных префиксов, пробелов и запятых).
+    """
     t = (text or "").strip()
     m = CAPTION_RE_TABLE.match(t)
     if m:
-        num = (m.group(1) or "").replace(",", ".").replace(" ", "")
+        raw_num = (m.group(1) or "")
+        num = _norm_caption_num(raw_num)
         tail = (m.group(2) or "").strip()
         return "table", num, tail
     m = CAPTION_RE_FIG.match(t)
     if m:
-        num = (m.group(1) or "").replace(",", ".").replace(" ", "")
+        raw_num = (m.group(1) or "")
+        num = _norm_caption_num(raw_num)
         tail = (m.group(2) or "").strip()
         return "figure", num, tail
     return None, None, None
@@ -579,6 +584,15 @@ SOURCES_TITLE_RE = re.compile(
 )
 
 APPENDIX_TITLE_RE = re.compile(r"\b(приложени[ея]|appendix)\b", re.IGNORECASE)
+
+# НОВОЕ: текстовый детектор глав/разделов типа «ГЛАВА 1», «Раздел 2.3», «Chapter 1»
+CHAPTER_TITLE_RE = re.compile(
+    r"""^\s*
+        (глава|раздел|chapter)\s+
+        \d+(?:[.,]\d+)*
+        """,
+    re.IGNORECASE | re.VERBOSE,
+)
 
 # разрешаем «12. », «12) », «12 - », «12 — », «[12] », и «12 <пробел>»
 REF_LINE_RE = re.compile(r"^\s*(?:\[(\d+)\]|(\d+)(?:[\.\)\-–—:]\s*|\s+))\s*(.+)$")
@@ -1176,8 +1190,33 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                 })
                 continue
 
-            # Appendix pseudo-heading
             attrs_here = _paragraph_attrs(block)
+
+            # НОВОЕ: текстовый псевдо-заголовок главы/раздела («ГЛАВА 1 ...», «Раздел 2.3 ...»)
+            if CHAPTER_TITLE_RE.match(p_text) and _is_title_candidate(p_text, attrs_here):
+                consider_flush_stale_candidate()
+                flush_text_section()
+                title = p_text or "Глава"
+                # Для простоты считаем такие заголовки уровнем 1
+                lvl = 1
+                sec_id = _enter_heading(lvl, title)
+
+                in_sources = _is_sources_title(title)
+                if _is_appendix_title(title):
+                    in_sources = False
+
+                sections.append({
+                    "title": title,
+                    "level": lvl,
+                    "text": "",
+                    "page": None,
+                    "section_path": _current_scope_path(),
+                    "element_type": "heading",
+                    "attrs": {"style": "pseudo-heading-chapter", "section_id": sec_id, **attrs_here}
+                })
+                continue
+
+            # Appendix pseudo-heading
             if _is_appendix_title(p_text) and _is_title_candidate(p_text, attrs_here):
                 consider_flush_stale_candidate()
                 flush_text_section()
@@ -1250,6 +1289,9 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                 consider_flush_stale_candidate()
                 flush_text_section()
                 figure_counter += 1
+
+                # НОВОЕ: нормализованный номер подписи
+                norm_num: Optional[str] = _norm_caption_num(num) if num else None
                 fig_title = _compose_figure_title(num, tail)
                 attrs_here_fig = _paragraph_attrs(block)
 
@@ -1400,7 +1442,7 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
             table_counter += 1
 
             caption_source = "none"
-            num_final: Optional[str] = None
+            num_final: Optional[str] = None      # raw-строка из подписи/ссылки
             tail_final: Optional[str] = None
 
             if pending_tbl_num:
@@ -1423,6 +1465,8 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                 tail_final = consume_title_candidate()
                 caption_source = "two_lines_before"
 
+            # --- НОВОЕ: нормализованный номер для поиска/ID ---
+            norm_num: Optional[str] = _norm_caption_num(num_final) if num_final else None
 
             t_text = _table_to_text(block) or "(пустая таблица)"
             attrs_tbl = _table_attrs(block) | {"numbers": _extract_numbers(t_text)}
@@ -1430,21 +1474,24 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
             # NEW: порядковый номер таблицы в документе (для fallback-поиска)
             attrs_tbl["order_index"] = table_counter
 
-
             if not tail_final and attrs_tbl.get("header_preview"):
                 tail_final = attrs_tbl["header_preview"]
                 if caption_source == "none":
                     caption_source = "header_row"
 
-            t_title = _compose_table_title(num_final, tail_final)
-            attrs_tbl["caption_num"] = num_final
+            # Для отображения можно использовать нормализованный номер; raw сохраняем отдельно
+            t_title = _compose_table_title(norm_num, tail_final)
+
+            attrs_tbl["caption_raw"] = num_final
+            attrs_tbl["caption_num"] = norm_num
             attrs_tbl["caption_tail"] = tail_final
-            attrs_tbl["label"] = num_final
+            attrs_tbl["label"] = norm_num
             attrs_tbl["title"] = tail_final
             attrs_tbl["caption_source"] = caption_source
             attrs_tbl["section_scope"] = _current_scope_path()
             attrs_tbl["section_scope_id"] = _current_scope_id()
-            attrs_tbl["anchor"] = f"tbl-{(num_final or table_counter)}"
+            attrs_tbl["anchor"] = f"tbl-{(norm_num or table_counter)}"
+
 
             # Явно помечаем происхождение таблицы
             attrs_tbl["origin"] = "docx"

@@ -16,7 +16,12 @@ from aiogram.filters import Command
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.enums import ChatAction
 from aiogram.types import FSInputFile, InputMediaPhoto
-
+from .retrieval import (
+    get_table_context_for_numbers,
+    get_figure_context_for_numbers,
+    get_section_context_for_hints,
+    build_context as build_rag_context,
+)
 from .ooxml_lite import (
     build_index as oox_build_index,
     figure_lookup as oox_fig_lookup,
@@ -225,24 +230,26 @@ _STRUCT_REF_RE = re.compile(
     r"((?:[A-Za-zА-Яа-я](?=[\.\d]))?\s*\d+(?:[.,]\d+)*)"  # номер: 2, 2.1, A.1 и т.п.
 )
 
-
 def extract_struct_refs(question: str) -> list[dict]:
     """
     Ищет в тексте ссылки на таблицы/рисунки/главы с номером.
+    Поддерживает перечисления вида:
+      - "рисунки 2.1 и 2.2"
+      - "таблицы 1.1, 1.2, 1.3"
     Возвращает список словарей:
-      {"kind": "table"|"figure"|"chapter", "num": "2.1", "raw": "таблица 2.1"}
+      {"kind": "table"|"figure"|"chapter", "num": "2.1", "raw": "таблицу 2.1, 2.2 и 2.3"}
     """
     result: list[dict] = []
     if not question:
         return result
 
+    # чтобы не плодить дубли
+    seen: set[tuple[str, str]] = set()
+
     for m in _STRUCT_REF_RE.finditer(question):
         raw = m.group(0)
         kw = (m.group(1) or "").lower()
-        num = (m.group(2) or "").strip()
-
-        if not num:
-            continue
+        first_num = (m.group(2) or "").strip()
 
         if kw.startswith(("табл", "table", "tbl")):
             kind = "table"
@@ -252,7 +259,31 @@ def extract_struct_refs(question: str) -> list[dict]:
             # глава / раздел / chapter / section
             kind = "chapter"
 
-        result.append({"kind": kind, "num": num, "raw": raw})
+        def _add_num(num_str: str) -> None:
+            n = (num_str or "").strip()
+            if not n:
+                return
+            # нормализация: убираем пробелы и заменяем запятую на точку
+            n = n.replace(" ", "").replace(",", ".")
+            key = (kind, n)
+            if not n or key in seen:
+                return
+            seen.add(key)
+            result.append({"kind": kind, "num": n, "raw": raw})
+
+        # 1) первый номер из самого матча
+        if first_num:
+            _add_num(first_num)
+
+        # 2) все последующие номера после матча:
+        #    "рисунки 2.2, 2.3 и 2.4"
+        tail = question[m.end():]
+        for mm in re.finditer(
+            r"\s*(?:,|;|\s+и\s+|\s+and\s+)\s*(\d+(?:[.,]\d+)*)",
+            tail,
+            flags=re.IGNORECASE,
+        ):
+            _add_num(mm.group(1))
 
     return result
 
@@ -293,6 +324,8 @@ async def _answer_structured_multi(
             continue
 
         norm_num = raw_num.replace(" ", "").replace(",", ".")
+        # локальный текст запроса именно про этот объект
+        raw_ref = (r.get("raw") or "").strip()
 
         # --- таблицы ---
         if kind == "table":
@@ -300,7 +333,9 @@ async def _answer_structured_multi(
                 continue
             used_tables.add(norm_num)
 
-            text = await _describe_table_for_multi(uid, doc_id, norm_num, q_text, verbosity)
+            # вместо всего q_text используем локальный саб-вопрос
+            local_q = raw_ref or f"опиши таблицу {raw_num}"
+            text = await _describe_table_for_multi(uid, doc_id, norm_num, local_q, verbosity)
             if not text:
                 parts.append(f"- Таблица {raw_num}: данной таблицы нет в работе.")
             else:
@@ -312,7 +347,8 @@ async def _answer_structured_multi(
                 continue
             used_figs.add(norm_num)
 
-            text = await _describe_figure_for_multi(uid, doc_id, norm_num, q_text, verbosity)
+            local_q = raw_ref or f"опиши рисунок {raw_num}"
+            text = await _describe_figure_for_multi(uid, doc_id, norm_num, local_q, verbosity)
             if not text:
                 parts.append(f"- Рисунок {raw_num}: данного рисунка нет в работе.")
             else:
@@ -324,11 +360,13 @@ async def _answer_structured_multi(
                 continue
             used_sections.add(norm_num)
 
-            text = await _describe_section_for_multi(uid, doc_id, norm_num, q_text, verbosity)
+            local_q = raw_ref or f"опиши главу {raw_num}"
+            text = await _describe_section_for_multi(uid, doc_id, norm_num, local_q, verbosity)
             if not text:
                 parts.append(f"- Глава/раздел {raw_num}: данный раздел в явном виде не найден в работе.")
             else:
                 parts.append(f"**Глава/раздел {raw_num}**\n{text}")
+
 
     if not parts:
         # вообще ничего осмысленного собрать не удалось — пусть дальше отработает обычный пайплайн
@@ -362,31 +400,37 @@ async def _describe_table_for_multi(
     """
     Вспомогательный помощник: делает отдельный GPT-разбор одной таблицы
     (для мультирежима), но ничего не шлёт в Телеграм — просто возвращает текст.
+
+    NEW: контекст по таблице берём через retrieval.get_table_context_for_numbers,
+    чтобы использовать тот же путь, что и в остальных режимах (включая все строки).
     """
     num = (num or "").strip()
     if not num:
         return ""
-    # забираем те же данные, что и в одиночном режиме
-    tbl_block = _ooxml_table_block(uid, doc_id, num)
-    extra = _table_related_context(uid, doc_id, num, max_chars=2000)
-    if not tbl_block and not extra:
-        # вообще ничего не нашли — пусть об этом скажет вызывающий код
+
+    # Берём все строки таблицы через RAG-хелпер
+    snippets = get_table_context_for_numbers(
+        owner_id=uid,
+        doc_id=doc_id,
+        numbers=[num],
+        include_all_values=True,
+        rows_limit=None,
+    )
+    if not snippets:
         return ""
 
-    ctx_tables = (tbl_block or "").strip()
-    full_ctx = ctx_tables
-    if extra:
-        full_ctx += "\n\n[Дополнительный текст по таблице]\n" + extra
+    full_ctx = build_rag_context(snippets, max_chars=4000)
+    if not full_ctx:
+        return ""
 
     system_prompt = (
-        "Ты репетитор по дипломным работам. Ниже дана таблица из диплома в машинно-читаемом виде "
+        "Ты репетитор по дипломным работам. Ниже дана таблица из диплома в текстовом виде "
         "и, возможно, фрагменты текста рядом с ней. Отвечай строго по этим данным: "
         "не придумывай новые строки, столбцы и значения, не придумывай предметную область и термины, "
         "если их нет в заголовках или тексте."
     )
 
     user_prompt = (
-        f"Вопрос пользователя: {question}\n\n"
         f"Сделай понятное человеку объяснение по таблице {num}: что в ней сравнивается, "
         "какие значения выше/ниже и какие 2–3 вывода можно сделать. "
         "Не пересчитывай проценты и не добавляй новых чисел.\n\n"
@@ -423,12 +467,17 @@ async def _describe_figure_for_multi(
 ) -> str:
     """
     Вспомогательный помощник для мультирежима: делает GPT-разбор одного рисунка.
+
+    NEW: данные по рисунку берём из _build_figure_records, который уже:
+      - подтягивает пути к изображениям и подписи;
+      - подмешивает числовые значения диаграммы (chart_data/chart_matrix);
+      - при их отсутствии может использовать значения из таблицы-источника.
     """
     num = (num or "").strip()
     if not num:
         return ""
 
-    # берём те же данные, что и в одиночном режиме
+    # Берём те же данные, что и в одиночном режиме
     try:
         records = _build_figure_records(uid, doc_id, [num]) or []
     except Exception as e:
@@ -439,7 +488,7 @@ async def _describe_figure_for_multi(
         return ""
 
     rec = records[0]
-    parts = []
+    parts: list[str] = []
 
     disp = rec.get("display") or f"Рисунок {rec.get('num') or ''}".strip()
     caption = (rec.get("caption") or "").strip()
@@ -475,8 +524,8 @@ async def _describe_figure_for_multi(
     )
 
     user_prompt = (
-        f"Вопрос пользователя: {question}\n\n"
-        f"Сделай понятное пояснение по рисунку {num}: что на нём изображено и какие 2–3 вывода можно сделать.\n\n"
+        f"Сделай понятное пояснение по рисунку {num}: что на нём изображено "
+        "и какие 2–3 вывода можно сделать.\n\n"
         "[Данные по рисунку]\n"
         f"{ctx}"
         f"{_verbosity_addendum(verbosity, 'объяснения рисунка')}"
@@ -510,27 +559,41 @@ async def _describe_section_for_multi(
 ) -> str:
     """
     Вспомогательный помощник: GPT-разбор одного раздела/главы.
+
+    NEW: вместо локального _section_context используем RAG-хелпер
+    get_section_context_for_hints, который ищет все чанки с section_path,
+    начинающимся на нужную «голову» (например, '3', '3.1', '3.2').
     """
     sec = (num or "").strip()
     if not sec:
         return ""
-    # нормализуем так же, как в основном пайплайне
+
+    # нормализация как раньше
     sec = re.sub(r"^[A-Za-zА-Яа-я]\s+(?=\d)", "", sec)
     sec = sec.replace(" ", "").replace(",", ".")
-    ctx = _section_context(uid, doc_id, sec, max_chars=4000)
+
+    snippets = get_section_context_for_hints(
+        owner_id=uid,
+        doc_id=doc_id,
+        section_hints=[sec],
+        per_section_k=6,
+    )
+    if not snippets:
+        return ""
+
+    ctx = build_rag_context(snippets, max_chars=4000)
     if not ctx:
         return ""
 
     system_prompt = (
-        "Ты репетитор по ВКР. Ниже фрагмент одного раздела/главы диплома. "
+        "Ты репетитор по ВКР. Ниже фрагменты одного раздела/главы диплома. "
         "Кратко и по делу перескажи его содержание простым языком: о чём речь, какие основные идеи, "
         "какие выводы делает автор. Не добавляй новых фактов, которых нет в тексте."
     )
 
     user_prompt = (
-        f"Вопрос пользователя: {question}\n\n"
-        f"Сделай пояснение по разделу/главе {sec}.\n\n"
-        "[Фрагмент раздела]\n"
+        f"Сделай краткое, понятное пояснение по разделу/главе {sec}.\n\n"
+        "[Фрагменты раздела]\n"
         f"{ctx}"
         f"{_verbosity_addendum(verbosity, 'объяснения раздела')}"
     )
@@ -552,6 +615,7 @@ async def _describe_section_for_multi(
     if not answer:
         return ""
     return _strip_unwanted_sections(answer)
+
 
 
 
@@ -683,10 +747,23 @@ def _section_context(owner_id: int, doc_id: int, sec: str, *, max_chars: int = 9
         base.replace(" ", "").replace(".", ","),
     }
     prefixes = ["", "Раздел ", "Пункт ", "Глава ", "Подраздел "]
-    patterns = [f"%{v}%" for v in variants]
-    patterns += [f"%{p}{base}%" for p in prefixes]
-    # уберём дубли и ограничим разумным числом плейсхолдеров
-    patterns = list(dict.fromkeys(patterns))[:8]
+    patterns = set()
+
+    # 1️⃣ Точные и нормализованные варианты
+    for v in variants:
+        patterns.add(f"%{v}%")
+        # Поддержка вида: "3." "3.1", "3.2" — всё, что начинается с нужной главы
+        patterns.add(f"{v}.%")
+
+    # 2️⃣ Любые форматы с ключевыми словами "Глава", "Раздел", "Пункт"
+    prefixes = ["Глава", "Раздел", "Пункт", "Chapter", "Section"]
+    for p in prefixes:
+        patterns.add(f"%{p} {base}%")
+        patterns.add(f"%{p}{base}%")   # без пробела тоже ловим
+
+    # преобразуем обратно в список
+    patterns = list(patterns)[:12]  # оставим небольшой лимит
+
 
     con = get_conn()
     cur = con.cursor()
@@ -4043,8 +4120,6 @@ def _table_related_context(
     return (ctx or "").strip()
 
 
-
-
 async def _answer_table_query(
     m: types.Message,
     uid: int,
@@ -4460,7 +4535,12 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
     """
     Собираем ТОЛЬКО факты из БД/индекса, без генерации текста.
     """
-    facts: dict[str, object] = {"doc_id": doc_id, "owner_id": uid}
+    facts: dict[str, object] = {
+        "doc_id": doc_id,
+        "owner_id": uid,
+        # пробрасываем интенты внутрь facts — answer_builder их умеет использовать
+        "intents": intents,
+    }
     # флаг «точные числа как в документе»
     exact = bool(intents.get("exact_numbers"))
     # если явно просят конкретную таблицу(ы) — всегда работаем в режиме ТОЧНЫХ чисел
@@ -4670,9 +4750,14 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
             "count": int(lst.get("count") or 0),
             "list": list(lst.get("list") or []),
             "more": int(lst.get("more") or 0),
-            "describe_lines": [],
+            # ключи в формате, который ждёт answer_builder
+            "describe": [],
             "describe_cards": [],
+            # на будущее: флаг фокуса на конкретных номерах рисунков
+            "single_only": False,
+            "describe_nums": [],
         }
+
 
         nums = list(intents.get("figures", {}).get("describe") or [])
         if nums:
@@ -4694,7 +4779,7 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
                 )
 
                 if not cards:
-                    figs_block["describe_lines"] = ["Данного рисунка нет в работе."]
+                    figs_block["describe"] = ["Данного рисунка нет в работе."]
                     figs_block["describe_cards"] = []
                 else:
                     # Основное для answer_builder: полный набор describe_cards
@@ -4704,13 +4789,13 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
                     # если запрос был только про конкретные номера.
                     figs_block["list"] = [
                         (c.get("display")
-                         or f"Рисунок {c.get('num') or ''}".strip())
+                        or f"Рисунок {c.get('num') or ''}".strip())
                         for c in cards
                     ]
                     figs_block["count"] = len(figs_block["list"])
                     figs_block["more"] = 0
 
-                    # Для обратной совместимости — короткие describe_lines
+                    # Для обратной совместимости — короткие текстовые описания
                     lines = []
                     for c in cards:
                         disp = c.get("display") or "Рисунок"
@@ -4727,13 +4812,16 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
                             lines.append(f"{disp}: {hint}")
                         else:
                             lines.append(disp)
-                    figs_block["describe_lines"] = lines[:25]
+                    figs_block["describe"] = lines[:25]
+
+                    # 💡 важное: помечаем, что нужно сфокусироваться только на этих номерах
+                    figs_block["single_only"] = True
+                    figs_block["describe_nums"] = list(nums)
             except Exception as e:
-                figs_block["describe_lines"] = [f"Не удалось описать рисунки: {e}"]
+                figs_block["describe"] = [f"Не удалось описать рисунки: {e}"]
                 figs_block["describe_cards"] = []
 
         facts["figures"] = figs_block
-
 
     # ----- Источники -----
     if intents["sources"]["want"]:
@@ -4833,11 +4921,9 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
         if vb:
             facts["verbatim_hits"] = vb
         if cov and cov.get("items"):
+            # coverage в формате, который умеет facts_to_prompt
             facts["coverage"] = {"items": cov["items"]}
-            facts["general_subitems"] = [
-                {"id": i + 1, "ask": s} if isinstance(s, str) else s
-                for i, s in enumerate(cov["items"])
-            ]
+
 
         # --- [VISION] второй проход: числа из диаграмм/картинок (подмешиваем в контекст) ---
         try:

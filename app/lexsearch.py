@@ -518,7 +518,7 @@ def id_aware_search(owner_id: int,
     if area_num:
         area_prefix = _find_area_prefix(owner_id, doc_id, area_num)
 
-    # Приоритет: если явно указан ID рисунка/таблицы — находим его
+        # Приоритет: если явно указан ID рисунка/таблицы — находим его
     tkind = meta.get("target_kind")
     tnum = meta.get("target_num")
     if tkind and tnum:
@@ -577,20 +577,112 @@ def id_aware_search(owner_id: int,
             ctx = build_context(final_hits, max_chars=max_ctx_chars)
 
             return {
-                "found": True, "context": ctx, "kind": tkind, "label": tnum,
-                "area_prefix": scope, "suggestions": None,
+                "found": True,
+                "context": ctx,
+                "kind": tkind,
+                "label": tnum,
+                "area_prefix": scope,
+                "suggestions": None,
             }
 
+        # --- НОВОЕ: фолбэк по текстовым упоминаниям, если структурный ID не нашли ---
+        # Пытаемся хотя бы привязаться к абзацам, где встречается "Таблица/Рисунок N.M"
+        con = get_conn()
+        try:
+            mention_hits = _gather_mentions(con, owner_id, doc_id, tnum, tkind, limit=1)
+            if mention_hits:
+                anchor = mention_hits[0]
+                anchor_id = int(anchor["id"])
+
+                neighbor_hits = _gather_neighbors(con, owner_id, doc_id, anchor_id, before=3, after=3)
+                heading_hits = _nearest_heading(con, owner_id, doc_id, anchor_id)
+
+                # область — по section_path этого упоминания (если есть)
+                scope = anchor.get("section_path") or area_prefix or ""
+
+                area_hits = hybrid_search(
+                    owner_id,
+                    doc_id,
+                    query,
+                    sem_top_k=6,
+                    lex_top_k=12,
+                    merge_top_k=10,
+                    section_prefix=scope or None,
+                )
+
+                by_id: Dict[int, Dict[str, Any]] = {}
+                for lst in ([anchor], heading_hits, neighbor_hits, area_hits):
+                    for h in lst:
+                        by_id.setdefault(int(h["id"]), h)
+
+                final_hits = list(by_id.values())
+                ctx = build_context(final_hits, max_chars=max_ctx_chars)
+
+                return {
+                    "found": True,
+                    "context": ctx,
+                    "kind": tkind,
+                    "label": tnum,
+                    "area_prefix": scope or None,
+                    "suggestions": None,
+                }
+        finally:
+            con.close()
+
+        # Если ни ID, ни текстовых упоминаний — честно говорим, что не нашли
         return {
-            "found": False, "context": "", "kind": tkind, "label": tnum,
-            "area_prefix": area_prefix, "suggestions": sugg or [],
+            "found": False,
+            "context": "",
+            "kind": tkind,
+            "label": tnum,
+            "area_prefix": area_prefix,
+            "suggestions": sugg or [],
         }
+
 
 
     # Если область задана, но без ID — ограничим поиск ей
         # Если область задана, но без ID — сначала пробуем ограничиться ей,
     # а при полном отсутствии хитов делаем обычный поиск по всему документу.
     if area_prefix:
+        # --- НОВОЕ: прямой контекст по всей области (глава/раздел), если такая секция реально есть ---
+        con = get_conn()
+        try:
+            cur = con.cursor()
+            cur.execute(
+                """
+                SELECT id, page, section_path, text
+                FROM chunks
+                WHERE owner_id=? AND doc_id=? AND section_path LIKE ? || '%'
+                ORDER BY id ASC
+                """,
+                (owner_id, doc_id, area_prefix),
+            )
+            rows = cur.fetchall() or []
+        finally:
+            con.close()
+
+        if rows:
+            area_rows: List[Dict[str, Any]] = []
+            for r in rows:
+                area_rows.append({
+                    "id": r["id"],
+                    "page": r["page"],
+                    "section_path": r["section_path"],
+                    "text": r["text"] or "",
+                    "score": 1.0,
+                })
+            ctx = build_context(area_rows, max_chars=max_ctx_chars)
+            return {
+                "found": True,
+                "context": ctx,
+                "kind": None,
+                "label": None,
+                "area_prefix": area_prefix,
+                "suggestions": None,
+            }
+
+        # --- СТАРОЕ поведение: гибридный поиск с ограничением по области + фолбэк на весь документ ---
         hits = hybrid_search(
             owner_id,
             doc_id,
@@ -633,6 +725,7 @@ def id_aware_search(owner_id: int,
             "area_prefix": area_prefix,
             "suggestions": None,
         }
+
 
 
     # Обычный путь — без области/ID

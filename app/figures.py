@@ -160,6 +160,23 @@ _rx_caption = re.compile(
 )
 
 
+def _norm_fig_number(raw: Optional[str]) -> Optional[str]:
+    """
+    Нормализуем номер рисунка в канонический вид:
+      - убираем неразрывные/обычные пробелы внутри
+      - запятые → точки
+      - срезаем хвостовые точечки/скобки: '6.' / '6).' → '6'
+    """
+    if not raw:
+        return None
+    s = str(raw).strip()
+    s = s.replace("\xa0", " ")
+    s = s.replace(" ", "")
+    s = s.replace(",", ".")
+    s = re.sub(r"[.)]+$", "", s)
+    return s or None
+
+
 def parse_caption_line(text: str) -> Tuple[Optional[str], Optional[str]]:
     t = _normalize_text(text)
     m = _rx_caption.match(t)
@@ -167,11 +184,7 @@ def parse_caption_line(text: str) -> Tuple[Optional[str], Optional[str]]:
         return None, None
 
     raw_num = (m.group("num") or "").strip()
-    # "А 1.2" → "А1.2", "A 2,3" → "A2.3"
-    raw_num = raw_num.replace(" ", "")
-    num = raw_num.replace(",", ".")
-    # убираем хвостовые точки/скобки: "6." / "6)." → "6"
-    num = re.sub(r"[.)]+$", "", num)
+    num = _norm_fig_number(raw_num)
     title = _normalize_text(m.group("title"))
     return (num or None), (title or None)
 
@@ -209,7 +222,7 @@ class FigureRecord:
     def build_anchors(self) -> List[str]:
         out: List[str] = []
         if self.number:
-            n = self.number
+            n = _norm_fig_number(self.number) or self.number
             out += [f"рисунок {n}", f"рис. {n}", f"figure {n}", f"fig {n}", n]
         if self.title:
             out.append(_normalize_text(self.title).lower())
@@ -381,6 +394,7 @@ def extract_docx(docx_path: Path, out_dir: Path, neighbor_window: int = NEIGH) -
         for blob, ext in all_blobs:
             order += 1
             shash = _short_hash(blob, 10)
+            # fig_number уже нормализован в parse_caption_line
             if fig_number:
                 fname = f"fig-{fig_number.replace('.', '-')}-{shash}{ext}"
             else:
@@ -400,6 +414,7 @@ def extract_docx(docx_path: Path, out_dir: Path, neighbor_window: int = NEIGH) -
                 caption=caption_text,
                 section=section_path_by_idx.get(i) or None,
             )
+
             rec.anchors = rec.build_anchors()
             figures.append(rec)
 
@@ -1058,14 +1073,20 @@ def query_by_number(index: Dict[str, Any], number: str) -> List[Dict[str, Any]]:
     # позволяем передавать сюда целую подпись "Рисунок 2.3 — ..."
     num_norm, _ = parse_caption_line(raw)
     if not num_norm:
-        num_norm = raw.replace(",", ".").strip()
+        num_norm = _norm_fig_number(raw)
+
+    if not num_norm:
+        return []
 
     figs = index.get("figures", [])
+
+    def _stored_num(f: Dict[str, Any]) -> Optional[str]:
+        return _norm_fig_number(f.get("number"))
 
     # 1) точное совпадение
     exact = [
         f for f in figs
-        if str(f.get("number") or "").strip().replace(",", ".") == num_norm
+        if _stored_num(f) == num_norm
     ]
     if exact:
         return exact
@@ -1077,9 +1098,10 @@ def query_by_number(index: Dict[str, Any], number: str) -> List[Dict[str, Any]]:
 
     prefixed = [
         f for f in figs
-        if str(f.get("number") or "").strip().replace(",", ".").startswith(prefix + ".")
+        if (_stored_num(f) or "").startswith(prefix + ".")
     ]
     return prefixed
+
 
 def query_by_caption(index: Dict[str, Any], text: str, top_k: int = 3) -> List[Dict[str, Any]]:
     q = _normalize_text(text).lower()

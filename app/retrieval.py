@@ -1126,6 +1126,7 @@ def describe_figures_by_numbers(
                 highlights.append(_shorten(rr["text"], 200))
 
         # 4) chart_matrix/values_str — из attrs фигуры
+                # 4) chart_matrix/values_str — из attrs фигуры
         chart_matrix = None
         try:
             attrs = fig.get("attrs")
@@ -1141,7 +1142,37 @@ def describe_figures_by_numbers(
         if isinstance(attrs_obj, dict) and attrs_obj.get("chart_matrix") is not None:
             chart_matrix = attrs_obj.get("chart_matrix")
 
+        # значения, привязанные к САМОЙ диаграмме (chart_data/chart_matrix)
         values_str = _figure_values_str_from_row(fig)
+
+        # NEW: если своих чисел у рисунка нет, но подпись/текст вокруг
+        # явно ссылается на таблицу-источник — подтягиваем значения из таблицы.
+        if not values_str:
+            # берём подпись + соседний текст, чтобы искать фразы "по данным таблицы 2.1"
+            hint_text_parts: List[str] = []
+            if caption:
+                hint_text_parts.append(caption)
+            hint_text_parts.extend(h for h in (highlights or []) if h)
+            hint_text = " ".join(hint_text_parts)
+
+            src_table_num = _extract_table_source_from_text(hint_text)
+            if src_table_num:
+                try:
+                    table_vals = _table_values_for_figure_from_doc(
+                        uid,
+                        doc_id,
+                        src_table_num,
+                        max_rows=12,
+                    )
+                except Exception:
+                    table_vals = None
+
+                if table_vals:
+                    values_str = (
+                        f"Значения диаграммы получены по данным таблицы {src_table_num}:\n"
+                        f"{table_vals}"
+                    )
+
 
         # 5) vision-описание (опционально)
         vision_payload = None
@@ -1192,6 +1223,31 @@ def _num_norm(s: str | None) -> str:
     s = s.replace(" ", "").replace(",", ".")
     s = re.sub(r"[.)]+$", "", s)  # «3.1.» -> «3.1», «(3.1)» -> «3.1»
     return s
+
+# сильные формулировки связи с таблицей:
+# "по данным таблицы 2.1", "по данным табл. 2.1",
+# "на основании данных таблицы 2.1", "согласно таблице 2.1" и т.п.
+_TABLE_SOURCE_RE = re.compile(
+    r"(?i)"
+    r"(?:по\s+данн\w+\s+табл(?:иц\w*)?\s+"
+    r"|на\s+основани[иия]\s+данн\w+\с+табл(?:иц\w*)?\s+"
+    r"|согласно\s+табл(?:иц\w*)?\s+)"
+    r"([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)"
+)
+
+def _extract_table_source_from_text(text: str) -> Optional[str]:
+    """
+    Ищем в подписи/рядом с рисунком сильную фразу вида
+    «по данным таблицы 2.1 / табл. 2.1 / согласно таблице 2.1».
+    Возвращаем нормализованный номер таблицы или None.
+    """
+    if not text:
+        return None
+    m = _TABLE_SOURCE_RE.search(text)
+    if not m:
+        return None
+    return _num_norm(m.group(1))
+
 
 def _table_base_from_section(section_path: str) -> str:
     """Убираем хвост ' [row k]' если присутствует."""
@@ -1386,6 +1442,51 @@ def _gather_table_chunks_for_base(pack: dict, base: str, *, include_header: bool
     out.extend(rows)
     return out
 
+def _table_values_for_figure_from_doc(
+    owner_id: int,
+    doc_id: int,
+    table_num: str,
+    *,
+    max_rows: int = 12,
+) -> Optional[str]:
+    """
+    Для рисунка, построенного «по данным таблицы N», поднимаем текстовые
+    значения этой таблицы из chunks и превращаем их в один текстовый блок.
+
+    Используется ТОЛЬКО когда у самого рисунка нет своих чисел.
+    """
+    pack = _load_doc(owner_id, doc_id)
+    bases = _find_table_bases_by_number(pack, table_num)
+    if not bases:
+        return None
+
+    parts: List[str] = []
+    seen: set[str] = set()
+
+    # обычно первая база — нужная таблица; остальные игнорируем
+    base = bases[0]
+    chunks = _gather_table_chunks_for_base(
+        pack,
+        base,
+        include_header=True,
+        row_limit=max_rows,
+    )
+
+    for ch in chunks:
+        t = _clean_for_ctx(ch.get("text") or "")
+        if not t:
+            continue
+        if t in seen:
+            continue
+        seen.add(t)
+        parts.append(t)
+
+    if not parts:
+        return None
+
+    return "\n".join(parts)
+
+
 def _inject_special_sources_for_item(pack: dict, ask: str, used_ids: set[int], *, doc_id: int) -> List[Dict]:
     """
     Если подпункт явно ссылается на «Таблица N» / «Рисунок N», добавляем соответствующие
@@ -1476,7 +1577,203 @@ def _inject_special_sources_for_item(pack: dict, ask: str, used_ids: set[int], *
                     used_ids.add(m["id"])
                     break  # одного соседнего чанка достаточно
 
-    return added
+        return added
+
+
+# =======================================================================
+#   Публичные хелперы: точечный контекст по таблицам, рисункам и главам
+# =======================================================================
+
+def get_table_context_for_numbers(
+    owner_id: int,
+    doc_id: int,
+    numbers: List[str],
+    *,
+    include_all_values: bool = False,
+    rows_limit: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Возвращает список чанков по номерам таблиц:
+      - заголовок таблицы (если есть),
+      - строки (table_row) в порядке следования.
+
+    Параметры:
+      include_all_values=True  → игнорируем rows_limit и отдаём все строки;
+      rows_limit=N             → ограничиваем количество строк (если include_all_values=False).
+    """
+    if not numbers:
+        return []
+
+    pack = _load_doc(owner_id, doc_id)
+    used_ids: set[int] = set()
+    snippets: List[Dict[str, Any]] = []
+
+    for raw in numbers:
+        num = _num_norm(str(raw))
+        if not num:
+            continue
+
+        bases = _find_table_bases_by_number(pack, num)
+        for base in bases:
+            chunks = _gather_table_chunks_for_base(
+                pack,
+                base,
+                include_header=True,
+                row_limit=None if include_all_values else rows_limit,
+            )
+            for ch in chunks:
+                cid = int(ch["id"])
+                if cid in used_ids:
+                    continue
+                snippets.append(ch)
+                used_ids.add(cid)
+
+    return snippets
+
+
+def get_figure_context_for_numbers(
+    owner_id: int,
+    doc_id: int,
+    numbers: List[str],
+    *,
+    use_vision: bool = True,
+    lang: str = "ru",
+) -> List[Dict[str, Any]]:
+    """
+    Возвращает RAG-фрагменты по номерам рисунков:
+      - page/section_path,
+      - текстовое описание (анализ + подпись + values_str для диаграмм),
+      - при необходимости vision-описание и пути к изображениям.
+
+    Формат элементов максимально близок к элементам retrieve():
+      {id, page, section_path, text, score}
+    """
+    if not numbers:
+        return []
+
+    cards = describe_figures_by_numbers(
+        uid=owner_id,
+        doc_id=doc_id,
+        numbers=numbers,
+        sample_chunks=2,
+        use_vision=use_vision,
+        lang=lang,
+    )
+
+    snippets: List[Dict[str, Any]] = []
+    used_ids: set[int] = set()
+
+    for card in cards:
+        num = card.get("num")
+        where = card.get("where") or {}
+        page = where.get("page")
+        sec = where.get("section_path") or ""
+
+        # строим текст так же, как в _build_figure_context_text
+        analysis = card.get("analysis") or {}
+        fig_stub = {
+            "label": num,
+            "figure_label": num,
+            "caption": "",
+            "attrs": {},
+            "page": page,
+            "section": sec,
+        }
+        rec = {"figure": fig_stub, "analysis": analysis}
+        text = _build_figure_context_text(rec)
+        if not text:
+            text = ""
+
+        # NEW: подмешиваем values_str из карточки (сюда могут попасть
+        # либо собственные числа диаграммы, либо значения, подтянутые из таблицы)
+        values_str = card.get("values_str")
+        if values_str and values_str not in text:
+            text = f"{text}\n\n{values_str}".strip()
+
+        if not text:
+            continue
+
+        # synthetic_id — чтобы не конфликтовать с id чанков
+        synthetic_id = -int(20_000_000 + hash(str(num)))
+        if synthetic_id in used_ids:
+            continue
+
+        snippets.append(
+            {
+                "id": synthetic_id,
+                "page": page,
+                "section_path": sec,
+                "text": text,
+                "score": 0.97,
+            }
+        )
+        used_ids.add(synthetic_id)
+
+    return snippets
+
+
+def get_section_context_for_hints(
+    owner_id: int,
+    doc_id: int,
+    section_hints: List[str],
+    *,
+    per_section_k: int = 3,
+) -> List[Dict[str, Any]]:
+    """
+    Возвращает контекст по подсказкам разделов/глав:
+      section_hints = ['1', '2.3', ...] — как из extract_section_hints().
+
+    Для каждого hint берём несколько чанков, у которых section_path
+    начинается с этой «головы» (например, '1', '1.1', '1.2', ...).
+    """
+    if not section_hints:
+        return []
+
+    pack = _load_doc(owner_id, doc_id)
+    snippets: List[Dict[str, Any]] = []
+    used_ids: set[int] = set()
+
+    for h in section_hints:
+        head = str(h or "").strip()
+        if not head:
+            continue
+
+        # Простая фильтрация по префиксу section_path
+        candidates: List[Tuple[int, Dict[str, Any]]] = []
+        for m in pack["meta"]:
+            sp = str(m.get("section_path") or "")
+            # section_path в формате "1", "1/1.1", "[заголовок] 1.1" и т.п. —
+            # используем грубую проверку по вхождению головы
+            if not sp:
+                continue
+            if not (sp.startswith(head) or f"/{head}" in sp or f" {head}" in sp):
+                continue
+            candidates.append(
+                (
+                    int(m["id"]),
+                    {
+                        "id": m["id"],
+                        "page": m["page"],
+                        "section_path": sp,
+                        "text": (m.get("text") or "").strip(),
+                        "score": 0.9,
+                    },
+                )
+            )
+
+        # берём первые per_section_k по порядку появления id
+        candidates.sort(key=lambda t: t[0])
+        taken = 0
+        for cid, item in candidates:
+            if taken >= per_section_k:
+                break
+            if cid in used_ids:
+                continue
+            snippets.append(item)
+            used_ids.add(cid)
+            taken += 1
+
+    return snippets
 
 
 # =======================================================================
@@ -1486,6 +1783,7 @@ def _inject_special_sources_for_item(pack: dict, ask: str, used_ids: set[int], *
 
 # Эвристики распознавания подпунктов
 _ENUM_LINE = re.compile(r"(?m)^\s*(?:\d+[).\)]|[-—•])\s+")
+
 _ENUM_INLINE = re.compile(r"(?:\s|^)\(?\d{1,2}[)\.]\s+")
 
 def plan_subitems(question: str, *, min_items: int = 2, max_items: int = 12) -> List[str]:
@@ -1611,7 +1909,7 @@ def retrieve_coverage(
     owner_id: int,
     doc_id: int,
     question: str,
-    subitems: Optional[List[str]] = None,
+    subitems: Optional[List[Any]] = None,
     *,
     per_item_k: int = 2,
     prelim_factor: int = 4,
@@ -1627,10 +1925,48 @@ def retrieve_coverage(
         "by": {"1":[idx, ...], ...},          # карта: подпункт -> индексы в snippets (для bot.py)
         "snippets": [...],
       }
+
+    subitems может быть:
+      - списком строк: ["опиши рисунок 2.2", "таблицу 2.1", "главу 1"];
+      - списком словарей из intents.detect_intents():
+        [{"id": 1, "ask": "...", ...}, ...].
     """
-    items_list = list(subitems or plan_subitems(question)) if (subitems or question) else []
-    # Нормализуем к нужному для bot.py формату: [{id, ask}]
-    items_norm = [{"id": i + 1, "ask": it} for i, it in enumerate(items_list)]
+    # Если subitems не передан, пытаемся сами распланировать подпункты
+    if subitems is None:
+        items_list: List[str] = list(plan_subitems(question)) if question else []
+        items_norm = [{"id": i + 1, "ask": it} for i, it in enumerate(items_list)]
+    else:
+        # subitems передан явно: может быть list[str] или list[dict]
+        if subitems and isinstance(subitems[0], dict):
+            # Формат из intents.detect_intents(): уже есть id и ask
+            items_norm = []
+            items_list = []
+            for it in subitems:
+                ask = (it.get("ask") or "").strip()
+                if not ask:
+                    continue
+                # если id уже есть — используем его, иначе пронумеруем позже
+                items_norm.append({"id": it.get("id"), "ask": ask, **{k: v for k, v in it.items() if k not in {"id", "ask"}}})
+                items_list.append(ask)
+            # Пронумеруем те элементы, у кого id отсутствует
+            next_id = 1
+            for it in items_norm:
+                if it.get("id") is None:
+                    it["id"] = next_id
+                    next_id += 1
+        else:
+            # Старый формат: список строк
+            items_list = [str(it or "").strip() for it in subitems if str(it or "").strip()]
+            items_norm = [{"id": i + 1, "ask": it} for i, it in enumerate(items_list)]
+
+    if not items_list:
+        # Если подпункты не распознаны — обычный retrieve с небольшим расширением k
+        base = retrieve(owner_id, doc_id, question, top_k=max(10, backfill_k * 2))
+        by_indices = {"_single": list(range(len(base)))}
+        return {"items": [], "by_item": {"_single": base}, "by": by_indices, "snippets": base}
+
+    # ниже оставляем существующую логику как есть
+
 
     if items_list:
         by_item = retrieve_for_items(
