@@ -955,7 +955,7 @@ def get_figure_analysis_by_label(doc_id: int, figure_label: str) -> Optional[Dic
     cur = con.cursor()
     cur.execute(
         """
-        SELECT a.id, a.figure_id, a.kind, a.data_json, a.exact_numbers, a.exact_text,
+        SELECT a.id, a.figure_id, a.kind, a.data_json, a.exact_numbers, a_exact_text,
                a.confidence, a.created_at, a.updated_at
           FROM figures f
           JOIN figure_analysis a ON a.figure_id = f.id
@@ -984,6 +984,63 @@ def get_figure_analysis_by_label(doc_id: int, figure_label: str) -> Optional[Dic
         "confidence": row["confidence"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
+    }
+
+
+def find_nearest_table_above(doc_id: int, chunk_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Находит ближайшую таблицу выше по тексту (по id), в рамках одного документа.
+
+    Ожидания:
+    - таблицы представлены в chunks с element_type='table';
+    - id в chunks растёт по порядку следования элементов в документе.
+
+    Возвращает словарь с базовой мета-информацией по таблице, в т.ч.
+    caption_num / num из attrs (если там есть).
+    """
+    con = get_conn()
+    cur = con.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT id, doc_id, page, section_path, text, attrs
+              FROM chunks
+             WHERE doc_id = ?
+               AND element_type = 'table'
+               AND id < ?
+             ORDER BY id DESC
+             LIMIT 1
+            """,
+            (doc_id, chunk_id),
+        )
+        row = cur.fetchone()
+    finally:
+        con.close()
+
+    if not row:
+        return None
+
+    # аккуратно парсим attrs, вытаскиваем caption_num / num
+    try:
+        attrs = json.loads(row["attrs"]) if row["attrs"] else {}
+    except Exception:
+        attrs = {}
+
+    caption_num = None
+    # самые типичные варианты, которые используются в индексаторе
+    for key in ("caption_num", "num", "number", "label"):
+        if key in attrs and attrs[key]:
+            caption_num = str(attrs[key]).strip()
+            break
+
+    return {
+        "id": row["id"],
+        "doc_id": row["doc_id"],
+        "page": row["page"],
+        "section_path": row["section_path"],
+        "text": row["text"],
+        "attrs": attrs,
+        "caption_num": caption_num,
     }
 
 

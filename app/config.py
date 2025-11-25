@@ -240,7 +240,7 @@ class Cfg:
     PLANNER_MAX_TOKENS: int = _env_int("PLANNER_MAX_TOKENS", 800)
     PART_MAX_TOKENS: int = _env_int("PART_MAX_TOKENS", 1_500)
     MERGE_MAX_TOKENS: int = _env_int("MERGE_MAX_TOKENS", 8_000)
-    FINAL_MAX_TOKENS: int = _env_int("FINAL_MAX_TOKENS", 10_000)
+    FINAL_MAX_TOKENS: int = _env_int("FINAL_MAX_TOKENS", 20_000)
 
     # --- Полные выгрузки таблиц (TablesRaw) ---
     FULL_TABLE_MAX_ROWS: int = _env_int("FULL_TABLE_MAX_ROWS", 500)
@@ -361,7 +361,7 @@ class Cfg:
     FIG_STRICT: bool = _env_bool("FIG_STRICT", True)
 
     # --- Строгий режим exact-or-fail / источники истины / геометрические декодеры ---
-    ANALYZER_EXACT_OR_FAIL: bool = _env_bool("ANALYZER_EXACT_OR_FAIL", True)
+    ANALYZER_EXACT_OR_FAIL: bool = _env_bool("ANALYZER_EXACT_OR_FAIL", False)
     CHART_XML_IS_GROUND_TRUTH: bool = _env_bool("CHART_XML_IS_GROUND_TRUTH", True)
     VISION_PIE_NORMALIZE_ENABLE: bool = _env_bool("VISION_PIE_NORMALIZE_ENABLE", True)
     VISION_EXTRACT_REQUIRE_UNITS: bool = _env_bool("VISION_EXTRACT_REQUIRE_UNITS", True)
@@ -378,7 +378,7 @@ class Cfg:
     # --- Универсальный анализатор рисунков (без обязательного OCR) ---
     FIG_ANALYZER_ENABLED: bool = _env_bool("FIG_ANALYZER_ENABLED", True)
     FIG_ANALYZER_REQUIRE_EXACT_NUMBERS: bool = _env_bool("FIG_ANALYZER_REQUIRE_EXACT_NUMBERS", True)
-    FIG_ANALYZER_REQUIRE_EXACT_TEXT: bool = _env_bool("FIG_ANALYZER_REQUIRE_EXACT_TEXT", True)
+    FIG_ANALYZER_REQUIRE_EXACT_TEXT: bool = _env_bool("FIG_ANALYZER_REQUIRE_EXACT_TEXT", False)
 
     # Допустимые типы рисунков (используются в vision_analyzer / figures)
     FIG_ANALYZER_ALLOWED_KINDS: tuple[str, ...] = (
