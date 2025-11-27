@@ -345,8 +345,21 @@ def chat_with_gpt(
             max_tokens=max_tokens,
             **pass_extra,
         )
-        content = cmpl.choices[0].message.content or ""
-        return (content or "").strip()
+
+        msg = cmpl.choices[0].message
+
+        # 1) обычный текстовый ответ
+        text = (msg.content or "").strip()
+
+        # 2) если content пустой (классический случай gpt-5), пробуем взять reasoning
+        if not text and hasattr(msg, "reasoning") and msg.reasoning:
+            # reasoning обычно строка; на всякий случай приводим к str
+            try:
+                text = str(msg.reasoning).strip()
+            except Exception:
+                text = (msg.content or "").strip()
+
+        return text
     except Exception as e:
         logging.error("Ошибка при запросе к чат-модели: %s", e)
         return "Произошла ошибка при обработке запроса. Попробуйте позже."
@@ -616,8 +629,18 @@ def _vision_messages(
         )
         if want_tags:
             kwargs["response_format"] = {"type": "json_object"}
+
         cmpl = _client.chat.completions.create(**kwargs)
-        return (cmpl.choices[0].message.content or "").strip()
+        msg = cmpl.choices[0].message
+
+        text = (msg.content or "").strip()
+        if not text and hasattr(msg, "reasoning") and msg.reasoning:
+            try:
+                text = str(msg.reasoning).strip()
+            except Exception:
+                text = (msg.content or "").strip()
+
+        return text
     except Exception as e:
         logging.warning("vision JSON response_format failed, retrying without it: %s", e)
         try:
@@ -674,12 +697,16 @@ def vision_describe(
     system_hint: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Описывает изображение(я) «для подписи»: возвращает JSON {description, tags}.
+    Описывает изображение(я) «для подписи»: возвращает JSON {description, tags, raw_text}.
     Вшивает картинки как image_url (data: base64) либо http(s) ссылку — по Cfg.VISION_IMAGE_TRANSPORT.
     Даунскейлит/сжимает до лимитов из конфига.
     """
     if not Cfg.vision_active():
-        return {"description": "модуль анализа изображений отключён (VISION_ENABLED=False).", "tags": []}
+        return {
+            "description": "модуль анализа изображений отключён (VISION_ENABLED=False).",
+            "tags": [],
+            "raw_text": "",
+        }
 
     paths: List[str] = [image_or_images] if isinstance(image_or_images, str) else list(image_or_images or [])
     orig_paths = list(paths)
@@ -692,7 +719,6 @@ def vision_describe(
         if _path_is_url(p) or os.path.exists(p):
             norm_paths.append(p)
         else:
-            # Ключевой чек: сюда должны приходить реальные пути до файлов/URL из figures.py
             logging.warning(
                 "vision_describe: image path is not accessible: %r "
                 "(возможен баг в figures/indexer — путь None или файл не существует)",
@@ -704,8 +730,11 @@ def vision_describe(
             "vision_describe: no accessible images. original_paths=%r (likely indexer bug)",
             orig_paths,
         )
-        return {"description": "изображение отсутствует или недоступно.", "tags": []}
-
+        return {
+            "description": "изображение отсутствует или недоступно.",
+            "tags": [],
+            "raw_text": "",
+        }
 
     # Лимит по количеству изображений
     norm_paths = norm_paths[: max(1, int(getattr(Cfg, "VISION_MAX_IMAGES_PER_REQUEST", 4) or 4))]
@@ -736,7 +765,23 @@ def vision_describe(
         require_json=Cfg.VISION_JSON_STRICT,
     )
 
-    content_parts: List[Dict[str, Any]] = [{"type": "text", "text": tmpl["user"]}]
+    # Добавляем явную просьбу вернуть ВСЕ надписи с изображения в поле raw_text
+    if lang.lower().startswith("ru"):
+        extra = (
+            "\n\nДополнительно: если на изображении есть текст, верни его полностью "
+            "в поле \"raw_text\" того же JSON. Перечисли все читаемые надписи "
+            "как можно точнее, через точку с запятой."
+        )
+    else:
+        extra = (
+            "\n\nAdditionally: if there is any text on the image, return it verbatim "
+            'in the "raw_text" field of the same JSON. List all readable labels '
+            "as accurately as possible, separated by semicolons."
+        )
+
+    user_prompt = (tmpl["user"] or "") + extra
+
+    content_parts: List[Dict[str, Any]] = [{"type": "text", "text": user_prompt}]
     for p in norm_paths:
         part = _image_part_for(p)
         if part:
@@ -751,8 +796,10 @@ def vision_describe(
     )
 
     # Стараемся распарсить JSON; если не получилось — используем как есть (текст модели)
+        # Стараемся распарсить JSON; если не получилось — используем как есть (текст модели)
     desc: str = ""
     tags: List[str] = []
+    raw_text: str = ""
     if raw:
         try:
             obj = json.loads(raw)
@@ -760,21 +807,48 @@ def vision_describe(
             tgs = obj.get("tags", [])
             if isinstance(tgs, list):
                 tags = [str(x).strip() for x in tgs if str(x).strip()]
+            raw_text = str(obj.get("raw_text", "")).strip()
         except Exception:
+            # модель ответила не JSON — трактуем целиком как описание
             desc = (raw or "").strip()
+
+    # 🔁 ФОЛБЭК: если после основного вызова текст с изображения не получен,
+    # пробуем вытащить его через vision_extract_values (там обычно есть raw_text)
+    if not raw_text:
+        try:
+            extra_vals = vision_extract_values(
+                image_or_images,
+                caption_hint=desc or None,
+                ocr_hint=None,
+                temperature=0.0,
+                max_tokens=900,
+                lang=lang,
+            )
+            rt = extra_vals.get("raw_text")
+            if isinstance(rt, list):
+                raw_text = "; ".join(
+                    str(x).strip() for x in rt if str(x).strip()
+                )
+        except Exception as e:
+            logging.warning("vision_describe: fallback via vision_extract_values failed: %s", e)
 
     # Санитайз + фоллбэк, если после санитайза получилось пусто/заглушка
     sanitized = _sanitize_description(desc)
     _fallback_placeholder = "содержимое изображения (описание не распознано)."
     if (not sanitized or sanitized == _fallback_placeholder) and (raw or "").strip():
-        # Возьмём первое предложение «как есть» из сырого текста
         r = (raw or "").strip()
         sanitized = (r.split(".")[0] + ".") if "." in r else r
 
-    res = {"description": sanitized, "tags": tags}
+    res = {
+        "description": sanitized,
+        "tags": tags,
+        "raw_text": raw_text,
+    }
+
     _VISION_CACHE[cache_key] = res
     _vcache_put(cache_key, res)
     return res
+
 
 def vision_describe_with_values(
     image_or_images: Union[str, List[str]],

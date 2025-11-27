@@ -15,10 +15,18 @@ if not log.handlers:
 log.setLevel(logging.INFO)
 
 
-def _safe_clean(text: Optional[str]) -> str:
+def _safe_clean(text: Any) -> str:
     if not text:
         return ""
+    if callable(text):
+        return ""
+    if not isinstance(text, str):
+        try:
+            text = str(text)
+        except Exception:
+            return ""
     return text.replace("\xa0", " ").strip()
+
 
 
 def analyze_figure(fig, lang: str = "ru") -> Dict[str, Any]:
@@ -27,18 +35,57 @@ def analyze_figure(fig, lang: str = "ru") -> Dict[str, Any]:
     - title
     - values (если таблица или диаграмма — из DOCX; иначе — из vision_extract_values)
     - description (vision_describe)
+
+    Поддерживает fig как:
+    - объект с атрибутами (title/caption/image_path/chart_data/table_data)
+    - dict с ключами
+    - str (путь к изображению)
     """
 
-    # Определяем тип
-    if getattr(fig, "chart_data", None):
+    # --- Нормализуем вход (fig может быть объектом / dict / str)
+    image_path: Optional[str] = None
+    chart_data = None
+    table_data = None
+    title_raw = None
+    caption_raw = None
+    fig_id = None
+    fig_doc_id = None
+
+    if isinstance(fig, str):
+        image_path = fig
+    elif isinstance(fig, dict):
+        image_path = fig.get("image_path") or fig.get("abs_path") or fig.get("path")
+        chart_data = fig.get("chart_data")
+        table_data = fig.get("table_data")
+        title_raw = fig.get("title")
+        caption_raw = fig.get("caption")
+        fig_id = fig.get("id")
+        fig_doc_id = fig.get("doc_id")
+    else:
+        image_path = (
+            getattr(fig, "image_path", None)
+            or getattr(fig, "abs_path", None)
+            or getattr(fig, "path", None)
+        )
+        chart_data = getattr(fig, "chart_data", None)
+        table_data = getattr(fig, "table_data", None)
+        title_raw = getattr(fig, "title", None)
+        caption_raw = getattr(fig, "caption", None)
+        fig_id = getattr(fig, "id", None)
+        fig_doc_id = getattr(fig, "doc_id", None)
+
+    # --- Определяем тип
+    if chart_data:
         kind = "chart"
-    elif getattr(fig, "table_data", None):
+    elif table_data:
         kind = "table"
     else:
         kind = "other"
 
-    title = _safe_clean(fig.title or fig.caption or "")
-    caption = _safe_clean(fig.caption)
+    # Важно: title_raw может оказаться callable (например, если fig == str и кто-то лезет в fig.title)
+    title = _safe_clean(title_raw or caption_raw or "")
+    caption = _safe_clean(caption_raw)
+
     description = ""
     values: Any = []
     chart_source: Optional[str] = None
@@ -47,14 +94,16 @@ def analyze_figure(fig, lang: str = "ru") -> Dict[str, Any]:
     warnings: list[str] = []
 
     # ---- 1️⃣ Описание изображения (VISION)
-    if getattr(fig, "image_path", None):
+    if image_path:
         try:
-            v = vision_describe(fig.image_path, lang=lang)
+            v = vision_describe(image_path, lang=lang)
+            vision_desc_raw = v
             # если модель дала описание — используем его; иначе падаем обратно на подпись
             description = _safe_clean(v.get("description", "")) or caption
-            vision_desc_raw = v
+            if not description:
+                warnings.append("vision_empty_description")
         except Exception as e:
-            log.warning("vision_describe failed for %s: %s", getattr(fig, "image_path", None), e)
+            log.warning("vision_describe failed for %s: %s", image_path, e)
             description = caption or "Описание не удалось извлечь."
             warnings.append("vision_describe_failed")
     else:
@@ -62,38 +111,36 @@ def analyze_figure(fig, lang: str = "ru") -> Dict[str, Any]:
         if not description:
             warnings.append("no_description")
 
-
     # ---- 2️⃣ Числовые данные
-        # ---- 2️⃣ Числовые данные
     if kind in ("chart", "table"):
         used_docx = False
 
         # 2.1. Точные данные из DOCX (приоритетнее OCR)
-        if getattr(fig, "chart_data", None):
-            values = fig.chart_data
+        if chart_data:
+            values = chart_data
             chart_source = "docx-chart"
             used_docx = True
-        elif getattr(fig, "table_data", None):
-            values = fig.table_data
+        elif table_data:
+            values = table_data
             chart_source = "docx-table"
             used_docx = True
 
         # 2.2. Фолбэк в OCR, если в DOCX данных нет
         if not used_docx:
-            if getattr(fig, "image_path", None):
+            if image_path:
                 try:
                     vvals = vision_extract_values(
-                        fig.image_path,
+                        image_path,
                         caption_hint=caption,
                         lang=lang,
                     )
+                    vision_values_raw = vvals
                     values = vvals.get("data", []) or []
                     chart_source = chart_source or "vision"
-                    vision_values_raw = vvals
                     if not values:
                         warnings.append("vision_no_values")
                 except Exception as e:
-                    log.warning("vision_extract_values failed for %s: %s", fig.image_path, e)
+                    log.warning("vision_extract_values failed for %s: %s", image_path, e)
                     warnings.append("vision_extract_failed")
                     values = []
             else:
@@ -102,31 +149,30 @@ def analyze_figure(fig, lang: str = "ru") -> Dict[str, Any]:
                 values = []
     else:
         # Попробовать OCR-извлечение чисел для произвольного изображения
-        if getattr(fig, "image_path", None):
+        if image_path:
             try:
                 vvals = vision_extract_values(
-                    fig.image_path,
+                    image_path,
                     caption_hint=caption,
                     lang=lang,
                 )
+                vision_values_raw = vvals
                 values = vvals.get("data", []) or []
                 chart_source = "vision" if values else None
-                vision_values_raw = vvals
                 if not values:
                     warnings.append("vision_no_values")
             except Exception as e:
-                log.warning("vision_extract_values failed for %s: %s", fig.image_path, e)
+                log.warning("vision_extract_values failed for %s: %s", image_path, e)
                 warnings.append("vision_extract_failed")
                 values = []
         else:
             values = []
             warnings.append("no_image_for_values")
 
-
     # ---- 3️⃣ Итоговая структура
     return {
-        "id": getattr(fig, "id", None),
-        "doc_id": getattr(fig, "doc_id", None),
+        "id": fig_id,
+        "doc_id": fig_doc_id,
         "kind": kind,
         "title": title,
         "caption": caption,
@@ -139,4 +185,3 @@ def analyze_figure(fig, lang: str = "ru") -> Dict[str, Any]:
         "vision_values_raw": vision_values_raw,
         "warnings": warnings,
     }
-

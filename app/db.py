@@ -992,7 +992,7 @@ def find_nearest_table_above(doc_id: int, chunk_id: int) -> Optional[Dict[str, A
     Находит ближайшую таблицу выше по тексту (по id), в рамках одного документа.
 
     Ожидания:
-    - таблицы представлены в chunks с element_type='table';
+    - таблицы представлены в chunks с element_type='table' или 'table_row';
     - id в chunks растёт по порядку следования элементов в документе.
 
     Возвращает словарь с базовой мета-информацией по таблице, в т.ч.
@@ -1006,7 +1006,7 @@ def find_nearest_table_above(doc_id: int, chunk_id: int) -> Optional[Dict[str, A
             SELECT id, doc_id, page, section_path, text, attrs
               FROM chunks
              WHERE doc_id = ?
-               AND element_type = 'table'
+               AND element_type IN ('table', 'table_row')
                AND id < ?
              ORDER BY id DESC
              LIMIT 1
@@ -1042,7 +1042,6 @@ def find_nearest_table_above(doc_id: int, chunk_id: int) -> Optional[Dict[str, A
         "attrs": attrs,
         "caption_num": caption_num,
     }
-
 
 # ----------------------------- public API: chunks -----------------------------
 

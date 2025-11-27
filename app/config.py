@@ -100,6 +100,7 @@ class Cfg:
     # =========================
     # Включает подачу изображений напрямую в чат-модель (b64/url/file).
     VISION_ENABLED: bool = _env_bool("VISION_ENABLED", True)
+    POLZA_VISION_MODEL: str = os.getenv("POLZA_VISION_MODEL", "openai/gpt-5")
 
     # Базовый язык ответов vision-пайплайна (используется как запасной)
     VISION_LANG: str = _env_str("VISION_LANG", "ru")
@@ -521,6 +522,11 @@ class Cfg:
     def vision_active(cls) -> bool:
         """Глобальный флаг готовности подачи изображений в модель."""
         return bool(cls.VISION_ENABLED and cls.POLZA_VISION_MODEL)
+
+    @classmethod
+    def vision_model(cls) -> str:
+        """Модель, которую polza_client будет использовать для image_url."""
+        return cls.POLZA_VISION_MODEL or cls.POLZA_CHAT
 
     @classmethod
     def vision_model(cls) -> str:

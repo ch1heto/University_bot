@@ -1175,16 +1175,43 @@ def describe_figures_by_numbers(
 
 
         # 5) vision-описание (опционально)
-        vision_payload = None
+                # 5) vision-описание (опционально) + нормализованный формат
+        vision_desc: str = ""
+        vision_raw_text: str = ""
+
         if use_vision and images:
             try:
                 img_for_vision = images[0] if vision_first_image_only else images
-                vision_payload = vision_describe(img_for_vision, lang=lang)
+                vp = vision_describe(img_for_vision, lang=lang)
             except Exception:
-                vision_payload = {
+                vp = {
                     "description": "описание изображения недоступно.",
                     "tags": [],
                 }
+
+            # vp может быть строкой или словарём — аккуратно нормализуем
+            if isinstance(vp, str):
+                vision_desc = vp.strip()
+            elif isinstance(vp, dict):
+                vision_desc = (vp.get("description") or "").strip()
+                # главное: не потерять сырой текст / OCR
+                vision_raw_text = (vp.get("raw_text") or vp.get("text") or "").strip()
+
+        # дополняем текстом из анализа фигуры, если он есть
+        if isinstance(analysis, dict):
+            ana_text = (analysis.get("text") or analysis.get("raw_text") or "").strip()
+            if ana_text:
+                if vision_raw_text:
+                    vision_raw_text = f"{vision_raw_text}\n{ana_text}"
+                else:
+                    vision_raw_text = ana_text
+
+        vision_payload = None
+        if vision_desc or vision_raw_text:
+            vision_payload = {
+                "description": vision_desc,
+                "raw_text": vision_raw_text,
+            }
 
         card: Dict[str, Any] = {
             "num": label,
@@ -1202,6 +1229,7 @@ def describe_figures_by_numbers(
             card["vision"] = vision_payload
         if analysis:
             card["analysis"] = analysis
+
 
         cards.append(card)
 

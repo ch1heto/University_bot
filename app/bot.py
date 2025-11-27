@@ -521,9 +521,23 @@ async def _describe_figure_for_multi(
 
     ctx = f"{disp}\n\n" + "\n\n".join(parts)
 
+    # 💡 Мини-фикс: если у нас по сути только подпись и нет ни vision, ни текста рядом, ни чисел —
+    # не гоняем GPT с «учебной» простынёй, а даём короткий понятный ответ.
+    has_near = bool(near)
+    has_vision = bool(vision)
+    has_values = bool(values_text)
+
+    if not has_near and not has_vision and not has_values:
+        # только подпись или вообще почти ничего
+        num_display = rec.get("num") or num
+        if caption:
+            return f"На рисунке {num_display} показано: {caption}"
+        return f"Не удалось извлечь содержимое рисунка {num_display} из текста документа."
+
     # ---- ОПРЕДЕЛЯЕМ ТИП РИСУНКА ----
     figure_kind = (rec.get("figure_kind") or "").strip().lower()
-    has_values = bool(values_text)
+    # has_values уже посчитан выше
+
 
     # достаточно консервативная эвристика: если явно не диаграмма ИЛИ нет чисел,
     # считаем рисунок текстовой схемой
@@ -594,9 +608,31 @@ async def _describe_figure_for_multi(
         return ""
 
     answer = (answer or "").strip()
+    num_display = rec.get("num") or num
+
     if not answer:
+        # хотя бы что-то осмысленное вернём по подписи
+        if caption:
+            return f"Описание рисунка {num_display}.\n\nНа рисунке показано: {caption}"
         return ""
-    return _strip_unwanted_sections(answer)
+
+    # подчистим хвосты
+    answer = _strip_unwanted_sections(answer)
+
+    # заголовок для читаемости
+    header = f"Описание рисунка {num_display}.\n\n"
+
+    # если есть числовые значения — всегда явно их добавляем
+    if has_values:
+        return (
+            f"{header}{answer}\n\n"
+            f"Точные значения по данным документа:\n"
+            f"{values_text[:1500]}"
+        )
+
+    # если чисел нет — просто заголовок + объяснение
+    return header + answer
+
 
 
 async def _describe_section_for_multi(
@@ -1630,8 +1666,10 @@ except Exception:
 
 # NEW: точечный анализ одной картинки (связный текст + числа)
 try:
-    from .vision_analyzer import analyze_figure as va_analyze_figure  # type: ignore
-except Exception:
+    from .vision_analyzer import analyze_figure as va_analyze_figure
+    logger.info("vision_analyzer loaded OK: %r", va_analyze_figure)  # type: ignore
+except Exception as e:
+    logger.exception("vision_analyzer import failed: %s", e)
     va_analyze_figure = None  # type: ignore
 
 # ГОСТ-валидатор (мягкий импорт)
@@ -2758,49 +2796,79 @@ def _compose_figure_display(attrs_json: str | None, section_path: str, title_tex
 def _fetch_figure_row_by_num(uid: int, doc_id: int, num: str):
     """
     Возвращает строку chunks для рисунка с указанным номером (если найдена),
-    ориентируясь ТОЛЬКО на caption_num (номер рисунка в подписи).
-    По label больше не ищем, чтобы не путать номер рисунка с подписями серий/категорий.
+    ориентируясь на caption_num в attrs.
+    Добавлена нормализация номера и расширенный поиск вариантов.
     """
     con = get_conn()
     cur = con.cursor()
-    like1 = f'%\"caption_num\": \"{num}\"%'
+
+    # нормализуем номер вида "2. 2." -> "2.2"
+    n = (
+        (num or "")
+        .strip()
+        .replace(" ", "")
+        .replace(" ", "")  # иногда бывают узкие пробелы
+        .rstrip(".,")      # убираем точку/запятую в конце
+    )
+
     row = None
 
-    # 1) по номеру в attrs (caption_num)
-    try:
-        cur.execute(
-            """
-            SELECT id, page, section_path, attrs, text
-            FROM chunks
-            WHERE owner_id=? AND doc_id=? AND element_type='figure'
-              AND attrs LIKE ?
-            ORDER BY id ASC LIMIT 1
-            """,
-            (uid, doc_id, like1),
-        )
-        row = cur.fetchone()
-    except Exception:
-        row = None
+    # 1) по caption_num внутри attrs (несколько вариантов записи)
+    like_variants = [
+        f'%\\"caption_num\\": \\"{n}\\"%',
+        f'%\\"caption_num\\": \\"{n}.\\"%',
+        f'%\\"caption_num\\": \\"Рис.{n}\\"%',
+        f'%\\"caption_num\\": \\"Рис. {n}\\"%',
+        f'%\\"caption_num\\": \\"Рисунок {n}\\"%',
+    ]
 
-    # 2) фолбэк — по section_path
-    if not row:
+    for like_val in like_variants:
         try:
             cur.execute(
                 """
                 SELECT id, page, section_path, attrs, text
                 FROM chunks
                 WHERE owner_id=? AND doc_id=? AND element_type='figure'
-                  AND section_path LIKE ? COLLATE NOCASE
+                  AND attrs LIKE ? ESCAPE '\\'
                 ORDER BY id ASC LIMIT 1
                 """,
-                (uid, doc_id, f'%Рисунок {num}%'),
+                (uid, doc_id, like_val),
             )
             row = cur.fetchone()
+            if row:
+                break
         except Exception:
-            row = None
+            pass
+
+    # 2) fallback — ищем в section_path (подписи могут быть другие)
+    if not row:
+        section_like_variants = [
+            f'%Рисунок {num}%',
+            f'%Рис. {num}%',
+            f'%Рис.{num}%',
+            f'%{n}%',  # просто номер
+        ]
+        for pat in section_like_variants:
+            try:
+                cur.execute(
+                    """
+                    SELECT id, page, section_path, attrs, text
+                    FROM chunks
+                    WHERE owner_id=? AND doc_id=? AND element_type='figure'
+                      AND section_path LIKE ? COLLATE NOCASE
+                    ORDER BY id ASC LIMIT 1
+                    """,
+                    (uid, doc_id, pat),
+                )
+                row = cur.fetchone()
+                if row:
+                    break
+            except Exception:
+                pass
 
     con.close()
     return row
+
 
 def _figure_following_paragraphs(
     uid: int,
@@ -3516,6 +3584,12 @@ def _build_figure_records(
 
             vis_clean = " ".join(vis_parts).strip()
             low = vis_clean.lower()
+            logging.info(
+                "FIGURE %s kind=%r vision_desc=%r",
+                rec["num"],
+                rec.get("figure_kind"),
+                vis_clean[:300],
+            )
             # отбрасываем заглушки вида «содержимое изображения (описание не распознано)»
             if vis_clean and "описание не распознано" not in low and "содержимое изображения" not in low:
                 rec["vision_desc"] = vis_clean
@@ -3570,13 +3644,68 @@ def _build_figure_records(
                     rec["figure_kind"] = kind_loc
 
         # --- 4) chart_data из attrs (ТОЧНЫЕ числовые значения из OOXML) ---
+                # --- 4) chart_data из attrs (ТОЧНЫЕ числовые значения из OOXML) ---
         row = _fetch_figure_row_by_num(uid, doc_id, orig)
+        logging.info("FIGURE %s: fetch_row(orig=%r) -> %s", norm, orig, "HIT" if row else "MISS")
+
         if not row and norm != orig:
             row = _fetch_figure_row_by_num(uid, doc_id, norm)
+            logging.info("FIGURE %s: fetch_row(norm=%r) -> %s", norm, norm, "HIT" if row else "MISS")
 
+
+        # NEW: если по caption_num не нашли — пытаемся достать figure-chunk по тексту/section_path,
+        # чтобы хотя бы получить chunk_id (иначе nearest_table_above никогда не сработает).
+        if not row:
+            try:
+                con = get_conn()
+                cur = con.cursor()
+
+                pats = []
+                # сначала пробуем по подписи (если она есть)
+                cap = (rec.get("caption") or "").strip()
+                if cap:
+                    cap_snip = cap[:60]
+                    pats.append(f"%{cap_snip}%")
+
+                # затем типовые формы "Рисунок 2.2", "Рис. 2.2", просто "2.2"
+                pats.extend([
+                    f"%Рисунок {norm}%",
+                    f"%Рис. {norm}%",
+                    f"%Рис.{norm}%",
+                    f"%{norm}%",
+                ])
+
+                for pat in pats:
+                    cur.execute(
+                        """
+                        SELECT id, page, section_path, attrs, text
+                        FROM chunks
+                        WHERE owner_id=? AND doc_id=? AND element_type='figure'
+                          AND (
+                                (text IS NOT NULL AND text LIKE ? COLLATE NOCASE)
+                             OR (section_path IS NOT NULL AND section_path LIKE ? COLLATE NOCASE)
+                          )
+                        ORDER BY id ASC LIMIT 1
+                        """,
+                        (uid, doc_id, pat, pat),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        break
+            except Exception:
+                row = None
+            finally:
+                try:
+                    con.close()
+                except Exception:
+                    pass
+
+        # если row нашли — обрабатываем attrs / display / follow_text как раньше
         if row:
-            if "id" in row.keys():
+            try:
                 rec["chunk_id"] = row["id"]
+            except Exception:
+                pass
 
             attrs_json = row["attrs"] if ("attrs" in row.keys()) else None
 
@@ -3599,11 +3728,8 @@ def _build_figure_records(
                 rec["raw_values"] = raw
                 rec["values_text"] = _format_exact_values(raw)
                 rec["values_source"] = "ooxml"
-                rec["values"] = rec["values_text"]  # для старого кода
+                rec["values"] = rec["values_text"]
 
-            # фолбэк: если raw_values не получилось собрать, но старый
-            # _parse_chart_data вернул плоский список — аккуратно
-            # оборачиваем его в одну серию без доп. магии
             if not rec.get("raw_values"):
                 cd, _ctype, _attrs = _parse_chart_data(attrs_json)
                 if cd:
@@ -3648,20 +3774,43 @@ def _build_figure_records(
                 # не ломаем обработку рисунка, если что-то пошло не так
                 pass
 
-            # 4.d) ФОЛБЭК ПО ТАБЛИЦЕ:
-            # теперь вызываем ТОЛЬКО когда реально нужен акцент на числах
-            if need_values:
+            # 4.d) ФОЛБЭК ПО ТАБЛИЦЕ: если из OOXML не получилось достать числа,
+            # всегда пробуем привязать ближайшую таблицу.
+            if not rec.get("raw_values"):
                 try:
                     _attach_table_values_from_near_text(uid, doc_id, rec)
                 except Exception:
                     logging.exception("figure->table fallback failed")
 
+
+
         if not rec["display"]:
             rec["display"] = f"Рисунок {norm}"
+
+        # --- 5) VISION fallback: если в карточках vision пусто, но есть картинка ---
+        if not rec.get("vision_desc") and va_analyze_figure and rec.get("images"):
+            try:
+                vis = va_analyze_figure(rec["images"][0], lang="ru")
+                if isinstance(vis, dict):
+                    desc = (vis.get("description") or "").strip()
+                    raw_text = (vis.get("raw_text") or vis.get("text") or "").strip()
+                    vis_clean = " ".join([p for p in (desc, raw_text) if p]).strip()
+
+                    low = vis_clean.lower()
+                    # отбрасываем заглушки вида «содержимое изображения (описание не распознано)»
+                    if vis_clean and "описание не распознано" not in low and "содержимое изображения" not in low:
+                        rec["vision_desc"] = vis_clean
+                        logging.info("FIGURE %s vision_fallback=%r", rec["num"], vis_clean[:300])
+                    else:
+                        logging.info("FIGURE %s vision_fallback discarded=%r", rec["num"], vis_clean[:300])
+            except Exception as e:
+                logging.exception("vision fallback failed for figure %s: %s", rec["num"], e)
 
         records_by_num[norm] = rec
 
     return list(records_by_num.values())
+
+
 
 
 def _format_table_values_for_figure(table_num: str, ctx: str) -> str:
@@ -3728,29 +3877,20 @@ def _attach_table_values_from_near_text(
     """
     Фолбэк для рисунков без чисел.
 
-    Логика:
-    если В ТЕКСТЕ ВОКРУГ рисунка явно упоминается таблица X.X
-    («таблица 2.5», «табл. 3.1», «table 1.2» и т.п.),
-    подтягиваем её как источник числовых значений.
-
-    ВАЖНО:
-    - работает ТОЛЬКО для числовых диаграмм (bar/line/pie/stacked_bar);
-    - для схем, оргструктур и других текстовых рисунков таблицы не подмешиваются.
+    Упрощённая логика:
+    - если уже есть значения (OOXML / table) — выходим;
+    - пробуем найти таблицу по явному упоминанию "таблица 2.5" в подписи/тексте;
+    - если не нашли — берём ближайшую таблицу выше по документу;
+    - её текст кладём в values_text как источник "table".
     """
-    # 0) если тип рисунка известен и он не числовой — сразу выходим
-    kind = (rec.get("figure_kind") or "").strip()
-    try:
-        if kind and not Cfg.is_numeric_figure_kind(kind):
-            return
-    except Exception:
-        # если helper по каким-то причинам недоступен — не ломаемся
-        pass
-
-    # 1) если у рисунка уже есть значения (OOXML / rag / vision) — ничего не делаем
-    if rec.get("raw_values") or (rec.get("values_text") or rec.get("values")):
+    # 1) если у рисунка уже есть «сильные» значения (OOXML / table) — ничего не делаем
+    if rec.get("raw_values"):
+        return
+    src = (rec.get("values_source") or "").lower()
+    if src in {"ooxml", "table"}:
         return
 
-    # 2) берём подпись + текст рядом, чтобы ловить ссылки вида "см. табл. 2.5"
+    # 2) подпись + текст рядом — пригодится и для явных ссылок
     parts: list[str] = []
     cap = (rec.get("caption") or "").strip()
     if cap:
@@ -3760,41 +3900,86 @@ def _attach_table_values_from_near_text(
     parts.extend(p for p in near_parts if p)
 
     near_text = " ".join(parts).strip()
-    if not near_text:
+
+    table_num_raw: Optional[str] = None
+    snippets = None
+    full_ctx: Optional[str] = None
+
+    # 3) сначала пробуем явное упоминание таблицы: "таблица 2.5", "табл. 1.1", "table 3"
+    if near_text:
+        try:
+            m = _TABLE_NUM_IN_TEXT_RE.search(near_text)
+        except Exception:
+            m = None
+
+        if m:
+            table_num_raw = (m.group(1) or "").strip() or None
+            if table_num_raw:
+                try:
+                    snippets = get_table_context_for_numbers(
+                        owner_id=uid,
+                        doc_id=doc_id,
+                        numbers=[table_num_raw],
+                        include_all_values=True,
+                        rows_limit=None,  # берём всю таблицу
+                    )
+                except Exception as e:
+                    logging.exception(
+                        "figure->table: get_table_context_for_numbers failed (explicit): %s",
+                        e,
+                    )
+
+    # 4) если явной ссылки нет ИЛИ по ней ничего не нашли — пробуем ближайшую таблицу выше
+    if not snippets and rec.get("chunk_id"):
+        try:
+            tbl_meta = find_nearest_table_above(doc_id=doc_id, chunk_id=rec["chunk_id"])
+        except Exception as e:
+            logging.exception("figure->table: find_nearest_table_above failed: %s", e)
+            tbl_meta = None
+
+        if tbl_meta:
+            # если номер таблицы не известен — пробуем вытащить его из attrs
+            if not table_num_raw:
+                attrs = tbl_meta.get("attrs") or {}
+                for key in ("caption_num", "num", "number", "label"):
+                    if key in attrs and attrs[key]:
+                        table_num_raw = str(attrs[key]).strip()
+                        break
+
+            # если номер удалось вытащить — используем стандартный путь через get_table_context_for_numbers
+            if table_num_raw and not snippets:
+                try:
+                    snippets = get_table_context_for_numbers(
+                        owner_id=uid,
+                        doc_id=doc_id,
+                        numbers=[table_num_raw],
+                        include_all_values=True,
+                        rows_limit=None,
+                    )
+                except Exception as e:
+                    logging.exception(
+                        "figure->table: get_table_context_for_numbers failed (nearest): %s",
+                        e,
+                    )
+
+            # если по номеру ничего не нашли, хотя таблица есть — используем её text как сырой контекст
+            if not snippets:
+                full_ctx = (tbl_meta.get("text") or "").strip() or None
+
+    # 5) если есть snippets — собираем финальный контекст из них
+    if snippets and not full_ctx:
+        try:
+            full_ctx = build_rag_context(snippets, max_chars=2000) or None
+        except Exception as e:
+            logging.exception("figure->table: build_rag_context failed: %s", e)
+            full_ctx = None
+
+    if not full_ctx or not full_ctx.strip():
         return
 
-    # ищем явное упоминание таблицы: "таблица 2.5", "табл. 1.1", "table 3" и т.п.
-    m = _TABLE_NUM_IN_TEXT_RE.search(near_text)
-    if not m:
-        # рядом по тексту таблица не названа — ничего не подтягиваем
-        return
-
-    table_num_raw = (m.group(1) or "").strip()
-    if not table_num_raw:
-        return
-
+    # 6) аккуратно форматируем значения таблицы для вывода по рисунку
     try:
-        snippets = get_table_context_for_numbers(
-            owner_id=uid,
-            doc_id=doc_id,
-            numbers=[table_num_raw],
-            include_all_values=True,
-            rows_limit=None,  # берём всю таблицу
-        )
-    except Exception as e:
-        logging.exception("figure->table: get_table_context_for_numbers failed: %s", e)
-        return
-
-    if not snippets:
-        return
-
-    full_ctx = build_rag_context(snippets, max_chars=2000)
-    if not full_ctx.strip():
-        return
-
-    # аккуратно форматируем значения таблицы для вывода по рисунку
-    try:
-        formatted = _format_table_values_for_figure(table_num_raw, full_ctx)
+        formatted = _format_table_values_for_figure(table_num_raw or "?", full_ctx)
     except Exception:
         # если форматирование сломалось — хотя бы сырые данные
         formatted = full_ctx
@@ -3802,7 +3987,79 @@ def _attach_table_values_from_near_text(
     rec["values_text"] = formatted
     rec["values_source"] = "table"
     rec["values"] = formatted
-    rec["source_table_num"] = table_num_raw
+    if table_num_raw:
+        rec["source_table_num"] = table_num_raw
+
+
+# --- эвристики для "моста" рисунок ↔ таблица ---
+
+# ключевые слова, по которым легко понять, что речь о числовой диаграмме/динамике
+_NUMERIC_FIGURE_KEYWORDS = [
+    "динамик",      # динамика, динамический
+    "график",
+    "диаграм",
+    "распределени",
+    "состав",
+    "удельн",
+    "объем",
+    "объём",
+    "выручк",
+    "затрат",
+    "доход",
+    "прибыл",
+]
+
+
+def _is_numeric_chart_figure_text(text: str) -> bool:
+    """
+    Очень простая эвристика: по подписи/контексту вокруг рисунка решаем,
+    что это именно числовая диаграмма, а не оргструктура/схема/картинка с текстом.
+
+    Не лезем в БД, работаем только по строке.
+    """
+    if not text:
+        return False
+
+    t = text.lower()
+
+    has_kw = any(k in t for k in _NUMERIC_FIGURE_KEYWORDS)
+    has_digit = bool(re.search(r"\d", t))
+    has_percent = "%" in t
+    has_money = "руб" in t or "тыс. руб" in t
+
+    # довольно мягкое условие:
+    # - либо есть "динамика/график/диаграмма/затраты/выручка/..." (типичный график),
+    # - либо явно есть цифры/проценты/деньги.
+    if has_kw or has_digit or has_percent or has_money:
+        return True
+
+    return False
+
+
+def _looks_like_numeric_table_text(ctx: str) -> bool:
+    """
+    Проверяем, что текст по таблице действительно похож на числовую таблицу.
+    Не идеально, но отсекает совсем текстовые штуки.
+    """
+    if not ctx:
+        return False
+
+    txt = " ".join(l.strip() for l in ctx.splitlines() if l.strip())
+    if not txt:
+        return False
+
+    digits = len(re.findall(r"\d", txt))
+    letters = len(re.findall(r"[A-Za-zА-Яа-яЁё]", txt))
+
+    # минимум несколько цифр
+    if digits < 3:
+        return False
+
+    # грубое соотношение: цифр не должно быть совсем мало относительно текста
+    if letters > 0 and digits / max(letters, 1) < 0.05:
+        return False
+
+    return True
 
 
 
@@ -3856,7 +4113,8 @@ def _fig_values_text_from_records(
                     rec["values_source"] = rec.get("values_source") or "ooxml_text"
             except Exception:
                 pass
-
+        if rec.get("values_source") == "table" and values_text:
+            pass  # не пропускаем
         # если после всех попыток чисел нет — пропускаем этот рисунок
         if not values_text:
             continue
@@ -3882,6 +4140,7 @@ def _fig_values_text_from_records(
     if lines:
         return "\n\n".join(lines)
 
+    # Был запрос "описать", но таблицы или OOXML не нашли
     if need_values:
         return (
             "По указанным рисункам не удалось автоматически извлечь точные числовые данные "
@@ -3889,7 +4148,9 @@ def _fig_values_text_from_records(
             "Могу дать только текстовое описание."
         )
 
+    # NEW: не блокируем таблицы, если они есть у других рисунков
     return ""
+
 
 
 async def _send_fig_values_from_records(
@@ -4054,7 +4315,7 @@ async def _answer_figure_query(
     или «дай точные значения по рисунку 2.3» — меняется только акцент
     в текстовом объяснении.
     """
-    # 0) нужен ли особый акцент на числах
+    # 0) по тексту запроса — есть ли явный намёк на числа
     need_values = bool(_VALUES_HINT.search(text or ""))
 
     # 1) вытаскиваем номера рисунков из текста
@@ -4070,27 +4331,44 @@ async def _answer_figure_query(
     if not nums:
         return False
 
+    # 🎯 НЕОБЯЗАТЕЛЬНАЯ эвристика:
+    # если пользователь просто «опиши рисунок 2.2», но по OOXML нет сырых чисел —
+    # можно форснуть need_values=True, чтобы агрессивнее искать таблицы.
+    #
+    # Если не хочется лишней магии — этот блок можно вообще удалить.
+    if not need_values:
+        try:
+            for token in nums:
+                n = _num_norm_fig(token)
+                if not n:
+                    continue
+                rec_row = _fetch_figure_row_by_num(uid, doc_id, n)
+                if not rec_row:
+                    continue
+                attrs_json = rec_row["attrs"] if ("attrs" in rec_row.keys()) else None
+                raw = _extract_raw_values_from_attrs(attrs_json)
+                # если сырых чисел нет — лучше включить поиск таблиц
+                if not raw:
+                    need_values = True
+                    break
+        except Exception:
+            # не считаем падение эвристики фатальным
+            pass
+
     # 2) собираем единую структуру по всем рисункам
     records = _build_figure_records(uid, doc_id, nums, need_values=need_values)
     if not records:
-        # 🔧 Раньше здесь сразу шёл ответ «Указанные рисунки в работе не найдены.»,
-        # из-за чего мы не доходили до общего RAG-пайплайна и не могли,
-        # например, ответить по таблицам или общему контексту.
-        # Теперь просто говорим вызывающему коду «я не обработал этот запрос».
         return False
 
     # 4) собираем общий блок с точными значениями (без отправки)
     values_block = _fig_values_text_from_records(records, need_values=need_values)
 
-    # 5) Описание каждой фигуры через новую логику (единый мозг для single + multi)
     for rec in records:
         num = rec.get("num")
         if not num:
             continue
 
         try:
-            # 🔥 используем ту самую новую функцию,
-            # где уже есть разветвление: диаграмма ИЛИ текстовая схема
             explanation = await _describe_figure_for_multi(
                 uid, doc_id, num, text, verbosity
             )
@@ -4099,9 +4377,9 @@ async def _answer_figure_query(
             explanation = ""
 
         if explanation:
-            # Рассылаем как готовый ответ (или стримим — если у тебя так принято)
+            if values_block:
+                explanation = explanation.rstrip() + "\n\n" + values_block.strip()
             await m.answer(explanation)
-
 
     # 6) обновляем «последний упомянутый рисунок» для анафорических вопросов
     try:
