@@ -14,6 +14,7 @@ from .docs_handlers import register_docs_handlers
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.exceptions import TelegramBadRequest
+from app.planner import is_big_complex_query, plan_tasks_from_user_query, batch_tasks, TaskType
 from aiogram.enums import ChatAction
 from aiogram.types import FSInputFile, InputMediaPhoto
 from .retrieval import (
@@ -465,34 +466,38 @@ async def _describe_figure_for_multi(
     num: str,
     question: str,
     verbosity: str,
+    rec: dict | None = None,   # ⬅️ новый необязательный аргумент
 ) -> str:
     """
     Вспомогательный помощник для мультирежима: делает GPT-разбор одного рисунка.
 
-    NEW: данные по рисунку берём из _build_figure_records, который уже:
+    Данные по рисунку берём из _build_figure_records, который уже:
       - подтягивает пути к изображениям и подписи;
       - подмешивает числовые значения диаграммы (chart_data/chart_matrix);
       - при их отсутствии может использовать значения из таблицы-источника.
 
-    NEW2: если рисунок не является числовой диаграммой (figure_kind = org_chart / flowchart /
-          text_blocks / schema / ... либо нет числовых значений), используем отдельный промпт
-          для «текстовых» схем: акцент на элементах и связях, а не на тенденциях и числах.
+    Для нечисловых схем (org_chart / flowchart / text_blocks / schema / ...),
+    где нет внутренних текстов/значений, стараемся давать только общее описание
+    без перечисления конкретных подразделений, чтобы не галлюцинировать структуру.
     """
     num = (num or "").strip()
     if not num:
         return ""
 
-    # Берём те же данные, что и в одиночном режиме
-    try:
-        records = _build_figure_records(uid, doc_id, [num], need_values=True) or []
-    except Exception as e:
-        logging.exception("build_figure_records in _describe_figure_for_multi failed: %s", e)
-        records = []
+    # Если карточка рисунка уже собрана снаружи (в _answer_figure_query),
+    # используем её. Иначе — старое поведение: собираем по номеру.
+    if rec is None:
+        try:
+            records = _build_figure_records(uid, doc_id, [num], need_values=True) or []
+        except Exception as e:
+            logging.exception("build_figure_records in _describe_figure_for_multi failed: %s", e)
+            records = []
 
-    if not records:
-        return ""
+        if not records:
+            return ""
 
-    rec = records[0]
+        rec = records[0]
+
     parts: list[str] = []
 
     disp = rec.get("display") or f"Рисунок {rec.get('num') or ''}".strip()
@@ -514,6 +519,8 @@ async def _describe_figure_for_multi(
 
     values_text = (rec.get("values_text") or rec.get("values") or "").strip()
     if values_text:
+        # ВНИМАНИЕ: здесь значения только для контекста GPT, в ответе их
+        # будет добавлять _fig_values_text_from_records.
         parts.append("Точные значения (как в документе):\n" + values_text[:1500])
 
     if not parts:
@@ -521,26 +528,14 @@ async def _describe_figure_for_multi(
 
     ctx = f"{disp}\n\n" + "\n\n".join(parts)
 
-    # 💡 Мини-фикс: если у нас по сути только подпись и нет ни vision, ни текста рядом, ни чисел —
-    # не гоняем GPT с «учебной» простынёй, а даём короткий понятный ответ.
     has_near = bool(near)
     has_vision = bool(vision)
     has_values = bool(values_text)
-
-    if not has_near and not has_vision and not has_values:
-        # только подпись или вообще почти ничего
-        num_display = rec.get("num") or num
-        if caption:
-            return f"На рисунке {num_display} показано: {caption}"
-        return f"Не удалось извлечь содержимое рисунка {num_display} из текста документа."
+    num_display = rec.get("num") or num
 
     # ---- ОПРЕДЕЛЯЕМ ТИП РИСУНКА ----
     figure_kind = (rec.get("figure_kind") or "").strip().lower()
-    # has_values уже посчитан выше
 
-
-    # достаточно консервативная эвристика: если явно не диаграмма ИЛИ нет чисел,
-    # считаем рисунок текстовой схемой
     textual_kinds = {
         "org_chart",
         "orgchart",
@@ -553,7 +548,16 @@ async def _describe_figure_for_multi(
     }
     is_textual_figure = (figure_kind in textual_kinds) or (not has_values and bool(vision))
 
-    # ---- ВЕТКА ДЛЯ ЧИСЛОВЫХ ДИАГРАММ (СТАРОЕ ПОВЕДЕНИЕ) ----
+    # 💡 Мини-фикс: если у нас по сути только подпись и нет ни vision, ни текста рядом, ни чисел —
+    # не гоняем GPT с «учебной» простынёй, а даём короткий понятный ответ.
+    # Это универсальный fallback и для схем, и для любых других рисунков.
+    if not has_near and not has_vision and not has_values:
+        if caption:
+            return f"На рисунке {num_display} показано: {caption}"
+        return f"Не удалось извлечь содержимое рисунка {num_display} из текста документа."
+
+
+    # ---- ВЕТКА ДЛЯ ЧИСЛОВЫХ ДИАГРАММ ----
     if not is_textual_figure:
         system_prompt = (
             "Ты репетитор по дипломным работам. Ниже даны подпись к рисунку, текст рядом с ним "
@@ -561,48 +565,71 @@ async def _describe_figure_for_multi(
             "1) Кратко опиши, что показано на рисунке.\n"
             "2) Сформулируй 2–3 вывода по динамике и структуре показателя.\n\n"
             "Формат ответа строго такой:\n"
-            "**Что изображено**\n"
+            "Что изображено:\n"
             "- ...\n"
             "- ...\n\n"
-            "**Выводы**\n"
+            "Выводы:\n"
             "- ...\n"
             "- ...\n"
             "- ...\n\n"
             "Не придумывай новых чисел и не вводи предметную область, если её нет в подписи/тексте. "
-            "Не добавляй блок с точными значениями — он будет подставлен отдельно."
+            "Не добавляй блок с точными значениями — он будет подставлен отдельно. "
+            "Никогда не пиши, что «рисунка с таким номером нет» или что «есть только другой рисунок» — "
+            "давай максимально возможное описание по тем данным, которые приведены, и если их мало, "
+            "просто укажи, что информации недостаточно для подробного анализа."
         )
 
+
+        # ⬇️ Важное дополнение: явно говорим модели сфокусироваться ТОЛЬКО на этом номере,
+        # даже если в исходном вопросе упоминались несколько рисунков.
+        num_display = rec.get("num") or num
+
         user_prompt = (
-            f"Сделай понятное пояснение по рисунку {num}: что на нём изображено "
+            f"Пользовательский вопрос: {question}\n\n"
+            f"Сосредоточься ТОЛЬКО на рисунке {num_display}, "
+            "другие рисунки из вопроса игнорируй.\n\n"
+            f"Сделай понятное пояснение по рисунку {num_display}: что на нём изображено "
             "и какие 2–3 вывода можно сделать.\n\n"
             "[Данные по рисунку]\n"
             f"{ctx}"
             f"{_verbosity_addendum(verbosity, 'объяснения рисунка')}"
         )
 
-    # ---- ВЕТКА ДЛЯ ТЕКСТОВЫХ СХЕМ / ОРГСТРУКТУР / БЛОК-СХЕМ ----
+
+    # ---- ВЕТКА ДЛЯ ТЕКСТОВЫХ СХЕМ / ОРГСТРУКТУР ----
     else:
         system_prompt = (
             "Ты репетитор по дипломным работам. Ниже даны подпись к рисунку, текст рядом с ним "
-            "и текстовое описание содержимого изображения (включая распознанный текст с рисунка). "
-            "Это не числовая диаграмма, а схема/структура/оргструктура или другой рисунок, "
-            "где главное — элементы и связи между ними. На основе этих данных:\n"
-            "— перечисли ключевые элементы схемы и кратко опиши роль каждого;\n"
-            "— объясни, как элементы связаны между собой (по стрелкам/расположению/подписям);\n"
-            "— сделай 2–3 вывода о том, какую идею иллюстрирует схема.\n"
-            "Не придумывай новых сущностей и терминов, которых нет в подписи, тексте рядом или на самом рисунке. "
-            "Если каких-то деталей не хватает, честно укажи на это вместо выдумывания."
+            "и текстовое описание содержимого изображения (включая распознанный текст с рисунка, "
+            "если он есть). Это не числовая диаграмма, а схема/структура/оргструктура или другой рисунок, "
+            "где главное — элементы и связи между ними.\n\n"
+            "Если в данных ЯВНО указаны элементы схемы (названия подразделений, блоков, ролей, "
+            "приведённые списком в подписи, тексте рядом или в описании изображения) — можешь "
+            "на них опираться и кратко перечислить.\n"
+            "Если таких явных элементов нет, дай только ОБЩЕЕ описание схемы в 2–4 предложениях "
+            "без выдумывания названий отделов, ролей и блоков.\n\n"
+            "Строго соблюдай правило: не придумывай ни одного нового названия элемента, которого "
+            "нет в предоставленных данных. Если информации мало, лучше напиши об этом явно, чем домысливать. "
+            "Никогда не пиши, что «рисунка с таким номером нет» или что «есть только рисунок с другим номером» — "
+            "всегда давай описание по тем данным, которые есть, и при нехватке данных просто укажи на это."
         )
 
+
+        num_display = rec.get("num") or num
+
         user_prompt = (
-            f"Сделай понятное пояснение по рисунку {num}: что на нём изображено, "
-            "какие основные элементы (блоки/участники/подсистемы) присутствуют и как они связаны.\n\n"
-            "Сначала опиши общую идею схемы одним–двумя предложениями, "
-            "затем перечисли ключевые элементы и их роль, а после этого сделай 2–3 вывода.\n\n"
+            f"Пользовательский вопрос: {question}\n\n"
+            f"Сосредоточься ТОЛЬКО на рисунке {num_display}, "
+            "другие рисунки из вопроса игнорируй.\n\n"
+            f"Сделай понятное пояснение по рисунку {num_display}: что на нём в целом изображено, "
+            "какую идею иллюстрирует схема и какие 2–3 вывода можно сделать.\n\n"
+            "Если в данных нет явного списка элементов схемы, НЕ перечисляй выдуманные подразделения "
+            "или должности — просто опиши характер структуры (иерархическая, функциональная и т.п.).\n\n"
             "[Данные по рисунку]\n"
             f"{ctx}"
             f"{_verbosity_addendum(verbosity, 'объяснения схемы')}"
         )
+
 
     try:
         answer = chat_with_gpt(
@@ -618,10 +645,8 @@ async def _describe_figure_for_multi(
         return ""
 
     answer = (answer or "").strip()
-    num_display = rec.get("num") or num
 
     if not answer:
-        # хотя бы что-то осмысленное вернём по подписи
         if caption:
             return f"Описание рисунка {num_display}.\n\nНа рисунке показано: {caption}"
         return ""
@@ -632,11 +657,9 @@ async def _describe_figure_for_multi(
     # заголовок для читаемости
     header = f"Описание рисунка {num_display}.\n\n"
 
-    # ВАЖНО: здесь больше НЕ добавляем сырые «Точные значения»,
-    # чтобы не дублировать их с блоком из _fig_values_text_from_records.
-    # Эта функция отвечает только за "человеческое объяснение".
+    # эта функция отвечает только за "человеческое объяснение",
+    # блок с точными значениями добавляется снаружи (_fig_values_text_from_records)
     return header + answer
-
 
 
 async def _describe_section_for_multi(
@@ -2873,27 +2896,306 @@ def _fetch_figure_row_by_num(uid: int, doc_id: int, num: str):
     con.close()
     return row
 
-
-def _figure_following_paragraphs(
+def _figure_fallback_from_caption(
     uid: int,
     doc_id: int,
-    fig_row,
+    num: str,
     max_paragraphs: int = 3,
     max_chars: int = 1500,
-) -> list[str]:
+) -> dict | None:
     """
-    Берём 2–3 абзаца текста ПОСЛЕ рисунка в том же section_path.
-    Останавливаемся, как только встретили следующий heading/table/figure.
-    """
-    if not fig_row:
-        return []
+    Фолбэк для «нестандартных» рисунков (SmartArt, врезки и т.п.),
+    которые не попали в element_type='figure' и не имеют нормального
+    figure-chunk'а в БД.
 
-    base_id = fig_row["id"]
-    sec = fig_row["section_path"] or ""
+    Ищем по тексту подписи вида:
+      - "Рисунок 1.2 ..."
+      - "Рис. 1.2 ..."
+      - "Рис.1.2 ..."
+    и, если нашли, забираем:
+      - caption: сам текст строки;
+      - near_text: 1–3 следующих абзаца в том же section_path.
+
+    Возвращает dict:
+      {
+        "caption": str | None,
+        "near_text": list[str],
+        "section_path": str | None,
+      }
+    или None, если ничего подходящего не найдено.
+    """
+    num_norm = _num_norm_fig(num)
+    if not num_norm:
+        return None
 
     con = get_conn()
     cur = con.cursor()
 
+    # Паттерны, по которым ищем кандидатов на подпись.
+    like_variants = [
+        f"%Рисунок {num_norm}%",
+        f"%Рис. {num_norm}%",
+        f"%Рис.{num_norm}%",
+        f"%рисунок {num_norm}%",
+        f"%рис. {num_norm}%",
+        f"%рис.{num_norm}%",
+    ]
+
+    row = None
+
+    # 1) Сначала ищем по text LIKE "Рисунок 1.2 ..."
+    for pat in like_variants:
+        try:
+            cur.execute(
+                """
+                SELECT id, page, section_path, text
+                FROM chunks
+                WHERE owner_id=? AND doc_id=? AND text LIKE ? COLLATE NOCASE
+                ORDER BY id ASC
+                LIMIT 20
+                """,
+                (uid, doc_id, pat),
+            )
+            candidates = cur.fetchall() or []
+        except Exception:
+            candidates = []
+
+        for r in candidates:
+            t = (r["text"] or "").strip()
+            if not t:
+                continue
+            m = re.search(
+                r"(?:Рис\.?|Рисунок)\s+(\d+(?:\.\d+)*)",
+                t,
+                flags=re.IGNORECASE,
+            )
+            if not m:
+                continue
+            found_num = _num_norm_fig(m.group(1))
+            if found_num == num_norm:
+                row = r
+                break
+
+        if row:
+            break
+
+    # 2) Если не нашли по text, пробуем искать по section_path и просто по числу "1.2"
+    if not row:
+        try:
+            cur.execute(
+                """
+                SELECT id, page, section_path, text
+                FROM chunks
+                WHERE owner_id=? AND doc_id=? AND (
+                    section_path LIKE ? COLLATE NOCASE
+                    OR text LIKE ? COLLATE NOCASE
+                )
+                ORDER BY id ASC
+                LIMIT 30
+                """,
+                (uid, doc_id, f"%{num_norm}%", f"%{num_norm}%"),
+            )
+            candidates = cur.fetchall() or []
+        except Exception:
+            candidates = []
+
+        for r in candidates:
+            line = ((r["text"] or "") + " " + (r["section_path"] or "")).strip()
+            if not line:
+                continue
+            # ищем "Рисунок/Рис. <номер>" уже в суммарной строке
+            m = re.search(
+                r"(?:Рис\.?|Рисунок)\s+(\d+(?:\.\d+)*)",
+                line,
+                flags=re.IGNORECASE,
+            )
+            if not m:
+                continue
+            found_num = _num_norm_fig(m.group(1))
+            if found_num == num_norm:
+                row = r
+                break
+
+    con.close()
+
+    if not row:
+        return None
+
+
+    caption = ((row["text"] or "")).strip()
+    section_path = row["section_path"] or ""
+
+    # Используем существующий хелпер, как будто это figure-объект:
+    fake_fig_row = {
+        "id": row["id"],
+        "section_path": section_path,
+    }
+
+    near_text = _figure_following_paragraphs(
+        uid,
+        doc_id,
+        fake_fig_row,
+        max_paragraphs=max_paragraphs,
+        max_chars=max_chars,
+    ) or []
+
+    return {
+        "caption": caption if caption else None,
+        "near_text": near_text,
+        "section_path": section_path or None,
+    }
+
+def _figure_fallback_context_from_caption(
+    uid: int,
+    doc_id: int,
+    num: str,
+    max_paragraphs: int = 3,
+    max_chars: int = 1500,
+) -> tuple[str | None, list[str]]:
+    """
+    Фолбэк для случаев, когда НЕТ figure-чанка (SmartArt, "висячая" подпись и т.п.).
+
+    Ищем в chunks строку с текстом "Рисунок N" / "Рис. N",
+    считаем её подписью и берём 1–3 следующих абзаца в этом же section_path
+    как текст рядом с рисунком.
+    """
+    num = (num or "").strip()
+    if not num:
+        return None, []
+
+    # нормализованный номер без пробелов и хвостовых точек
+    n = (
+        num.replace(" ", "")
+           .rstrip(".,")
+    )
+
+    con = get_conn()
+    cur = con.cursor()
+
+    row = None
+    patterns = [
+        f"%Рисунок {num}%",
+        f"%Рис. {num}%",
+        f"%Рис.{num}%",
+        f"%Рисунок {n}%",
+        f"%Рис. {n}%",
+        f"%Рис.{n}%",
+    ]
+
+    try:
+        for pat in patterns:
+            cur.execute(
+                """
+                SELECT id, page, section_path, text
+                FROM chunks
+                WHERE owner_id=? AND doc_id=? AND text LIKE ? COLLATE NOCASE
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (uid, doc_id, pat),
+            )
+            row = cur.fetchone()
+            if row:
+                break
+    except Exception:
+        row = None
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+    if not row:
+        return None, []
+
+    raw_caption = (row["text"] or "").strip()
+
+    # если есть хелпер для подчистки подписи — используем его
+    try:
+        caption = _clean_caption_for_figure(raw_caption, num)
+        caption = (caption or "").strip()
+    except Exception:
+        caption = raw_caption
+
+    # Берём абзацы ПОСЛЕ подписи — тем же механизмом, что и для нормальных figure-чанков
+    try:
+        near = _figure_following_paragraphs(
+            uid,
+            doc_id,
+            row,
+            max_paragraphs=max_paragraphs,
+            max_chars=max_chars,
+        )
+    except Exception:
+        near = []
+
+    return (caption or None), near
+
+def _figure_fallback_from_caption_text(
+    uid: int,
+    doc_id: int,
+    num: str,
+    max_paragraphs: int = 3,
+    max_chars: int = 1500,
+) -> tuple[str | None, list[str]]:
+    """
+    Фолбэк для случаев, когда нет нормального figure-chunk'а (SmartArt, кривой DOCX и т.п.).
+
+    Ищем в chunks обычный текстовый абзац с подписью вида
+    «Рис. 1.2 ...» / «Рисунок 1.2 ...» и берём его как caption,
+    а затем 2–3 следующих абзаца в том же section_path — как near_text.
+    """
+    num = (num or "").strip()
+    if not num:
+        return None, []
+
+    # нормализованный номер, чтобы не ловить "1.2." и т.п.
+    n = num.replace(" ", "").rstrip(".,")
+
+    con = get_conn()
+    cur = con.cursor()
+
+    # Ищем подпись в тексте. element_type != 'figure', потому что SmartArt
+    # часто не размечается как отдельный figure-chunk.
+    caption_row = None
+    patterns = [
+        f"Рис. {n}%",       # Рис. 1.2 ...
+        f"Рис.{n}%",        # Рис.1.2 ...
+        f"Рисунок {n}%",    # Рисунок 1.2 ...
+        f"Рисунок {n}.%",   # Рисунок 1.2. ...
+    ]
+
+    for pat in patterns:
+        try:
+            cur.execute(
+                """
+                SELECT id, page, section_path, element_type, text
+                FROM chunks
+                WHERE owner_id=? AND doc_id=?
+                  AND (element_type IS NULL OR element_type NOT IN ('figure','table','heading','table_row'))
+                  AND text LIKE ? ESCAPE '\\'
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (uid, doc_id, pat),
+            )
+            row = cur.fetchone()
+            if row:
+                caption_row = row
+                break
+        except Exception:
+            continue
+
+    if not caption_row:
+        con.close()
+        return None, []
+
+    caption_text = (caption_row["text"] or "").strip()
+    sec = caption_row["section_path"] or ""
+    base_id = caption_row["id"]
+
+    # Теперь берём 2–3 абзаца ПОСЛЕ подписи в том же section_path,
+    # пока не встретим следующий heading/table/figure/table_row.
     has_et = _table_has_columns(con, "chunks", ["element_type"])
 
     if has_et:
@@ -2928,12 +3230,116 @@ def _figure_following_paragraphs(
     for r in rows:
         et = (r["element_type"] or "").lower() if "element_type" in r.keys() else ""
         if et in ("heading", "table", "figure", "table_row"):
-            # дошли до следующего структурного блока — дальше уже не «про этот рисунок»
             break
         t = (r["text"] or "").strip()
         if not t:
             continue
+        paras.append(t)
+        total += len(t)
+        if len(paras) >= max_paragraphs or total >= max_chars:
+            break
 
+    return caption_text, paras
+
+
+def _figure_following_paragraphs(
+    uid: int,
+    doc_id: int,
+    fig_row,
+    max_paragraphs: int = 3,
+    max_chars: int = 1500,
+) -> list[str]:
+    """
+    Берём 1–2 абзаца текста ДО рисунка и 2–3 абзаца ПОСЛЕ рисунка
+    в том же section_path. Останавливаемся, как только встретили
+    следующий heading/table/figure.
+    """
+    if not fig_row:
+        return []
+
+    base_id = fig_row["id"]
+    sec = fig_row["section_path"] or ""
+
+    con = get_conn()
+    cur = con.cursor()
+
+    has_et = _table_has_columns(con, "chunks", ["element_type"])
+
+    # --- абзацы ПЕРЕД рисунком ---
+    if has_et:
+        cur.execute(
+            """
+            SELECT text, element_type
+            FROM chunks
+            WHERE owner_id=? AND doc_id=? AND id<? AND section_path=?
+            ORDER BY id DESC
+            LIMIT 5
+            """,
+            (uid, doc_id, base_id, sec),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT text, NULL AS element_type
+            FROM chunks
+            WHERE owner_id=? AND doc_id=? AND id<? AND section_path=?
+            ORDER BY id DESC
+            LIMIT 5
+            """,
+            (uid, doc_id, base_id, sec),
+        )
+    before_rows = list(reversed(cur.fetchall() or []))
+
+    # --- абзацы ПОСЛЕ рисунка ---
+    if has_et:
+        cur.execute(
+            """
+            SELECT text, element_type
+            FROM chunks
+            WHERE owner_id=? AND doc_id=? AND id>? AND section_path=?
+            ORDER BY id ASC
+            LIMIT 20
+            """,
+            (uid, doc_id, base_id, sec),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT text, NULL AS element_type
+            FROM chunks
+            WHERE owner_id=? AND doc_id=? AND id>? AND section_path=?
+            ORDER BY id ASC
+            LIMIT 20
+            """,
+            (uid, doc_id, base_id, sec),
+        )
+    after_rows = cur.fetchall() or []
+    con.close()
+
+    paras: list[str] = []
+    total = 0
+
+    # сначала добавляем 1–2 осмысленных абзаца до рисунка
+    for r in before_rows:
+        et = (r["element_type"] or "").lower() if "element_type" in r.keys() else ""
+        if et in ("heading", "table", "figure", "table_row"):
+            continue
+        t = (r["text"] or "").strip()
+        if not t:
+            continue
+        paras.append(t)
+        total += len(t)
+        if len(paras) >= 2 or total >= max_chars:
+            break
+
+    # затем добавляем 2–3 абзаца после рисунка
+    for r in after_rows:
+        et = (r["element_type"] or "").lower() if "element_type" in r.keys() else ""
+        if et in ("heading", "table", "figure", "table_row"):
+            break
+        t = (r["text"] or "").strip()
+        if not t:
+            continue
         paras.append(t)
         total += len(t)
         if len(paras) >= max_paragraphs or total >= max_chars:
@@ -3415,12 +3821,31 @@ def _extract_fig_nums(text: str) -> list[str]:
 _ALL_FIGS_HINT = re.compile(r"(?i)\b(все\s+рисунк\w*|все\s+схем\w*|все\s+картин\w*|all\s+pictures?|all\s+figs?)\b")
 
 def _num_norm_fig(s: str | None) -> str:
+    """
+    Нормализуем номер рисунка до чистого вида:
+    - вытаскиваем ТОЛЬКО числовую часть (например, "Рис. 2.1" -> "2.1");
+    - поддерживаем форматы 2.1, 2, 2.1.3 и т.п.;
+    - убираем хвостовую пунктуацию ("2.1." -> "2.1").
+    """
     s = (s or "").strip()
-    s = s.replace("\u00A0", " ")   # NBSP -> пробел
-    s = s.replace(" ", "")
-    s = s.replace(",", ".")        # 4,1 -> 4.1
-    s = re.sub(r"[.:;)\]]+$", "", s)  # срез хвостовой пунктуации: "4." -> "4"
-    return s
+    if not s:
+        return ""
+
+    # NBSP -> пробел, приводим запятую к точке
+    s = s.replace("\u00A0", " ")
+    s = s.replace(",", ".")
+
+    # Берём ПОСЛЕДНЮЮ числовую группу вида "1.2" / "2" / "3.4.5"
+    m = re.search(r"(\d+(?:\.\d+)*)", s)
+    if not m:
+        return ""
+
+    num = m.group(1)
+
+    # Срезаем хвостовую пунктуацию, если вдруг осталась
+    num = re.sub(r"[.:;)\]]+$", "", num)
+
+    return num
 
 
 def _is_pure_figure_request(text: str) -> bool:
@@ -3484,25 +3909,53 @@ def _is_pure_section_request(text: str, intents: dict | None = None) -> bool:
 
     return True
 
-
 def _build_figure_records(
     uid: int,
     doc_id: int,
     nums: list[str],
     *,
-    need_values: bool = False,   # <- НОВОЕ: нужен ли акцент на числах
+    need_values: bool = False,   # нужен ли акцент на числах
 ) -> list[dict]:
     """
     Единая "сборка" информации о рисунках:
     — номер и красивый display;
     — пути к картинкам;
-    — точные числовые значения (из chart_data);
+    — точные числовые значения (из chart_data/OOXML/таблиц);
     — подпись и текст рядом;
     — vision-описание (если есть и не «описание не распознано»);
     — тип рисунка (bar/pie/line/org_chart/…).
     """
     if not nums:
         return []
+
+    # вспомогательный хелпер: пытаемся вытащить реальный номер рисунка из row
+    def _row_fig_label(row, attrs_json=None) -> str:
+        num = None
+        try:
+            aj = attrs_json
+            if aj is None and ("attrs" in row.keys()):
+                aj = row["attrs"]
+            if isinstance(aj, str):
+                aj = json.loads(aj)
+            if isinstance(aj, dict):
+                for key in ("caption_num", "num", "number", "label"):
+                    if aj.get(key):
+                        num = str(aj[key])
+                        break
+        except Exception:
+            num = None
+
+        # если в attrs не нашли — пробуем вытащить из текста «Рис. 2.1»
+        if not num:
+            try:
+                text = (row["text"] if ("text" in row.keys()) else "") or ""
+                m = re.search(r"(?:Рис\.?|Рисунок)\s+([\d.]+)", text)
+                if m:
+                    num = m.group(1)
+            except Exception:
+                pass
+
+        return _num_norm_fig(num) if num else ""
 
     # заранее тянем карточки из retrieval, чтобы получить images/текст рядом/vision
     try:
@@ -3541,47 +3994,63 @@ def _build_figure_records(
 
         card = cards_by_norm.get(norm)
         rec: dict = {
-            "owner_id": uid,      # нужен для вызова summarizer.extract_figure_value
-            "doc_id": doc_id,     # идентификатор документа
+            "owner_id": uid,
+            "doc_id": doc_id,
             "num": norm,
             "orig": orig,
             "display": None,
             "images": [],
-            # ЕДИНЫЙ источник истины по числам
-            "raw_values": None,        # структурированные данные из OOXML
-            "values_text": None,       # уже отформатированный блок «Точные значения»
+            # единый источник истины по числам
+            "raw_values": None,
+            "values_text": None,
             "values_source": None,     # "ooxml" | "summary" | "vision" | "table" | "rag"
-            # для обратной совместимости со старым кодом
-            "values": None,
+            "values": None,            # для обратной совместимости со старым кодом
             "near_text": [],
             "caption": None,
             "vision_desc": None,
-            # позиция рисунка в документе (на всякий случай)
             "chunk_id": None,
-            # НОВОЕ: тип рисунка (bar / pie / line / org_chart / text_blocks / ...)
-            "figure_kind": None,
+            "figure_kind": None,       # bar / pie / line / org_chart / text_blocks / ...
         }
 
-        # --- 1) данные из RAG-карточек ---
+                # --- 1) данные из RAG-карточек ---
         if card:
-            rec["display"] = card.get("display") or rec["display"]
-            rec["images"] = [p for p in (card.get("images") or []) if p]
-            rec["near_text"] = [
-                (h or "").strip()
-                for h in (card.get("highlights") or [])
-                if (h or "").strip()
-            ]
+            # display из карточки используем только если он про тот же номер,
+            # иначе игнорируем, чтобы 1.1/1.2 не подменялись на 2.1 и т.п.
+            card_display = (card.get("display") or "").strip()
+            if card_display:
+                disp_num = _num_norm_fig(card_display)
+                if not disp_num or disp_num == norm:
+                    rec["display"] = card_display
 
-            # --- VISION: забираем максимум текста с картинки ---
+            rec["images"] = [p for p in (card.get("images") or []) if p]
+
+            # хайлайты из RAG берём как предварительный контекст,
+            # но отбрасываем абзацы, где явно упомянут ДРУГОЙ номер рисунка
+            clean_highlights: list[str] = []
+            for h in (card.get("highlights") or []):
+                txt = (h or "").strip()
+                if not txt:
+                    continue
+                m = re.search(r"(?:Рис\.?|Рисунок)\s+([\d.]+)", txt, flags=re.IGNORECASE)
+                if m:
+                    other = _num_norm_fig(m.group(1))
+                    if other and other != norm:
+                        # это явно про другой рисунок → пропускаем
+                        continue
+                clean_highlights.append(txt)
+
+            rec["near_text"] = clean_highlights
+
+
+
+            # VISION: забираем максимум текста с картинки
             vision = card.get("vision") or {}
             vis_parts: list[str] = []
 
-            # 1) обычное «описание изображения»
             desc = (vision.get("description") or "").strip()
             if desc:
                 vis_parts.append(desc)
 
-            # 2) если движок вернёт «сырой текст» / OCR (ключи заведомо безопасные: если их нет — просто пропустим)
             raw_text = (vision.get("raw_text") or vision.get("text") or "").strip()
             if raw_text:
                 vis_parts.append(raw_text)
@@ -3594,7 +4063,6 @@ def _build_figure_records(
                 rec.get("figure_kind"),
                 vis_clean[:300],
             )
-            # отбрасываем заглушки вида «содержимое изображения (описание не распознано)»
             if vis_clean and "описание не распознано" not in low and "содержимое изображения" not in low:
                 rec["vision_desc"] = vis_clean
 
@@ -3619,7 +4087,6 @@ def _build_figure_records(
                 if path and path not in rec["images"]:
                     rec["images"].append(path)
 
-                # попытка вытащить тип рисунка из OOXML-метаданных, если есть
                 kind_oox = (oox_rec.get("kind") or "").strip()
                 if kind_oox and not rec.get("figure_kind"):
                     rec["figure_kind"] = kind_oox
@@ -3642,13 +4109,24 @@ def _build_figure_records(
                 if not rec["near_text"] and cap_text:
                     rec["near_text"].append(cap_text)
 
-                # тип рисунка из локального индекса (figures.py)
                 kind_loc = (r.get("kind") or "").strip()
                 if kind_loc and not rec.get("figure_kind"):
                     rec["figure_kind"] = kind_loc
 
+                # 🔎 3.bis. Мягкая эвристика "по подписи": только общие схемы
+        # ВАЖНО:
+        #  - больше НЕ помечаем ничего как org_chart только по словам в подписи,
+        #    чтобы рисунки 1.1 / 1.2 не «притягивались» к оргструктурам из 2.1;
+        #  - org_chart теперь может появиться только из OOXML/figures-индекса,
+        #    где явно указан kind для конкретного рисунка.
+        if not rec.get("figure_kind"):
+            cap_low = (rec.get("caption") or "").strip().lower()
+            # только очень общие "схема/модель/алгоритм", без "организационная структура"
+            if cap_low and any(kw in cap_low for kw in ("схема", "модель", "алгоритм", "блок-схема")):
+                rec["figure_kind"] = "schema"
+
+
         # --- 4) chart_data из attrs (ТОЧНЫЕ числовые значения из OOXML) ---
-                # --- 4) chart_data из attrs (ТОЧНЫЕ числовые значения из OOXML) ---
         row = _fetch_figure_row_by_num(uid, doc_id, orig)
         logging.info("FIGURE %s: fetch_row(orig=%r) -> %s", norm, orig, "HIT" if row else "MISS")
 
@@ -3656,22 +4134,42 @@ def _build_figure_records(
             row = _fetch_figure_row_by_num(uid, doc_id, norm)
             logging.info("FIGURE %s: fetch_row(norm=%r) -> %s", norm, norm, "HIT" if row else "MISS")
 
+        # ⬇️ НОВОЕ: даже если fetch_row что-то нашёл, проверяем,
+        # что внутри chunk’а реально этот же номер рисунка, а не, например, 2.1
+        if row:
+            try:
+                real_label = _row_fig_label(row)
+            except Exception:
+                real_label = ""
 
-        # NEW: если по caption_num не нашли — пытаемся достать figure-chunk по тексту/section_path,
-        # чтобы хотя бы получить chunk_id (иначе nearest_table_above никогда не сработает).
+            if real_label and real_label != norm:
+                logging.info(
+                    "FIGURE %s: fetch_row returned foreign figure (real=%s), ignore row",
+                    norm,
+                    real_label,
+                )
+                row = None
+
+        # ⬇️ НОВОЕ: если figure-чанка нет, пробуем собрать контекст по строке "Рисунок N"
+        if not row and not rec.get("caption") and not rec.get("near_text"):
+            cap_fallback, near_fallback = _figure_fallback_context_from_caption(uid, doc_id, norm)
+            if cap_fallback:
+                rec["caption"] = rec.get("caption") or cap_fallback
+            if near_fallback:
+                rec["near_text"] = near_fallback
+
+        # если по caption_num не нашли — пробуем достать figure-chunk по тексту/section_path
         if not row:
             try:
                 con = get_conn()
                 cur = con.cursor()
 
                 pats = []
-                # сначала пробуем по подписи (если она есть)
                 cap = (rec.get("caption") or "").strip()
                 if cap:
                     cap_snip = cap[:60]
                     pats.append(f"%{cap_snip}%")
 
-                # затем типовые формы "Рисунок 2.2", "Рис. 2.2", просто "2.2"
                 pats.extend([
                     f"%Рисунок {norm}%",
                     f"%Рис. {norm}%",
@@ -3694,8 +4192,23 @@ def _build_figure_records(
                         (uid, doc_id, pat, pat),
                     )
                     row = cur.fetchone()
-                    if row:
-                        break
+                    if not row:
+                        continue
+
+                    # 🔍 NEW: проверяем, что найденный chunk реально про нужный номер рисунка
+                    real_label = _row_fig_label(row)
+                    if real_label and real_label != norm:
+                        logging.info(
+                            "FIGURE %s: SQL fallback matched foreign figure %r (real=%s), skip",
+                            norm,
+                            row.get("id") if hasattr(row, "get") else None,
+                            real_label,
+                        )
+                        row = None
+                        continue
+
+                    # если номера нет вообще (не удалось извлечь) — пусть остаётся
+                    break
             except Exception:
                 row = None
             finally:
@@ -3704,16 +4217,32 @@ def _build_figure_records(
                 except Exception:
                     pass
 
-        # если row нашли — обрабатываем attrs / display / follow_text как раньше
+        # ⬇️ НОВОЕ: если даже после всех попыток figure-чанк так и не нашли,
+        # пробуем вытащить подпись и текст по номеру "Рисунок X.Y" из обычных абзацев.
+        if not row:
+            fb = _figure_fallback_from_caption(uid, doc_id, norm)
+            if fb:
+                cap_fb = (fb.get("caption") or "").strip()
+                if cap_fb and not rec.get("caption"):
+                    rec["caption"] = cap_fb
+
+                near_fb = fb.get("near_text") or []
+                if near_fb and not rec.get("near_text"):
+                    rec["near_text"] = near_fb
+
+                # если тип ещё не определён, считаем это текстовой схемой
+                if not rec.get("figure_kind"):
+                    rec["figure_kind"] = "schema"
+
         if row:
             try:
                 rec["chunk_id"] = row["id"]
+
             except Exception:
                 pass
 
             attrs_json = row["attrs"] if ("attrs" in row.keys()) else None
 
-            # тип рисунка из attrs, если там есть figure_kind
             try:
                 if attrs_json and not rec.get("figure_kind"):
                     if isinstance(attrs_json, str):
@@ -3768,20 +4297,23 @@ def _build_figure_records(
                     title_text,
                 )
 
-            # 4.c) ТЕКСТ ПОСЛЕ РИСУНКА: 2–3 абзаца прямо из диплома
+            # 4.c) текст после рисунка: 2–3 абзаца прямо из диплома
             try:
-                follow = _figure_following_paragraphs(uid, doc_id, row, max_paragraphs=3, max_chars=1500)
+                follow = _figure_following_paragraphs(
+                    uid, doc_id, row, max_paragraphs=3, max_chars=1500
+                )
                 if follow:
-                    base = rec.get("near_text") or []
-                    rec["near_text"] = base + follow
+                    # ⚠️ ВАЖНО: считаем именно этот текст «истиной» для данного рисунка
+                    # и не смешиваем его с RAG-хайлайтами от других рисунков.
+                    rec["near_text"] = follow
+                elif not rec.get("near_text") and rec.get("caption"):
+                    # если вокруг рисунка нет отдельных абзацев,
+                    # используем хотя бы подпись как минимум текста
+                    rec["near_text"] = [rec["caption"]]
             except Exception:
-                # не ломаем обработку рисунка, если что-то пошло не так
                 pass
 
-            # 4.d) ФОЛБЭК ПО ТАБЛИЦЕ: если из OOXML не получилось достать числа,
-                        # 4.d) ФОЛБЭК ПО ТАБЛИЦЕ:
-            # если из OOXML не получилось достать числа, пытаемся привязать таблицу
-            # ТОЛЬКО для числовых диаграмм и только когда есть запрос на значения.
+            # 4.d) фолбэк по таблице: только для числовых фигур и только при запросе чисел
             if not rec.get("raw_values"):
                 try:
                     textual_kinds = {
@@ -3797,25 +4329,15 @@ def _build_figure_records(
                     fig_kind = (rec.get("figure_kind") or "").strip().lower()
                     is_textual_figure = fig_kind in textual_kinds
 
-                    # если явно текстовая схема — к таблицам не лезем
-                    if is_textual_figure:
-                        pass
-                    else:
-                        # если пользователь явно/эвристически просит числа —
-                        # пробуем подтянуть таблицу (явное "таблица X.X" или ближайшая выше)
-                        if need_values:
-                            _attach_table_values_from_near_text(uid, doc_id, rec)
+                    if not is_textual_figure and need_values:
+                        _attach_table_values_from_near_text(uid, doc_id, rec)
                 except Exception:
                     logging.exception("figure->table fallback failed")
-
-
-
-
 
         if not rec["display"]:
             rec["display"] = f"Рисунок {norm}"
 
-        # --- 5) VISION fallback: если в карточках vision пусто, но есть картинка ---
+        # --- 5) VISION fallback ---
         if not rec.get("vision_desc") and va_analyze_figure and rec.get("images"):
             try:
                 vis = va_analyze_figure(rec["images"][0], lang="ru")
@@ -3825,7 +4347,6 @@ def _build_figure_records(
                     vis_clean = " ".join([p for p in (desc, raw_text) if p]).strip()
 
                     low = vis_clean.lower()
-                    # отбрасываем заглушки вида «содержимое изображения (описание не распознано)»
                     if vis_clean and "описание не распознано" not in low and "содержимое изображения" not in low:
                         rec["vision_desc"] = vis_clean
                         logging.info("FIGURE %s vision_fallback=%r", rec["num"], vis_clean[:300])
@@ -3834,11 +4355,84 @@ def _build_figure_records(
             except Exception as e:
                 logging.exception("vision fallback failed for figure %s: %s", rec["num"], e)
 
+                # --- 6) Санитарная очистка near_text ---
+        # Удаляем куски, которые явно относятся к ДРУГИМ рисункам
+        clean_near: list[str] = []
+        for t in rec.get("near_text") or []:
+            txt = (t or "").strip()
+            if not txt:
+                continue
+            m = re.search(r"(?:Рис\.?|Рисунок)\s+([\d.]+)", txt, flags=re.IGNORECASE)
+            if m:
+                other = _num_norm_fig(m.group(1))
+                # если в тексте упомянут другой номер рисунка — выкидываем такой абзац
+                if other and other != norm:
+                    continue
+            clean_near.append(txt)
+
+        rec["near_text"] = clean_near
+
+        # --- 7) Фолбэк по подписи в обычном тексте (SmartArt и «невидимые» рисунки) ---
+        # Если после всех шагов по-прежнему нет ни подписи, ни внятного текста рядом,
+        # пробуем достать их из обычного текстового абзаца вида «Рис. 1.2 ...».
+        if (not rec.get("caption")) or not rec.get("near_text"):
+            try:
+                cap_fb, near_fb = _figure_fallback_from_caption_text(uid, doc_id, norm)
+            except Exception:
+                cap_fb, near_fb = None, []
+
+            if cap_fb and not rec.get("caption"):
+                rec["caption"] = cap_fb
+            if near_fb and not rec.get("near_text"):
+                rec["near_text"] = near_fb
+
+        # если после всех фолбэков вокруг рисунка всё ещё нет текста —
+        # используем хотя бы подпись как минимальный контекст
+        if not rec.get("near_text") and rec.get("caption"):
+            rec["near_text"] = [rec["caption"]]
+
         records_by_num[norm] = rec
+
 
     return list(records_by_num.values())
 
 
+
+def _clean_caption_for_figure(caption: str, expected_num: str) -> str:
+    """
+    Если подпись выглядит как 'Рис. 2.1. ...', а мы описываем, например, 1.2 —
+    отбрасываем чужой номер и оставляем только текст после него.
+    Если номер совпадает или не найден — возвращаем исходную строку.
+    """
+    caption = (caption or "").strip()
+    if not caption:
+        return ""
+
+    try:
+        m = re.match(
+            r"^\s*(рис(унок)?\.?\s+)?([\d.]+)\s*[\).:-]?\s*(.*)$",
+            caption,
+            flags=re.IGNORECASE,
+        )
+    except Exception:
+        return caption
+
+    if not m:
+        return caption
+
+    label_num_raw = m.group(3) or ""
+    tail = (m.group(4) or "").strip()
+
+    # нормализуем оба номера
+    exp_norm = _num_norm_fig(expected_num)
+    label_norm = _num_norm_fig(label_num_raw)
+
+    # если номер в подписи другой — возвращаем только «хвост» без "Рис. X.X"
+    if label_norm and exp_norm and label_norm != exp_norm:
+        return tail or ""
+
+    # номер совпадает или не распознан — оставляем подпись как есть
+    return caption
 
 
 def _format_table_values_for_figure(table_num: str, ctx: str) -> str:
@@ -3848,8 +4442,7 @@ def _format_table_values_for_figure(table_num: str, ctx: str) -> str:
     Ничего не парсит и не перестраивает:
     - оставляет исходный текст/Markdown-таблицу как есть;
     - добавляет заголовок
-      "По данным таблицы X.X точные значения (как в документе):";
-    - сам текст таблицы выводит в виде моноширинного блока ```text ... ```.
+      "По данным таблицы X.X точные значения (как в документе):".
     """
     ctx = (ctx or "").strip()
     if not ctx:
@@ -3875,16 +4468,15 @@ def _format_table_values_for_figure(table_num: str, ctx: str) -> str:
 
     body_text = "\n".join(body_lines) if body_lines else ctx
 
-    # чуть-чуть защита от совсем гигантских простыней
+    # лёгкая защита от слишком длинных простыней
     if len(body_text) > 4000:
         body_text = body_text[:4000] + "…"
 
     md.append("")
-    md.append("```text")
     md.append(body_text)
-    md.append("```")
 
     return "\n".join(md)
+
 
 
 def _attach_table_values_from_near_text(
@@ -3893,18 +4485,49 @@ def _attach_table_values_from_near_text(
     rec: dict,
 ) -> None:
     """
-    Фолбэк для рисунков без чисел.
+    Фолбэк для РИСУНКОВ-БАРЧАРТОВ/ГРАФИКОВ без чисел.
 
-    Логика:
-      1) Если уже есть значения (OOXML / table) — выходим.
-      2) Собираем подпись + ближайший текст, ищем явное упоминание "таблица X.X".
-      3) Если нашли — тянем контекст этой таблицы.
-      4) Если нет или по номеру не нашли — берём ближайшую таблицу выше по документу.
-      5) Используем таблицу только если она:
-         - из той же главы, что и рисунок (2.x → 2.y, но не 1.1),
-         - выглядит в целом как числовая (_looks_like_numeric_table_text).
-      6) Форматируем в markdown и складываем в values_text / values_source="table".
+    ВАЖНО: для схем/оргструктур/блок-схем таблицы НЕ подтягиваем вообще,
+    чтобы не было странных «таблица ?» и лишних чисел.
     """
+
+    # --- 0. Жёсткий стоп для текстовых схем / оргструктур ---
+    fig_kind = (rec.get("figure_kind") or "").strip().lower()
+    textual_kinds = {
+        "org_chart",
+        "orgchart",
+        "flowchart",
+        "text_blocks",
+        "schema",
+        "scheme",
+        "block_diagram",
+        "structure",
+    }
+
+    # если движок/индексы уже пометили рисунок как схему — сразу выходим
+    if fig_kind in textual_kinds:
+        return
+
+    # дополнительная эвристика по подписи:
+    # «организационная структура предприятия», «схема», «модель», «алгоритм» и т.п.
+    caption_low = (rec.get("caption") or "").strip().lower()
+    caption_keywords = (
+        "организационная структура",
+        "организационная структура предприятия",
+        "оргструктура",
+        "структура предприятия",
+        "схема",
+        "модель",
+        "алгоритм",
+        "блок-схема",
+    )
+    if any(kw in caption_low for kw in caption_keywords):
+        return
+
+    """
+    Дальше — СТАРАЯ ЛОГИКА, но уже точно только для числовых диаграмм.
+    """
+
     # 1) если у рисунка уже есть «сильные» значения (OOXML / table) — ничего не делаем
     if rec.get("raw_values"):
         return
@@ -4116,6 +4739,7 @@ def _fig_values_text_from_records(
     Приоритет:
       1) rec.raw_values / rec.values_text (OOXML / таблицы);
       2) oox_fig_lookup (готовый текст).
+    Формат — обычный текст, без Markdown-разметки.
     """
     lines: list[str] = []
     # чтобы не дублировать один и тот же блок значений (например, одна таблица для двух рисунков)
@@ -4159,7 +4783,6 @@ def _fig_values_text_from_records(
             except Exception:
                 pass
 
-        # если после всех попыток чисел нет — пропускаем этот рисунок
         if not values_text:
             continue
 
@@ -4167,38 +4790,57 @@ def _fig_values_text_from_records(
         src = (rec.get("values_source") or "").lower()
         tbl_num = (rec.get("source_table_num") or "").strip()
 
-        # ключ для дедупликации
+        # ключ для дедупликации (src + номер таблицы + сам текст)
         block_key = (src or "?", tbl_num, values_text)
         if block_key in seen_blocks:
-            # этот блок уже выводили (например, одна и та же таблица для двух рисунков)
             continue
         seen_blocks.add(block_key)
 
         if src == "ooxml":
-            title = f"**{disp} — точные значения (как в документе)**"
+            title = f"{disp} — точные значения (как в документе)"
         elif src == "table":
             if tbl_num:
-                title = f"**{disp} — значения по таблице {tbl_num} (как в документе)**"
+                title = f"{disp} — значения по таблице {tbl_num} (как в документе)"
             else:
-                title = f"**{disp} — значения по связанной таблице (как в документе)**"
+                title = f"{disp} — значения по связанной таблице (как в документе)"
         elif src in {"summary", "vision", "rag"}:
-            title = f"**{disp} — значения, распознанные/суммаризованные (возможны неточности)**"
+            title = f"{disp} — значения, распознанные или суммаризованные (возможны неточности)"
         else:
-            title = f"**{disp} — значения**"
+            title = f"{disp} — значения"
 
         lines.append(f"{title}\n\n{values_text}")
 
     if lines:
         return "\n\n".join(lines)
 
-    # Был запрос "описать", но таблицы или OOXML не нашли
-    if need_values:
+    # 👇 NEW: если чисел нет — решаем, надо ли вообще писать тех-сообщение
+    textual_kinds = {
+        "org_chart",
+        "orgchart",
+        "flowchart",
+        "text_blocks",
+        "schema",
+        "scheme",
+        "block_diagram",
+        "structure",
+    }
+
+    has_numeric_figure = any(
+        ((rec.get("figure_kind") or "").strip().lower() not in textual_kinds)
+        for rec in (records or [])
+    )
+
+    # Тех-сообщение показываем ТОЛЬКО если:
+    #  - пользователь действительно просил числа (need_values=True)
+    #  - и среди рисунков есть хотя бы один «нормальный» график/диаграмма
+    if need_values and has_numeric_figure:
         return (
             "По указанным рисункам не удалось автоматически извлечь точные числовые данные "
             "(нет структурированных OOXML-данных, связанных таблиц или распознавания по картинкам). "
             "Могу дать только текстовое описание."
         )
 
+    # Для схем/оргструктур без чисел — просто молчим, пусть будет только текстовое объяснение
     return ""
 
 
@@ -4357,15 +4999,19 @@ async def _answer_figure_query(
     """
     Новый единый сценарий:
     1) всегда вытаскиваем максимум по рисункам (_build_figure_records);
-    2) собираем общий блок с точными значениями (если есть);
-    3) даём одно связное пояснение через GPT, в которое подмешан блок значений.
+    2) собираем блоки с точными значениями по КАЖДОМУ рисунку (если есть);
+    3) даём по каждому рисунку пояснение через GPT + добавляем его блок значений.
 
-    Поведение не зависит от того, спросили ли «опиши рисунок 2.3»
-    или «дай точные значения по рисунку 2.3» — меняется только акцент
-    в текстовом объяснении.
+    ВАЖНО: теперь мы разделяем:
+    - user_asked_values: пользователь ЯВНО просил числа;
+    - need_values_for_search: внутренняя эвристика, чтобы агрессивнее искать таблицы/OOXML.
     """
-    # 0) по тексту запроса — есть ли явный намёк на числа
-    need_values = bool(_VALUES_HINT.search(text or ""))
+
+    # 0) по тексту запроса — есть ли ЯВНЫЙ намёк на числа
+    user_asked_values = bool(_VALUES_HINT.search(text or ""))
+
+    # этот флаг будем передавать в _build_figure_records, его можно форсить эвристикой
+    need_values_for_search = user_asked_values
 
     # 1) вытаскиваем номера рисунков из текста
     raw_list = _extract_fig_nums(text or "")
@@ -4375,17 +5021,17 @@ async def _answer_figure_query(
         n = _num_norm_fig(token)
         if n and n not in seen:
             seen.add(n)
-            nums.append(token)   # сохраняем исходный вид номера
+            # ⬇️ ВАЖНО: работаем дальше с нормализованным номером
+            nums.append(n)
+
 
     if not nums:
         return False
 
-    # 🎯 НЕОБЯЗАТЕЛЬНАЯ эвристика:
+    # 🎯 ЭВРИСТИКА ТОЛЬКО ДЛЯ ПОИСКА ЧИСЕЛ, НЕ ДЛЯ СООБЩЕНИЙ ПОЛЬЗОВАТЕЛЮ
     # если пользователь просто «опиши рисунок 2.2», но по OOXML нет сырых чисел —
-    # можно форснуть need_values=True, чтобы агрессивнее искать таблицы.
-    #
-    # Если не хочется лишней магии — этот блок можно вообще удалить.
-    if not need_values:
+    # можно форснуть need_values_for_search=True, чтобы агрессивнее искать таблицы.
+    if not need_values_for_search:
         try:
             for token in nums:
                 n = _num_norm_fig(token)
@@ -4398,44 +5044,72 @@ async def _answer_figure_query(
                 raw = _extract_raw_values_from_attrs(attrs_json)
                 # если сырых чисел нет — лучше включить поиск таблиц
                 if not raw:
-                    need_values = True
+                    need_values_for_search = True
                     break
         except Exception:
             # не считаем падение эвристики фатальным
             pass
 
-    # 2) собираем единую структуру по всем рисункам
-        # 2) собираем единую структуру по всем рисункам
-    records = _build_figure_records(uid, doc_id, nums, need_values=need_values)
+    # 2) собираем единую структуру по всем рисункам (сюда передаём ВНУТРЕННИЙ флаг)
+    records = _build_figure_records(uid, doc_id, nums, need_values=need_values_for_search)
     if not records:
         return False
 
-    # БОЛЬШЕ НЕТ общего values_block на все рисунки.
-    # Для каждого рисунка считаем свой блок значений отдельно.
+    # 3) по каждому рисунку отдельно: пояснение + его блок значений
+        # 3) по каждому рисунку отдельно: пояснение + его блок значений
     for rec in records:
         num = rec.get("num")
         if not num:
             continue
 
         try:
+            # ⬇️ Передаём rec внутрь, чтобы GPT-описание жёстко опиралось
+            # на уже найденную карточку, а не на заново собранные данные.
             explanation = await _describe_figure_for_multi(
-                uid, doc_id, num, text, verbosity
+                uid,
+                doc_id,
+                num,
+                text,
+                verbosity,
+                rec=rec,
             )
         except Exception as e:
             logging.exception("describe_figure_for_multi failed in _answer_figure_query: %s", e)
             explanation = ""
 
+
         if not explanation:
             continue
 
+        # определяем тип рисунка
+        fig_kind = (rec.get("figure_kind") or "").strip().lower()
+        textual_kinds = {
+            "org_chart",
+            "orgchart",
+            "flowchart",
+            "text_blocks",
+            "schema",
+            "scheme",
+            "block_diagram",
+            "structure",
+        }
+
+        # 👉 ВАЖНО:
+        # user_asked_values — "пользователь реально просил числа",
+        # а не "мы внутри хотим поискать таблицу".
+        # Для схем/оргструктур не просим числовые значения даже если пользователь их хотел.
+        need_values_for_message = user_asked_values and (fig_kind not in textual_kinds)
+
         # 🔢 Для этого конкретного рисунка собираем его "Точные значения"
-        per_values_block = _fig_values_text_from_records([rec], need_values=need_values)
+        per_values_block = _fig_values_text_from_records(
+            [rec],
+            need_values=need_values_for_message,
+        )
 
         if per_values_block:
             explanation = explanation.rstrip() + "\n\n" + per_values_block.strip()
 
         await m.answer(explanation)
-
 
     # 6) обновляем «последний упомянутый рисунок» для анафорических вопросов
     try:
@@ -4444,6 +5118,8 @@ async def _answer_figure_query(
         pass
 
     return True
+
+
 
 def _ooxml_table_block(uid: int, doc_id: int, num: str) -> str | None:
     """
@@ -6232,7 +6908,7 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
     # для коротких реплик вида «опиши подробнее», «расскажи про него»
     q_text = _expand_with_last_referent(uid, q_text)
 
-        # Примеры: "опиши таблицу 4", "что показывает таблица 2.3", "сделай выводы по таблице 4"
+    # Примеры: "опиши таблицу 4", "что показывает таблица 2.3", "сделай выводы по таблице 4"
     if _is_pure_table_request(q_text):
         verbosity = _detect_verbosity(q_text)
         base_text = (orig_q_text or "")
@@ -6261,13 +6937,10 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
                 uid,
                 doc_id,
             )
-
-
         # если _answer_table_query не смог ответить (таблица не нашлась в OOXML/картинке),
+        # просто проваливаемся дальше в общий пайплайн
 
-
-    # быстрый путь для запросов про рисунки
-        # быстрый путь для запросов про рисунки
+    # быстрый путь для запросов про рисунки (старый, через _answer_figure_query)
     if _is_pure_figure_request(q_text):
         verbosity = _detect_verbosity(q_text)
         logger.info(
@@ -6314,7 +6987,9 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
         # карточки (используем только для текста; картинки в чат больше не шлём)
         cards = []
         try:
-            cards = describe_figures_by_numbers(uid, doc_id, batch, sample_chunks=1, use_vision=False, lang="ru") or []
+            cards = describe_figures_by_numbers(
+                uid, doc_id, batch, sample_chunks=1, use_vision=False, lang="ru"
+            ) or []
         except Exception:
             cards = []
 
@@ -6335,9 +7010,6 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
                     else:
                         text_block = (str(res) or "").strip()
                 except Exception:
-                    text_block = ""
-                if not text_block:
-                    # фолбэк — старый summarizer больше не используем
                     text_block = ""
                 if text_block:
                     # это текст по изображению (OCR/описание)
@@ -6374,7 +7046,10 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
 
         # Если несколько номеров или смешанные типы (таблицы + рисунки + главы),
         # считаем это мультийнтентом и обрабатываем централизованно.
-        if not is_single_ref or len(kinds) > 1:
+        # ❗ ВАЖНО: запросы, где есть только несколько рисунков (kinds == {"figure"}),
+        # больше НЕ отдаём в _answer_structured_multi — их обработаем ниже
+        # через RAG + специальную "only_figures"-ветку.
+        if (not is_single_ref or len(kinds) > 1) and kinds != {"figure"}:
             logger.info(
                 "ANSWER: structured-multi pipeline (uid=%s, doc_id=%s, refs=%r)",
                 uid,
@@ -6383,7 +7058,6 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
             )
             handled = await _answer_structured_multi(m, uid, doc_id, q_text, refs)
             if handled:
-                # КРИТИЧЕСКОЕ МЕСТО:
                 # раз уж увидели явные номера и отработали их,
                 # НИ FULLREAD, НИ generic-ответы внизу НЕ вызываем.
                 return
@@ -6399,7 +7073,6 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
 
     # NEW: если в вопросе явно указан раздел/пункт — запоминаем его как последний
     m_area = _SECTION_NUM_RE.search(q_text)
-
     if m_area:
         try:
             area = (m_area.group(1) or "").replace(" ", "").replace(",", ".")
@@ -6407,14 +7080,16 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
         except Exception:
             pass
 
-        # --- Определяем интенты заранее
+    # --- Определяем интенты заранее
     intents = detect_intents(q_text)
 
     # Чистый запрос про конкретные рисунки (нет секций/таблиц/источников/общего вопроса)
     pure_figs = intents["figures"]["want"] and not (
-        intents["tables"]["want"] or intents["sources"]["want"] or
-        intents.get("summary") or intents.get("general_question") or
-        _SECTION_NUM_RE.search(q_text)
+        intents["tables"]["want"]
+        or intents["sources"]["want"]
+        or intents.get("summary")
+        or intents.get("general_question")
+        or _SECTION_NUM_RE.search(q_text)
     )
 
     # NEW: явная обработка «по пункту/разделу/главе X.Y» (но только для ЧИСТЫХ запросов)
@@ -6463,13 +7138,17 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
 
             if STREAM_ENABLED and chat_with_gpt_stream is not None:
                 try:
-                    stream = chat_with_gpt_stream(messages, temperature=0.2, max_tokens=FINAL_MAX_TOKENS)  # type: ignore
+                    stream = chat_with_gpt_stream(
+                        messages, temperature=0.2, max_tokens=FINAL_MAX_TOKENS
+                    )  # type: ignore
                     await _stream_to_telegram(m, stream)
                     return
                 except Exception as e:
                     logging.exception("section summary stream failed: %s", e)
             try:
-                ans = chat_with_gpt(messages, temperature=0.2, max_tokens=FINAL_MAX_TOKENS)
+                ans = chat_with_gpt(
+                    messages, temperature=0.2, max_tokens=FINAL_MAX_TOKENS
+                )
                 if ans:
                     await _send(m, _strip_unwanted_sections(ans))
                     return
@@ -6479,8 +7158,6 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
         else:
             await _send(m, f"Пункт {sec} не найден в индексе документа.")
             return
-
-
 
     # ====== FULLREAD: auto ======
     fr_mode = getattr(Cfg, "FULLREAD_MODE", "off")
@@ -6532,7 +7209,10 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
             messages = [
                 {"role": "system", "content": system_prompt},
                 {"role": "assistant", "content": f"[Документ — полный текст]\n{full_text}"},
-                {"role": "user", "content": f"{q_text}\n\n{_verbosity_addendum(verbosity)}"},
+                {
+                    "role": "user",
+                    "content": f"{q_text}\n\n{_verbosity_addendum(verbosity)}",
+                },
             ]
 
             if STREAM_ENABLED and chat_with_gpt_stream is not None:
@@ -6560,7 +7240,6 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
                 logging.exception("auto fullread non-stream failed: %s", e)
         # 3) документ длинный → итеративное чтение (map→reduce)
         else:
-            # документ большой → итеративное чтение (map→reduce)
             messages, err = _iterative_fullread_build_messages(uid, doc_id, q_text)
             if messages:
                 if STREAM_ENABLED and chat_with_gpt_stream is not None:
@@ -6575,7 +7254,9 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
                     except Exception as e:
                         logging.exception("auto iterative stream failed: %s", e)
                 try:
-                    ans = chat_with_gpt(messages, temperature=0.2, max_tokens=FINAL_MAX_TOKENS)
+                    ans = chat_with_gpt(
+                        messages, temperature=0.2, max_tokens=FINAL_MAX_TOKENS
+                    )
                     if ans:
                         await _send(m, _strip_unwanted_sections(ans))
                         return
@@ -6598,13 +7279,17 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
         if messages:
             if STREAM_ENABLED and chat_with_gpt_stream is not None:
                 try:
-                    stream = chat_with_gpt_stream(messages, temperature=0.2, max_tokens=FINAL_MAX_TOKENS)  # type: ignore
+                    stream = chat_with_gpt_stream(
+                        messages, temperature=0.2, max_tokens=FINAL_MAX_TOKENS
+                    )  # type: ignore
                     await _stream_to_telegram(m, stream)
                     return
                 except Exception as e:
                     logging.exception("iterative fullread stream failed: %s", e)
             try:
-                ans = chat_with_gpt(messages, temperature=0.2, max_tokens=FINAL_MAX_TOKENS)
+                ans = chat_with_gpt(
+                    messages, temperature=0.2, max_tokens=FINAL_MAX_TOKENS
+                )
                 if ans:
                     await _send(m, _strip_unwanted_sections(ans))
                     return
@@ -6626,6 +7311,73 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
         list(facts.keys()) if isinstance(facts, dict) else type(facts),
     )
 
+    # 💡 НОВОЕ: если запрос — ЧИСТО про конкретные рисунки по номерам,
+    # а карточки уже собраны в facts["figures"]["describe_cards"],
+    # отдаём быстрый "фигурный" ответ и НЕ идём в LLM-генерацию.
+    try:
+        figs_int = intents.get("figures") or {}
+        tables_int = intents.get("tables") or {}
+        sources_int = intents.get("sources") or {}
+        explicit_fig_nums = list(figs_int.get("describe") or [])
+
+        only_figures = (
+            explicit_fig_nums
+            and figs_int.get("want")
+            and not (tables_int.get("want") or sources_int.get("want"))
+            and not intents.get("summary")
+            and not intents.get("general_question")
+        )
+
+        if only_figures and isinstance(facts, dict):
+            figs_block = (facts.get("figures") or {}) if isinstance(facts, dict) else {}
+            cards = list(figs_block.get("describe_cards") or [])
+
+            if cards:
+                logger.info(
+                    "ANSWER: only_figures fast path (uid=%s, doc_id=%s, nums=%s, cards=%d)",
+                    uid,
+                    doc_id,
+                    explicit_fig_nums,
+                    len(cards),
+                )
+                parts: list[str] = []
+                for c in cards:
+                    num = (c.get("num") or c.get("label") or "").strip()
+                    display = c.get("display") or (f"Рисунок {num}" if num else "Рисунок")
+                    vision_desc = ((c.get("vision") or {}).get("description") or "").strip()
+                    text = (c.get("text") or "").strip()
+                    values_str = (c.get("values_str") or "").strip()
+
+                    block_lines: list[str] = []
+
+                    # 1. Заголовок
+                    block_lines.append(display + ".")
+
+                    # 2. Короткое смысловое описание (vision → text)
+                    body = ""
+                    if vision_desc:
+                        body = vision_desc
+                    elif text:
+                        paras = [p.strip() for p in text.split("\n") if p.strip()]
+                        body = "\n".join(paras[:2])
+                    if body:
+                        block_lines.append(body)
+
+                    # 3. Числа/значения — только если не превращаются в простыню
+                    if values_str:
+                        lines = [ln for ln in values_str.splitlines() if ln.strip()]
+                        if len(lines) > 8:
+                            lines = lines[:8]
+                        if lines:
+                            block_lines.append("\n".join(lines))
+
+                    parts.append("\n\n".join(block_lines))
+
+                await _send(m, "\n\n\n".join(parts))
+                return
+    except Exception as e:
+        logging.exception("only_figures fast path failed, fallback to generic: %s", e)
+
     # NEW: если по общему вопросу ничего не нашлось именно в тексте работы —
     # сначала спрашиваем, можно ли ответить в общем виде как [модель].
     if intents.get("general_question") and not facts.get("general_ctx") and not facts.get("summary_text"):
@@ -6637,12 +7389,11 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
             m,
             "По этому вопросу я не нашёл явной информации в самом тексте работы. "
             "Могу ответить в общем виде как [модель] (это уже не будет опираться на документ). "
-            "Напиши «да» или «нет»."
+            "Напиши «да» или «нет».",
         )
         return
 
-    # ↓ НОВОЕ: если есть план подпунктов — включаем многошаговую подачу
-        # ↓ НОВОЕ: если есть план подпунктов — включаем многошаговую подачу,
+    # ↓ НОВОЕ: если есть план подпунктов — включаем многошаговую подачу,
     # но только когда это реально оправдано (есть подпункты и вопрос не слишком короткий).
     discovered_items: list[dict] | None = None
     if isinstance(facts, dict):
@@ -6663,12 +7414,12 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
             if handled:
                 return
         except Exception as e:
-            logging.exception("multistep pipeline failed, fallback to normal: %s", e)
+            logging.exception(
+                "multistep pipeline failed, fallback to normal: %s", e
+            )
     # если мультишаг не подошёл — ниже идём по обычному пайплайну
 
-
-
-        # обычный путь + явная инструкция по вербозности
+    # обычный путь + явная инструкция по вербозности
     verbosity = _detect_verbosity(q_text)
     SAFE_RULES = (
         "Отвечай строго по приведённым фактам и цитатам из контекста. "
@@ -6684,13 +7435,15 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
     if figs_in_q:
         LAST_REF.setdefault(uid, {})["figure_nums"] = figs_in_q
 
-        # NEW: прямой мультимодальный ответ, если есть релевантные картинки из документа
+    # NEW: прямой мультимодальный ответ, если есть релевантные картинки из документа
     # (не ломает старую логику: если не получилось/нет картинок — идём в generate_answer)
     try:
         if intents.get("general_question") and getattr(Cfg, "vision_active", lambda: False)():
             # подтянем релевантные чанк-хиты и выберем 1–3 файла-изображения
             hits_v = retrieve(uid, doc_id, intents["general_question"], top_k=10) or []
-            img_paths = _pick_images_from_hits(hits_v, limit=getattr(Cfg, "VISION_MAX_IMAGES_PER_REQUEST", 3))
+            img_paths = _pick_images_from_hits(
+                hits_v, limit=getattr(Cfg, "VISION_MAX_IMAGES_PER_REQUEST", 3)
+            )
             if img_paths and (chat_with_gpt_stream_multimodal or chat_with_gpt_multimodal):
                 # контекст из RAG, если он есть
                 ctx = (facts.get("general_ctx") or "").strip() if isinstance(facts, dict) else ""
@@ -6702,7 +7455,9 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
                     "маркетинг и т.п.), если они не указаны в тексте или подписях к изображениям."
                 )
 
-                mm_prompt = (f"{q_text}\n\nКонтекст из документа:\n{ctx}" if ctx else q_text)
+                mm_prompt = (
+                    f"{q_text}\n\nКонтекст из документа:\n{ctx}" if ctx else q_text
+                )
 
                 if STREAM_ENABLED and chat_with_gpt_stream_multimodal is not None:
                     stream = chat_with_gpt_stream_multimodal(
@@ -6765,22 +7520,137 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
 
     await _send(m, _strip_unwanted_sections(answer))
 
+
 async def _qa_worker(m: types.Message, uid: int, doc_id: int, text: str):
     """
     Фоновый воркер: отвечает на вопрос пользователя, чтобы не блокировать обработку апдейта.
     """
     try:
-        await respond_with_answer(m, uid, doc_id, text)
+        # 1. Если запрос обычный/небольшой — работаем по старой схеме
+        if not is_big_complex_query(text):
+            await respond_with_answer(m, uid, doc_id, text)
+            return
+
+        # 2. Сложный запрос -> планируем подзадачи
+        tasks = plan_tasks_from_user_query(text, max_tasks=8)
+        batches = batch_tasks(tasks, batch_size=3)
+
+        # Жёсткая инструкция для всех под-вопросов
+        prefix = (
+            "Отвечай ТОЛЬКО на русском языке. "
+            "Не описывай свои рассуждения и планы, не используй фразы вроде "
+            "\"I need to\", \"I noticed\", \"I shouldn't\". "
+            "Сразу давай готовый, понятный студенту ответ.\n\n"
+        )
+
+        # Кратко показываем пользователю структуру ответа
+
+        header_lines = [
+            "Запрос большой, разобрал его на несколько частей и буду отвечать по очереди.\n",
+            "План:\n",
+        ]
+        for i, task in enumerate(tasks, start=1):
+            line = f"{i}. {task.title}"
+            if task.table_ref:
+                line += f" (таблица {task.table_ref})"
+            if task.figure_ref:
+                line += f" (рисунки/пункт {task.figure_ref})"
+            header_lines.append(line)
+
+        await _send(m, "\n".join(header_lines))
+
+        # 3. По очереди обрабатываем батчи подзадач
+        for batch in batches:
+            for task in batch:
+                # Для каждой подзадачи формируем под-вопрос, с которым уже
+                # умеет работать существующий respond_with_answer.
+                if task.type == TaskType.THEORY:
+                    # Теоретические вопросы — просто просим объяснить темы
+                    topics_text = ", ".join(task.topics) if task.topics else "запрошенные теоретические вопросы"
+                    sub_q = prefix + (
+                        "Объясни простым языком следующие темы по бухучёту и финансам: "
+                        f"{topics_text}. "
+                        "Сделай объяснение понятным для студента, можно опираться на общую теорию,"
+                        " а при необходимости связывать с данными диплома."
+                    )
+                    section_title = "Теоретическая часть"
+
+
+                elif task.type == TaskType.ENTERPRISE:
+                    sub_q = prefix + (
+                        "Кратко расскажи о предприятии, которое описано в дипломе: "
+                        "вид деятельности, основные характеристики и организационная структура. "
+                        "Опирайся на текст ВКР."
+                    )
+                    section_title = "О предприятии и оргструктуре"
+
+
+                elif task.type == TaskType.ENTERPRISE_FINANCE:
+                    sub_q = prefix + (
+                        "Проанализируй структуру активов и общее финансовое состояние предприятия "
+                        "по данным диплома. Отметь, как распределены активы, есть ли признаки "
+                        "устойчивости или проблем, прибыль/убыток, достаточно ли собственных средств."
+                    )
+                    section_title = "Финансовое состояние и структура активов"
+
+
+                elif task.type == TaskType.TABLE and task.table_ref:
+                    sub_q = prefix + (
+                        f"Проанализируй таблицу {task.table_ref} из диплома. "
+                        "Опиши показатели, динамику и темпы роста/снижения, сделай выводы "
+                        "о финансовом положении на основе этой таблицы."
+                    )
+                    section_title = f"Анализ таблицы {task.table_ref}"
+
+
+                elif task.type == TaskType.FIGURES and task.figure_ref:
+                    sub_q = prefix + (
+                        f"Проанализируй рисунки/графики, относящиеся к пункту/номеру {task.figure_ref} "
+                        "в дипломе. Кратко опиши, что на них показано, как меняются показатели "
+                        "и какие выводы можно сделать."
+                    )
+                    section_title = f"Анализ рисунков {task.figure_ref}"
+
+
+                elif task.type == TaskType.POSTINGS:
+                    sub_q = prefix + (
+                        "Объясни простым языком, какие типовые бухгалтерские проводки используются "
+                        "в контексте данного предприятия и диплома. Затем, используя данные диплома "
+                        "(особенно по запасам, оборотным активам, обесценению и текущим обязательствам), "
+                        "предложи примеры возможных проводок и поясни их смысл."
+                    )
+                    section_title = "Бухгалтерские проводки по дипломной работе"
+
+
+                else:
+                    # Запасной вариант: общий вопрос по ВКР
+                    sub_q = prefix + (
+                        "Ответь подробно на вопрос по дипломной работе на основе текста ВКР. "
+                        "Сделай структурированный и понятный для студента ответ."
+                    )
+                    section_title = task.title or "Общий ответ по ВКР"
+
+
+                # Небольшой заголовок перед блоком ответа
+                await _send(m, f"\n=== {section_title} ===")
+
+                # Запускаем уже существующую логику ответа,
+                # которая сама сделает RAG/vision/анализ и отправит текст.
+                await respond_with_answer(m, uid, doc_id, sub_q)
+
+        # на этом всё: пользователь получает несколько блоков подряд —
+        # один большой подробный ответ, но разобранный по разделам
+
     except Exception:
         logger.exception("QA worker failed (uid=%s, doc_id=%s)", uid, doc_id)
         try:
             await _send(
                 m,
-                "Во время подготовки ответа что-то пошло не так. Попробуй задать вопрос ещё раз."
+                "Что-то пошло не так при разборе вопроса. "
+                "Попробуй переформулировать запрос или задать один конкретный вопрос."
             )
         except Exception:
-            logger.exception("Failed to send fallback message from QA worker")
-
+            logger.exception("failed to send error message")
 
 
 # ------------------------------ эмбеддинг-профиль ------------------------------

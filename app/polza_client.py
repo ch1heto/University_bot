@@ -351,15 +351,17 @@ def chat_with_gpt(
         # 1) обычный текстовый ответ
         text = (msg.content or "").strip()
 
-        # 2) если content пустой (классический случай gpt-5), пробуем взять reasoning
+        # 2) если content пустой (некоторые модели кладут всё в reasoning),
+        #    используем reasoning только для БЭКА.
         if not text and hasattr(msg, "reasoning") and msg.reasoning:
-            # reasoning обычно строка; на всякий случай приводим к str
             try:
                 text = str(msg.reasoning).strip()
             except Exception:
                 text = (msg.content or "").strip()
 
         return text
+
+
     except Exception as e:
         logging.error("Ошибка при запросе к чат-модели: %s", e)
         return "Произошла ошибка при обработке запроса. Попробуйте позже."
@@ -455,32 +457,67 @@ def chat_with_gpt_stream(
                     continue
 
                 # Поддерживаем два формата:
-                # 1) {"delta":"..."} — упрощённый
+                # 1) {"delta": "..."} или {"delta": {"content": "..."}}
                 # 2) {"choices":[{"delta":{"content":"..."}}]} — openai-совместимый
-                delta = obj.get("delta")
-                if delta is None:
+                piece: str = ""
+
+                if "delta" in obj:
+                    d = obj["delta"]
+                    if isinstance(d, dict):
+                        # если это reasoning-чанк без content — просто пропускаем
+                        if d.get("reasoning") or d.get("reasoning_content") or d.get("thinking"):
+                            piece = ""
+                        else:
+                            piece = str(d.get("content") or "").strip()
+                    else:
+                        # упрощённый формат: считаем, что это уже кусок видимого ответа
+                        piece = str(d or "").strip()
+                else:
                     chs = obj.get("choices") or []
                     if chs:
-                        delta = (chs[0].get("delta") or {}).get("content")
+                        d = chs[0].get("delta") or {}
+                        if isinstance(d, dict):
+                            # тут как раз классический openai-формат:
+                            # delta = {"role": "...", "content": "..."} или {"reasoning": "..."}
+                            if d.get("reasoning") or d.get("reasoning_content") or d.get("thinking"):
+                                piece = ""
+                            else:
+                                piece = str(d.get("content") or "").strip()
 
-                if delta:
+                if piece:
                     yielded_any = True
-                    yield str(delta)
+                    yield piece
+
+
 
             # Если поток завершился, а в pending висит валидный JSON — доберём
             if pending:
                 try:
                     obj = json.loads(pending)
-                    delta = obj.get("delta")
-                    if delta is None:
+                    piece: str = ""
+
+                    if "delta" in obj:
+                        d = obj["delta"]
+                        if isinstance(d, dict):
+                            piece = str(d.get("content") or "").strip()
+                        else:
+                            piece = str(d or "").strip()
+                    else:
                         chs = obj.get("choices") or []
                         if chs:
-                            delta = (chs[0].get("delta") or {}).get("content")
-                    if delta:
+                            d = chs[0].get("delta") or {}
+                            if isinstance(d, dict):
+                                if d.get("reasoning") or d.get("reasoning_content") or d.get("thinking"):
+                                    piece = ""
+                                else:
+                                    piece = str(d.get("content") or "").strip()
+
+                    if piece:
                         yielded_any = True
-                        yield str(delta)
+                        yield piece
                 except Exception:
                     pass
+
 
         except Exception as e:
             logging.error("chat_with_gpt_stream: stream aborted: %s", e)
@@ -641,6 +678,8 @@ def _vision_messages(
                 text = (msg.content or "").strip()
 
         return text
+
+
     except Exception as e:
         logging.warning("vision JSON response_format failed, retrying without it: %s", e)
         try:

@@ -401,16 +401,19 @@ def retrieve(
     pack = _load_doc(owner_id, doc_id)
 
     # Специальные источники: таблицы/рисунки, если явно упомянуты в вопросе
+        # Специальные источники: таблицы/рисунки, если явно упомянуты в вопросе
     used_ids: set[int] = set()
     special: List[Dict[str, Any]] = _inject_special_sources_for_item(
         pack,
         query,
         used_ids,
         doc_id=doc_id,
-    )
+    ) or []  # <-- если функция вернула None, подставляем пустой список
+
     # for_item для одиночного вопроса нам не нужен
     for sp in special:
         sp["for_item"] = None
+
 
     rescored = _score_and_rank(
         pack,
@@ -1606,6 +1609,9 @@ def _inject_special_sources_for_item(pack: dict, ask: str, used_ids: set[int], *
                     break  # одного соседнего чанка достаточно
 
         return added
+
+    # Если ни таблиц, ни рисунков по вопросу не нашли — возвращаем пустой список
+    return added
 
 
 # =======================================================================
