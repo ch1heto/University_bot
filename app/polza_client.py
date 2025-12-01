@@ -347,18 +347,7 @@ def chat_with_gpt(
         )
 
         msg = cmpl.choices[0].message
-
-        # 1) обычный текстовый ответ
         text = (msg.content or "").strip()
-
-        # 2) если content пустой (некоторые модели кладут всё в reasoning),
-        #    используем reasoning только для БЭКА.
-        if not text and hasattr(msg, "reasoning") and msg.reasoning:
-            try:
-                text = str(msg.reasoning).strip()
-            except Exception:
-                text = (msg.content or "").strip()
-
         return text
 
 
@@ -669,15 +658,9 @@ def _vision_messages(
 
         cmpl = _client.chat.completions.create(**kwargs)
         msg = cmpl.choices[0].message
-
         text = (msg.content or "").strip()
-        if not text and hasattr(msg, "reasoning") and msg.reasoning:
-            try:
-                text = str(msg.reasoning).strip()
-            except Exception:
-                text = (msg.content or "").strip()
-
         return text
+
 
 
     except Exception as e:

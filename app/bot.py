@@ -6862,6 +6862,170 @@ async def _answer_with_model_extra_table(
 
     await _send(m, answer)
 
+def _is_structural_intro_question(q: str) -> bool:
+    """
+    Вопрос явно про структуру ВКР:
+    введение / главы / объект / предмет / цель / задачи / гипотеза / выводы.
+    Для таких запросов запускаем спец-режим fullread по всему тексту диплома.
+    """
+    if not q:
+        return False
+
+    text = q.lower()
+
+    # Ключевые триггеры по структуре работы
+    trigger_words = [
+        "введение",
+        "глава 1", "глава 2", "первая глава", "вторая глава",
+        "1 глава", "2 глава",
+        "объект исследования", "предмет исследования",
+        "объект и предмет",
+        "актуальность темы", "актуальность исследования",
+        "цель исследования", "цель работы",
+        "задачи исследования", "задачи работы",
+        "гипотеза исследования", "гипотеза работы",
+        "выводы по главе", "основные выводы по главе",
+    ]
+
+    return any(w in text for w in trigger_words)
+
+async def _answer_structural_fullread(
+    m: types.Message,
+    uid: int,
+    doc_id: int,
+    q_text: str,
+) -> bool:
+    """
+    Спец-режим для запросов вида:
+      - что во введении и в 1–2 главе написано;
+      - в чём актуальность темы, кто объект и предмет, цель и задачи, гипотеза, выводы по главам и т.п.
+
+    Читаем ПОЛНЫЙ текст ВКР и отвечаем строго по нему.
+    Возвращаем True, если ответ уже отправлен пользователю.
+    """
+    # 1) Забираем полный текст ВКР (есть уже готовый хелпер)
+    _limit = int(getattr(Cfg, "DIRECT_MAX_CHARS", 80000))
+    full_text = _full_document_text(uid, doc_id, limit_chars=_limit + 1)
+    full_len = len(full_text or "")
+
+    if not (full_text or "").strip():
+        # Вообще нет текста — смысла нет, пусть дальше отработает обычный пайплайн
+        return False
+
+    system_prompt = (
+        "Ты репетитор по ВКР. Тебе дан полный текст дипломной работы студента.\n"
+        "Отвечай ТОЛЬКО на русском языке, простым понятным студенту языком.\n"
+        "Опирайся строго на текст работы, не придумывай того, чего в тексте нет.\n"
+        "Если в работе нет явно выделенных введения или глав, используй те фрагменты, "
+        "которые по смыслу им соответствуют, и честно это укажи.\n"
+        "Если каких-то формулировок (например, гипотезы) нет — так и напиши.\n"
+        "Даже если в вопросе встречаются слова «вкратце», «коротко» и подобные, "
+        "обязательно пройди по всем запрошенным пунктам и дай по каждому законченные "
+        "формулировки без обрывков. Старайся, чтобы ответ был структурированным и логически полным."
+    )
+
+
+    # 2а) Документ целиком влезает в лимит — даём модели сразу весь текст
+    if full_len <= _limit:
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "assistant",
+                "content": "[Полный текст дипломной работы]\n" + full_text,
+            },
+            {
+                "role": "user",
+                "content": (
+                    "На основе полного текста работы вкратце ответь на вопрос:\n"
+                    f"{q_text}\n\n"
+                    "Сделай структурированный ответ (по возможности):\n"
+                    "- актуальность темы;\n"
+                    "- объект исследования;\n"
+                    "- предмет исследования;\n"
+                    "- цель работы;\n"
+                    "- задачи (списком);\n"
+                    "- формулировка гипотезы (если есть);\n"
+                    "- главные выводы по главе 1;\n"
+                    "- главные выводы по главе 2.\n"
+                    "Если каких-то пунктов нет в тексте — честно напиши, что они не выделены."
+                ),
+            },
+        ]
+
+        if STREAM_ENABLED and chat_with_gpt_stream is not None:
+            try:
+                stream = chat_with_gpt_stream(
+                    messages,
+                    temperature=0.2,
+                    max_tokens=FINAL_MAX_TOKENS,
+                )
+                await _stream_to_telegram(m, stream)
+                return True
+            except Exception as e:
+                logging.exception("structural fullread stream failed: %s", e)
+
+        try:
+            ans = chat_with_gpt(
+                messages,
+                temperature=0.2,
+                max_tokens=FINAL_MAX_TOKENS,
+            )
+        except Exception as e:
+            logging.exception("structural fullread non-stream failed: %s", e)
+            ans = ""
+
+        ans = (ans or "").strip()
+        if not ans:
+            ans = "Не удалось получить ответ по тексту работы. Попробуй задать вопрос ещё раз или чуть переформулировать."
+        await _send(m, _strip_unwanted_sections(ans))
+        return True
+
+    # 2б) Документ слишком длинный — используем уже существующий итеративный fullread
+    try:
+        # Можно слегка обогатить вопрос, чтобы итог тоже был структурным
+        iter_question = (
+            f"{q_text}\n\n"
+            "Сделай структурированный ответ: актуальность, объект, предмет, цель, задачи, "
+            "гипотеза (если есть), выводы по главам 1 и 2."
+        )
+        messages, err = _iterative_fullread_build_messages(uid, doc_id, iter_question)
+    except Exception as e:
+        logging.exception("structural iterative build failed: %s", e)
+        messages, err = None, "Ошибка при подготовке текста диплома."
+
+    if not messages:
+        # Не смогли собрать итеративный fullread — пусть дальше работает стандартный пайплайн
+        return False
+
+    if STREAM_ENABLED and chat_with_gpt_stream is not None:
+        try:
+            stream = chat_with_gpt_stream(
+                messages,
+                temperature=0.2,
+                max_tokens=FINAL_MAX_TOKENS,
+            )
+            await _stream_to_telegram(m, stream)
+            return True
+        except Exception as e:
+            logging.exception("structural iterative stream failed: %s", e)
+
+    try:
+        ans = chat_with_gpt(
+            messages,
+            temperature=0.2,
+            max_tokens=FINAL_MAX_TOKENS,
+        )
+    except Exception as e:
+        logging.exception("structural iterative non-stream failed: %s", e)
+        ans = ""
+
+    ans = (ans or "").strip()
+    if not ans:
+        ans = "Не удалось получить ответ по тексту работы. Попробуй уточнить вопрос."
+    await _send(m, _strip_unwanted_sections(ans))
+    return True
+
+
 async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: str):
     q_text = (q_text or "").strip()
     orig_q_text = q_text  # запомним исходную формулировку до подстановок
@@ -7083,6 +7247,71 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
     # --- Определяем интенты заранее
     intents = detect_intents(q_text)
 
+    # ✅ НОВОЕ: спец-режим для вопросов про введение/главы/объект/предмет/цель/задачи/гипотезу/выводы.
+    # Сначала пробуем ответить по ПОЛНОМУ тексту ВКР, а не по обрывкам RAG.
+    if _is_structural_intro_question(q_text):
+        handled = await _answer_structural_fullread(m, uid, doc_id, q_text)
+        if handled:
+            return
+
+
+    # 🚫 НЕ считаем вопрос "чисто теоретическим", если в нём явно просят разобрать
+    # введение/главы/разделы/объект-предмет ВКР — такие запросы должны идти через
+    # текст самой работы (FULLREAD/RAG), а не "общую теорию".
+    structural_re = re.compile(
+        r"\b(введение|глава|главе|главы|раздел|параграф|пункт|выводы по главе|объект|предмет|ВКР|диплом)\b",
+        re.IGNORECASE,
+    )
+    mentions_structure = bool(structural_re.search(q_text))
+
+    # ✅ Чисто теоретический вопрос (без ссылок на главы/таблицы/рисунки/структуру ВКР) —
+    # отвечаем просто как репетитор, вообще не трогая RAG.
+    if intents.get("general_question") and not (
+        intents["tables"]["want"]
+        or intents["figures"]["want"]
+        or intents["sources"]["want"]
+        or _SECTION_NUM_RE.search(q_text)
+        or mentions_structure           # ← добавили этот фильтр
+    ):
+        system_prompt = (
+            "Ты репетитор по ВКР. Отвечай ТОЛЬКО на русском языке, простым понятным студенту "
+            "языком. Можно опираться на общую теорию и учебники, но не выдумывай факты про "
+            "конкретную работу, если их нет в вопросе."
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": q_text},
+        ]
+
+        if STREAM_ENABLED and chat_with_gpt_stream is not None:
+            try:
+                stream = chat_with_gpt_stream(
+                    messages,
+                    temperature=0.2,
+                    max_tokens=FINAL_MAX_TOKENS,
+                )
+                await _stream_to_telegram(m, stream)
+                return
+            except Exception as e:
+                logging.exception("general theory stream failed: %s", e)
+
+        try:
+            ans = chat_with_gpt(
+                messages,
+                temperature=0.2,
+                max_tokens=FINAL_MAX_TOKENS,
+            )
+        except Exception as e:
+            logging.exception("general theory non-stream failed: %s", e)
+            ans = ""
+
+        ans = (ans or "").strip()
+        if not ans:
+            ans = "Не удалось получить ответ. Попробуй переформулировать вопрос."
+        await _send(m, ans)
+        return
+
+
     # Чистый запрос про конкретные рисунки (нет секций/таблиц/источников/общего вопроса)
     pure_figs = intents["figures"]["want"] and not (
         intents["tables"]["want"]
@@ -7091,6 +7320,7 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
         or intents.get("general_question")
         or _SECTION_NUM_RE.search(q_text)
     )
+
 
     # NEW: явная обработка «по пункту/разделу/главе X.Y» (но только для ЧИСТЫХ запросов)
     m_sec = _SECTION_NUM_RE.search(q_text)
@@ -7160,16 +7390,20 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
             return
 
     # ====== FULLREAD: auto ======
+        # ====== FULLREAD: auto ======
     fr_mode = getattr(Cfg, "FULLREAD_MODE", "off")
     # FULLREAD(auto) включаем только для общих вопросов по содержанию,
-    # чтобы не перебивать спец-логики по таблицам/рисункам/источникам.
+    # чтобы не перебивать спец-логики по таблицам/рисункам/источникам
+    # и по введению/главам (их обрабатываем отдельно).
     if (
         fr_mode == "auto"
         and intents.get("general_question")
         and not intents["tables"]["want"]
         and not intents["figures"]["want"]
         and not intents["sources"]["want"]
+        and not _is_structural_intro_question(q_text)   # 👈 добавили фильтр
     ):
+
         logger.info(
             "ANSWER: FULLREAD(auto) mode, uid=%s, doc_id=%s",
             uid,
@@ -7310,6 +7544,68 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
         doc_id,
         list(facts.keys()) if isinstance(facts, dict) else type(facts),
     )
+
+    # ✅ НОВОЕ: если по вопросу почти нет фактов из RAG, а речь явно про
+    # введение/главы/разделы, делаем прямое чтение всего документа,
+    # вместо «по имеющимся данным ответить нельзя».
+    try:
+        no_ctx = not isinstance(facts, dict) or (
+            not (facts.get("general_ctx") or facts.get("summary_text"))
+            and not (facts.get("coverage") or {}).get("items")
+        )
+
+        mentions_structure = bool(
+            re.search(r"\b(введение|глава|раздел|пункт)\b", q_text, re.IGNORECASE)
+        )
+
+        if no_ctx and mentions_structure:
+            # 👇 Вместо одного огромного текста — итеративный fullread по кусочкам
+            messages, err = _iterative_fullread_build_messages(uid, doc_id, q_text)
+
+            if messages:
+                if STREAM_ENABLED and chat_with_gpt_stream is not None:
+                    try:
+                        stream = chat_with_gpt_stream(
+                            messages,
+                            temperature=0.2,
+                            max_tokens=FINAL_MAX_TOKENS,
+                        )
+                        await _stream_to_telegram(m, stream)
+                        return
+                    except Exception as e:
+                        logging.exception("fallback iterative fullread stream failed: %s", e)
+
+                try:
+                    ans = chat_with_gpt(
+                        messages,
+                        temperature=0.2,
+                        max_tokens=FINAL_MAX_TOKENS,
+                    )
+                except Exception as e:
+                    logging.exception("fallback iterative fullread non-stream failed: %s", e)
+                    ans = ""
+
+                ans = (ans or "").strip()
+                if not ans:
+                    ans = (
+                        "Не удалось получить ответ по тексту работы даже после полного чтения. "
+                        "Попробуй сузить или переформулировать вопрос."
+                    )
+                await _send(m, _strip_unwanted_sections(ans))
+                return
+
+            elif err:
+                # не рвём пайплайн, просто логируем и даём шансу нижнему RAG-ответу
+                logging.warning(
+                    "fallback iterative fullread build failed (uid=%s, doc_id=%s): %s",
+                    uid,
+                    doc_id,
+                    err,
+                )
+                # без return — пойдём дальше по обычному RAG-пути
+
+    except Exception as e:
+        logging.exception("fallback fullread guard failed: %s", e)
 
     # 💡 НОВОЕ: если запрос — ЧИСТО про конкретные рисунки по номерам,
     # а карточки уже собраны в facts["figures"]["describe_cards"],
