@@ -172,7 +172,11 @@ def _ensure_columns(con: sqlite3.Connection) -> None:
     if "attrs" not in ccols:
         cur.execute("ALTER TABLE chunks ADD COLUMN attrs TEXT")
 
-    # document_sections: таблица создаётся в базовой схеме; дополнительных колонок пока нет.
+    # document_sections: добавим роль секции (intro/chapter_1/...)
+    scols = _table_info(con, "document_sections")
+    if "role" not in scols:
+        cur.execute("ALTER TABLE document_sections ADD COLUMN role TEXT")
+
     con.commit()
 
 
@@ -618,9 +622,11 @@ def upsert_document_sections(doc_id: int, sections: List[Dict[str, Any]]) -> int
         ord_no = 0
         for sec in sections or []:
             ord_no += 1
+            role = sec.get("role") or (sec.get("attrs") or {}).get("role")
+
             cur.execute(
-                "INSERT INTO document_sections(doc_id, ord, title, level, page, section_path, element_type, text, attrs) "
-                "VALUES(?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO document_sections(doc_id, ord, title, level, page, section_path, element_type, text, attrs, role) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (
                     doc_id,
                     ord_no,
@@ -631,8 +637,10 @@ def upsert_document_sections(doc_id: int, sections: List[Dict[str, Any]]) -> int
                     sec.get("element_type"),
                     sec.get("text"),
                     json.dumps(sec.get("attrs") or {}, ensure_ascii=False),
+                    role,
                 ),
             )
+
         cur.execute("COMMIT;")
         return ord_no
     except Exception:
@@ -642,35 +650,237 @@ def upsert_document_sections(doc_id: int, sections: List[Dict[str, Any]]) -> int
         con.close()
 
 
+def _table_has_columns(con: sqlite3.Connection, table: str, cols: List[str]) -> bool:
+    """
+    Локальная проверка наличия колонок (на случай, если у тебя нет общей helper-функции).
+    """
+    try:
+        cur = con.cursor()
+        cur.execute(f"PRAGMA table_info({table})")
+        existing = {row[1] for row in cur.fetchall()}  # row[1] = name
+        return all(c in existing for c in cols)
+    except Exception:
+        return False
+
+
 def get_document_sections(doc_id: int) -> List[Dict[str, Any]]:
-    """Возвращает сохранённый структурированный индекс секций документа (в порядке ord)."""
+    """
+    Возвращает "структурный список секций" документа на основе таблицы chunks.
+
+    Идея:
+      - у нас нет отдельной таблицы sections, поэтому строим "список секций"
+        как уникальные section_path в порядке появления в chunks (по id).
+      - attrs.role/chapter_num берём из attrs (если колонка есть).
+      - title/level мы тут честно не восстановим надёжно → возвращаем то, что есть:
+        section_path + attrs (+ page как min page).
+
+    Формат элемента:
+      {
+        "section_path": str,
+        "page": Optional[int],
+        "attrs": dict,
+        "first_chunk_id": int
+      }
+    """
     con = get_conn()
     cur = con.cursor()
+
+    has_attrs = _table_has_columns(con, "chunks", ["attrs"])
+    has_id = _table_has_columns(con, "chunks", ["id"])
+    has_page = _table_has_columns(con, "chunks", ["page"])
+    has_sp = _table_has_columns(con, "chunks", ["section_path"])
+
+    if not (has_id and has_sp):
+        con.close()
+        return []
+
+    # Забираем минимальный набор. ВАЖНО: сортировка по id, чтобы сохранить порядок документа.
+    if has_attrs and has_page:
+        cur.execute(
+            "SELECT id, section_path, page, attrs FROM chunks WHERE doc_id=? ORDER BY id ASC",
+            (doc_id,),
+        )
+    elif has_attrs:
+        cur.execute(
+            "SELECT id, section_path, NULL as page, attrs FROM chunks WHERE doc_id=? ORDER BY id ASC",
+            (doc_id,),
+        )
+    elif has_page:
+        cur.execute(
+            "SELECT id, section_path, page, NULL as attrs FROM chunks WHERE doc_id=? ORDER BY id ASC",
+            (doc_id,),
+        )
+    else:
+        cur.execute(
+            "SELECT id, section_path, NULL as page, NULL as attrs FROM chunks WHERE doc_id=? ORDER BY id ASC",
+            (doc_id,),
+        )
+
+    rows = cur.fetchall()
+    con.close()
+
+    # Группируем по section_path: берём самый первый id, min page, и первый attrs с role если найдём.
+    seen: Dict[str, Dict[str, Any]] = {}
+
+    for r in rows:
+        sp = (r["section_path"] if isinstance(r, dict) or hasattr(r, "__getitem__") else None)  # перестраховка
+        try:
+            sp = r["section_path"]
+        except Exception:
+            continue
+
+        sp = (sp or "").strip()
+        if not sp:
+            continue
+
+        try:
+            cid = int(r["id"])
+        except Exception:
+            continue
+
+        try:
+            page = r["page"]
+        except Exception:
+            page = None
+
+        # attrs может быть JSON-строкой
+        a: Dict[str, Any] = {}
+        if has_attrs:
+            raw = None
+            try:
+                raw = r["attrs"]
+            except Exception:
+                raw = None
+
+            if isinstance(raw, dict):
+                a = raw
+            elif isinstance(raw, str) and raw.strip():
+                try:
+                    a = json.loads(raw)
+                except Exception:
+                    a = {}
+
+        if sp not in seen:
+            seen[sp] = {
+                "section_path": sp,
+                "page": page,
+                "attrs": a or {},
+                "first_chunk_id": cid,
+            }
+        else:
+            # обновим min page
+            if page is not None:
+                cur_page = seen[sp].get("page")
+                if cur_page is None or (isinstance(cur_page, int) and page < cur_page):
+                    seen[sp]["page"] = page
+
+            # если раньше attrs были пустые/без role, а тут нашли role — подменим
+            if a:
+                old = seen[sp].get("attrs") or {}
+                if (not old) or (not old.get("role") and a.get("role")):
+                    seen[sp]["attrs"] = a
+
+    # сортируем по first_chunk_id (порядок появления)
+    out = list(seen.values())
+    out.sort(key=lambda x: int(x.get("first_chunk_id") or 0))
+    return out
+
+def get_document_sections(doc_id: int) -> List[Dict[str, Any]]:
+    """
+    Возвращает "структурный список секций" документа на основе таблицы chunks.
+
+    Важно:
+      - отдельной таблицы sections нет → строим список как уникальные section_path
+        в порядке появления по id.
+      - attrs.role/chapter_num берём из chunks.attrs (если колонка есть).
+      - page берём как минимальную page внутри section_path (если есть).
+
+    Формат элемента:
+      {
+        "section_path": str,
+        "page": Optional[int],
+        "attrs": dict,
+        "first_chunk_id": int
+      }
+    """
+    con = get_conn()
+    cur = con.cursor()
+
+    # проверим колонки через PRAGMA (надёжнее, чем гадать)
+    cur.execute("PRAGMA table_info(chunks)")
+    cols = {row[1] for row in cur.fetchall()}  # row[1] = name
+
+    if "id" not in cols or "section_path" not in cols:
+        con.close()
+        return []
+
+    has_attrs = "attrs" in cols
+    has_page = "page" in cols
+
+    select_cols = ["id", "section_path"]
+    if has_page:
+        select_cols.append("page")
+    else:
+        select_cols.append("NULL as page")
+    if has_attrs:
+        select_cols.append("attrs")
+    else:
+        select_cols.append("NULL as attrs")
+
     cur.execute(
-        "SELECT ord, title, level, page, section_path, element_type, text, attrs "
-        "FROM document_sections WHERE doc_id=? ORDER BY ord ASC",
+        f"SELECT {', '.join(select_cols)} FROM chunks WHERE doc_id=? ORDER BY id ASC",
         (doc_id,),
     )
     rows = cur.fetchall()
     con.close()
-    out: List[Dict[str, Any]] = []
-    for r in rows or []:
-        try:
-            attrs = json.loads(r["attrs"]) if r["attrs"] else {}
-        except Exception:
-            attrs = {}
-        out.append({
-            "title": r["title"],
-            "level": r["level"],
-            "page": r["page"],
-            "section_path": r["section_path"],
-            "element_type": r["element_type"],
-            "text": r["text"],
-            "attrs": attrs,
-            "ord": r["ord"],
-        })
-    return out
 
+    seen: Dict[str, Dict[str, Any]] = {}
+
+    for r in rows:
+        sp = (r["section_path"] or "").strip()
+        if not sp:
+            continue
+
+        try:
+            cid = int(r["id"])
+        except Exception:
+            continue
+
+        page = r["page"]
+        raw_attrs = r["attrs"]
+
+        attrs: Dict[str, Any] = {}
+        if isinstance(raw_attrs, dict):
+            attrs = raw_attrs
+        elif isinstance(raw_attrs, str) and raw_attrs.strip():
+            try:
+                attrs = json.loads(raw_attrs)
+            except Exception:
+                attrs = {}
+
+        if sp not in seen:
+            seen[sp] = {
+                "section_path": sp,
+                "page": page,
+                "attrs": attrs or {},
+                "first_chunk_id": cid,
+            }
+        else:
+            # min page
+            if page is not None:
+                cur_page = seen[sp].get("page")
+                if cur_page is None or (isinstance(cur_page, int) and page < cur_page):
+                    seen[sp]["page"] = page
+
+            # attrs: если раньше пусто/без role, а тут нашли role → обновим
+            if attrs:
+                old = seen[sp].get("attrs") or {}
+                if (not old) or (not old.get("role") and attrs.get("role")):
+                    seen[sp]["attrs"] = attrs
+
+    out = list(seen.values())
+    out.sort(key=lambda x: int(x.get("first_chunk_id") or 0))
+    return out
 
 def delete_document_sections(doc_id: int) -> int:
     """Удаляет все секции структурированного индекса документа. Возвращает число удалённых строк."""
@@ -1042,6 +1252,86 @@ def find_nearest_table_above(doc_id: int, chunk_id: int) -> Optional[Dict[str, A
         "attrs": attrs,
         "caption_num": caption_num,
     }
+
+def set_document_meta(doc_id: int, meta: Dict[str, Any]) -> None:
+    """
+    Сохраняет/обновляет «шапку» ВКР:
+    актуальность, объект, предмет, цель, задачи, гипотеза.
+    """
+    con = get_conn()
+    cur = con.cursor()
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS document_meta (
+            doc_id INTEGER PRIMARY KEY,
+            relevance TEXT,
+            object TEXT,
+            subject TEXT,
+            goal TEXT,
+            tasks_json TEXT,
+            hypothesis TEXT
+        )
+        """
+    )
+
+    tasks = meta.get("tasks") or []
+    tasks_json = json.dumps(tasks, ensure_ascii=False)
+
+    cur.execute(
+        """
+        INSERT INTO document_meta(doc_id, relevance, object, subject, goal, tasks_json, hypothesis)
+        VALUES(?,?,?,?,?,?,?)
+        ON CONFLICT(doc_id) DO UPDATE SET
+            relevance=excluded.relevance,
+            object=excluded.object,
+            subject=excluded.subject,
+            goal=excluded.goal,
+            tasks_json=excluded.tasks_json,
+            hypothesis=excluded.hypothesis
+        """,
+        (
+            doc_id,
+            meta.get("relevance"),
+            meta.get("object"),
+            meta.get("subject"),
+            meta.get("goal"),
+            tasks_json,
+            meta.get("hypothesis"),
+        ),
+    )
+    con.commit()
+    con.close()
+
+
+def get_document_meta(doc_id: int) -> Optional[Dict[str, Any]]:
+    con = get_conn()
+    cur = con.cursor()
+
+    cur.execute(
+        "SELECT relevance, object, subject, goal, tasks_json, hypothesis FROM document_meta WHERE doc_id = ?",
+        (doc_id,),
+    )
+    row = cur.fetchone()
+    con.close()
+    if not row:
+        return None
+
+    relevance, obj, subj, goal, tasks_json, hypothesis = row
+    try:
+        tasks = json.loads(tasks_json) if tasks_json else []
+    except Exception:
+        tasks = []
+
+    return {
+        "relevance": relevance,
+        "object": obj,
+        "subject": subj,
+        "goal": goal,
+        "tasks": tasks,
+        "hypothesis": hypothesis,
+    }
+
 
 # ----------------------------- public API: chunks -----------------------------
 

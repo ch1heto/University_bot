@@ -1,0 +1,694 @@
+# app/document_semantic_planner.py
+"""
+Высокоуровневый «семантический планировщик» вопросов по документу.
+
+Цель модуля — в одном месте решать, О ЧЁМ именно спрашивает пользователь
+и К КАКИМ кускам документа (главы / таблицы / рисунки) относится его вопрос.
+
+И дополнительно — давать высокоуровневый ответ для "репетиторских" запросов
+по введению и главам (актуальность, объект/предмет, цель, задачи, гипотеза, выводы),
+если удалось собрать нормальный контекст.
+"""
+
+from __future__ import annotations
+from .db import get_document_meta
+import re
+import logging
+from dataclasses import dataclass, field
+from typing import List, Optional, Literal
+from .db import get_document_sections
+
+logger = logging.getLogger(__name__)
+
+# ------------------------------------
+# Импортируем готовые хелперы из intents (если они есть)
+# ------------------------------------
+try:  # штатный путь
+    from .intents import (  # type: ignore
+        extract_table_numbers,
+        extract_figure_numbers,
+        extract_section_hints,
+    )
+except Exception:  # фолбэк: простые парсеры внутри этого модуля
+    logger.exception("document_semantic_planner: fallback to local parsers")
+
+    TABLE_NUM_RE = re.compile(
+        r"(?i)\b(таблица|табл\.|table)\s*([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)"
+    )
+    FIG_NUM_RE = re.compile(
+        r"(?i)\b(рисунок|рис\.|figure|fig\.)\s*([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)"
+    )
+    SECTION_HINT_RE = re.compile(
+        r"(?i)\b(глава|раздел|пункт|подраздел|§|section|chapter|clause)\s*([A-Za-zА-Яа-я]?\s*\d+(?:[.,]\d+)*)"
+    )
+
+    def _normalize_num(val: str) -> str:
+        # убираем пробелы и запятые → точки, нормализуем буква+цифры
+        s = (val or "").replace(" ", "").replace(",", ".")
+        s = re.sub(r"([A-Za-zА-Яа-я])[.-]?(?=\d)", r"\1", s)
+        return s.strip()
+
+    def extract_table_numbers(text: str) -> List[str]:  # type: ignore
+        out: List[str] = []
+        for m in TABLE_NUM_RE.findall(text or ""):
+            num = _normalize_num(m[1] or "")
+            if num:
+                out.append(num)
+        # уникализируем, сохраняя порядок
+        seen = set()
+        uniq: List[str] = []
+        for v in out:
+            if v not in seen:
+                seen.add(v)
+                uniq.append(v)
+        return uniq
+
+    def extract_figure_numbers(text: str) -> List[str]:  # type: ignore
+        out: List[str] = []
+        for m in FIG_NUM_RE.findall(text or ""):
+            num = _normalize_num(m[1] or "")
+            if num:
+                out.append(num)
+        seen = set()
+        uniq: List[str] = []
+        for v in out:
+            if v not in seen:
+                seen.add(v)
+                uniq.append(v)
+        return uniq
+
+    def extract_section_hints(text: str) -> List[str]:  # type: ignore
+        out: List[str] = []
+        for m in SECTION_HINT_RE.findall(text or ""):
+            num = _normalize_num(m[1] or "")
+            if num:
+                out.append(num)
+        seen = set()
+        uniq: List[str] = []
+        for v in out:
+            if v not in seen:
+                seen.add(v)
+                uniq.append(v)
+        return uniq
+
+
+# ------------------------------------
+# Базовые структуры данных
+# ------------------------------------
+
+SemanticMode = Literal[
+    "generic",          # обычный вопрос «как есть»
+    "tutor_overview",   # объяснение как репетитор / конспект по главам
+    "compare_objects",  # сравнение таблиц / рисунков / разделов
+]
+
+
+@dataclass
+class DocumentObjectRef:
+    """
+    Ссылка на объект документа, к которому относится вопрос:
+      - раздел/глава (SECTION)
+      - таблица (TABLE)
+      - рисунок (FIGURE)
+    """
+    kind: Literal["section", "table", "figure"]
+    key: str                     # '1', '2.3', 'A1', 'intro' и т.п.
+    label: str                   # человекочитаемое: 'глава 2', 'таблица 2.3', 'введение'
+    source_span: Optional[str] = None  # фрагмент вопроса, из которого это извлекли
+
+
+@dataclass
+class SemanticSlots:
+    """
+    Набор «смысловых слотов» — о чём именно просит пользователь.
+    Слоты подобраны под типичные ВКР/курсовые.
+    """
+    relevance: bool = False     # актуальность темы
+    obj: bool = False           # объект исследования
+    subj: bool = False          # предмет исследования
+    goal: bool = False          # цель исследования
+    tasks: bool = False         # задачи исследования
+    hypothesis: bool = False    # гипотеза
+    chapter_conclusions: bool = False  # выводы по главам / разделам
+
+    def any_slot_requested(self) -> bool:
+        return any(
+            [
+                self.relevance,
+                self.obj,
+                self.subj,
+                self.goal,
+                self.tasks,
+                self.hypothesis,
+                self.chapter_conclusions,
+            ]
+        )
+
+
+@dataclass
+class SemanticPlan:
+    """
+    Итоговый «план понимания» вопроса:
+      - какой это режим (mode),
+      - к каким объектам документа относится,
+      - какие смысловые слоты нужно заполнить.
+    """
+    mode: SemanticMode = "generic"
+    objects: List[DocumentObjectRef] = field(default_factory=list)
+    slots: SemanticSlots = field(default_factory=SemanticSlots)
+    original_question: str = ""
+    normalized_question: str = ""  # можно использовать для переформулировки
+
+
+# ------------------------------------
+# Детект режимов и слотов
+# ------------------------------------
+
+_TUTOR_RE = re.compile(
+    r"(?i)\b(как\s+репетитор|как\s+препод(ователь)?|объясни\s+простым\s+языком|"
+    r"объясни\s+как\s+для\s+студента|объясни\s+по\s+простому)\b"
+)
+
+_COMPARE_RE = re.compile(
+    r"(?i)\b(сравн(и|ить)|сопостав(ь|ить)|отличи(я|е)|различи(я|е))\b"
+)
+
+_INTRO_RE = re.compile(r"(?i)\bвведен(ие|ии|ия)?\b")
+
+
+def _detect_mode(text: str) -> SemanticMode:
+    t = (text or "").strip()
+    if not t:
+        return "generic"
+    if _TUTOR_RE.search(t):
+        return "tutor_overview"
+    if _COMPARE_RE.search(t):
+        return "compare_objects"
+    return "generic"
+
+
+def _detect_slots(text: str) -> SemanticSlots:
+    """
+    Простейший rule-based детектор смысловых слотов.
+    Не завязан на конкретный документ, работает по ключевым словам.
+    """
+    t = (text or "").lower()
+
+    slots = SemanticSlots()
+
+    # актуальность
+    if re.search(r"актуал(ьн|изир)", t):
+        slots.relevance = True
+
+    # объект / предмет
+    if (
+        re.search(r"объект(ом|а)?\s+исследован", t)
+        or "кто объект" in t
+        or "объект работы" in t
+        or "объект и предмет" in t
+    ):
+        slots.obj = True
+
+    if (
+        re.search(r"предмет(ом|а)?\s+исследован", t)
+        or "что является предмет" in t
+        or "предмет работы" in t
+        or "объект и предмет" in t
+    ):
+        slots.subj = True
+
+    # цель / задачи
+    if (
+        re.search(r"цель(ю)?\s+исследован", t)
+        or "цель работы" in t
+        or "как сформулирована цель" in t
+        or "как сформулированы цель" in t
+        or "цель и задачи" in t
+    ):
+        slots.goal = True
+
+    if (
+        re.search(r"задач(и|ами)\s+исследован", t)
+        or "какие задачи" in t
+        or "как сформулированы задачи" in t
+        or "цель и задачи" in t
+    ):
+        slots.tasks = True
+
+    # гипотеза
+    if "гипотез" in t or "какая гипотеза" in t:
+        slots.hypothesis = True
+
+    # выводы по главам / разделам
+    if re.search(r"вывод(ы)?\s+по\s+(глав|раздел|параграф|част)", t) or "главные выводы" in t:
+        slots.chapter_conclusions = True
+
+    # мягкий фолбэк для репетиторского режима: если явно не просили слоты,
+    # но есть «как репетитор» и упоминание введения/глав — считаем, что нужны
+    # как минимум цель/задачи/выводы.
+    if _TUTOR_RE.search(t) and (" глава" in t or "главе" in t or _INTRO_RE.search(t)):
+        if not slots.goal and not slots.tasks and not slots.chapter_conclusions:
+            slots.goal = True
+            slots.tasks = True
+            slots.chapter_conclusions = True
+
+    return slots
+
+
+# ------------------------------------
+# Извлечение ссылок на объекты документа
+# ------------------------------------
+def _extract_section_objects(text: str) -> List[DocumentObjectRef]:
+    out: List[DocumentObjectRef] = []
+
+    txt = text or ""
+    seen_keys = set()
+
+    # 0) "в главах 1 и 2" / "в главах 1–3"
+    multi_re1 = re.compile(r"(?i)(?:\bв\s+)?главах?\s+(\d+)\s*(?:[-–]\s*(\d+)|и\s+(\d+))")
+
+    # 0b) "в 1 и 2 главе" / "в 1–3 главе"
+    multi_re2 = re.compile(r"(?i)\bв\s+(\d+)\s*(?:[-–]\s*(\d+)|и\s+(\d+))\s+глав")
+
+    for rgx in (multi_re1, multi_re2):
+        for m in rgx.finditer(txt):
+            first = m.group(1)
+            second = m.group(2) or m.group(3)
+
+            nums: List[str] = []
+            if first:
+                nums.append(first.strip())
+            if second:
+                try:
+                    a = int(first)
+                    b = int(second)
+                    if b >= a:
+                        nums.extend(str(x) for x in range(a + 1, b + 1))
+                    else:
+                        nums.append(second.strip())
+                except Exception:
+                    nums.append(second.strip())
+
+            for n in nums:
+                key = n.strip()
+                if not key or key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                out.append(DocumentObjectRef(kind="section", key=key, label=f"глава {key}"))
+
+    # 1) Явные подсказки вида «глава 1», «раздел 2.3», «пункт 1.2»
+    hints: List[str] = []
+    try:
+        hints = extract_section_hints(txt) or []  # type: ignore[arg-type]
+    except Exception:
+        logger.exception("document_semantic_planner: extract_section_hints failed")
+        hints = []
+
+    for h in hints:
+        key = h.strip()
+        if not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        out.append(
+            DocumentObjectRef(
+                kind="section",
+                key=key,
+                label=f"раздел/глава {key}",
+            )
+        )
+
+    # 2) Введение — отдельный флаг, часто без номера
+    if _INTRO_RE.search(txt):
+        if "intro" not in seen_keys:
+            out.insert(
+                0,
+                DocumentObjectRef(
+                    kind="section",
+                    key="intro",
+                    label="введение",
+                ),
+            )
+            seen_keys.add("intro")
+
+    return out
+
+
+def _extract_table_objects(text: str) -> List[DocumentObjectRef]:
+    out: List[DocumentObjectRef] = []
+    try:
+        nums = extract_table_numbers(text) or []  # type: ignore[arg-type]
+    except Exception:
+        logger.exception("document_semantic_planner: extract_table_numbers failed")
+        nums = []
+
+    seen = set()
+    for n in nums:
+        key = (n or "").strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            DocumentObjectRef(
+                kind="table",
+                key=key,
+                label=f"таблица {key}",
+            )
+        )
+    return out
+
+
+def _extract_figure_objects(text: str) -> List[DocumentObjectRef]:
+    out: List[DocumentObjectRef] = []
+    try:
+        nums = extract_figure_numbers(text) or []  # type: ignore[arg-type]
+    except Exception:
+        logger.exception("document_semantic_planner: extract_figure_numbers failed")
+        nums = []
+
+    seen = set()
+    for n in nums:
+        key = (n or "").strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            DocumentObjectRef(
+                kind="figure",
+                key=key,
+                label=f"рисунок {key}",
+            )
+        )
+    return out
+
+
+def extract_document_objects(text: str) -> List[DocumentObjectRef]:
+    """
+    Универсальный хелпер: по тексту вопроса извлекает ссылки на разделы/главы,
+    таблицы и рисунки в формате единых DocumentObjectRef.
+
+    Порядок важен:
+      - сначала введение/главы (общая структура),
+      - затем таблицы,
+      - затем рисунки.
+    """
+    sections = _extract_section_objects(text)
+    tables = _extract_table_objects(text)
+    figures = _extract_figure_objects(text)
+
+    objects: List[DocumentObjectRef] = []
+    objects.extend(sections)
+    objects.extend(tables)
+    objects.extend(figures)
+
+    return objects
+
+
+# ------------------------------------
+# Публичное API модуля — план
+# ------------------------------------
+
+def build_semantic_plan(question: str) -> SemanticPlan:
+    q = (question or "").strip()
+
+    plan = SemanticPlan(
+        mode=_detect_mode(q),
+        objects=extract_document_objects(q),
+        slots=_detect_slots(q),
+        original_question=q,
+        normalized_question=q,
+    )
+
+    # Если спрашивают учебные слоты, но разделы не распознаны — добавляем введение.
+    if plan.slots.any_slot_requested() and not any(o.kind == "section" for o in plan.objects):
+        plan.objects.insert(
+            0,
+            DocumentObjectRef(kind="section", key="intro", label="введение"),
+        )
+
+    q_lower = q.lower()
+
+    want_ch1 = any(p in q_lower for p in ("1 глава", "первая глава", "глава 1"))
+    want_ch2 = any(p in q_lower for p in ("2 глава", "вторая глава", "глава 2"))
+
+    # Если попросили "выводы по главам" — по умолчанию глава 1 + глава 2
+    if plan.slots.chapter_conclusions:
+        want_ch1, want_ch2 = True, True
+
+    def _ensure_section_object(key: str, label: str) -> None:
+        if not any(o.kind == "section" and o.key == key for o in plan.objects):
+            plan.objects.append(DocumentObjectRef(kind="section", key=key, label=label))
+
+    # ✅ ВАЖНО: это ДОЛЖНО быть снаружи функции, а не внутри неё
+    if want_ch1:
+        _ensure_section_object("1", "глава 1")
+    if want_ch2:
+        _ensure_section_object("2", "глава 2")
+
+
+    logger.info(
+        "semantic_plan: mode=%s, objects=%d, slots=%s",
+        plan.mode,
+        len(plan.objects),
+        {
+            "relevance": plan.slots.relevance,
+            "obj": plan.slots.obj,
+            "subj": plan.slots.subj,
+            "goal": plan.slots.goal,
+            "tasks": plan.slots.tasks,
+            "hypothesis": plan.slots.hypothesis,
+            "chapter_conclusions": plan.slots.chapter_conclusions,
+        },
+    )
+
+    return plan
+
+
+# ------------------------------------
+# Высокоуровневый ответчик по плану
+# ------------------------------------
+
+from .retrieval import (
+    get_section_context_for_hints,
+    get_table_context_for_numbers,
+    get_figure_context_for_numbers,
+)
+
+try:
+    # та же функция, что используется в bot.py для обычных ответов
+    from .polza_client import chat_with_gpt  # type: ignore
+except Exception:
+    chat_with_gpt = None  # type: ignore
+
+
+def _slots_to_instruction(slots: SemanticSlots) -> str:
+    parts: list[str] = []
+
+    if slots.relevance:
+        parts.append("в чём актуальность темы")
+    if slots.obj:
+        parts.append("кто или что является объектом исследования")
+    if slots.subj:
+        parts.append("что является предметом исследования")
+    if slots.goal:
+        parts.append("как сформулирована цель исследования")
+    if slots.tasks:
+        parts.append("какие задачи исследования выделены")
+    if slots.hypothesis:
+        parts.append("какая выдвинута гипотеза")
+    if slots.chapter_conclusions:
+        parts.append("какие основные выводы по указанным главам/разделам")
+
+    if not parts:
+        return ""
+
+    return "Кратко раскрой " + "; ".join(parts) + "."
+
+
+def _collect_section_hints(plan: SemanticPlan) -> list[str]:
+    return [o.key for o in plan.objects if o.kind == "section"]
+
+
+def _collect_table_nums(plan: SemanticPlan) -> list[str]:
+    return [o.key for o in plan.objects if o.kind == "table"]
+
+
+def _collect_figure_nums(plan: SemanticPlan) -> list[str]:
+    return [o.key for o in plan.objects if o.kind == "figure"]
+
+
+async def answer_semantic_query(
+    uid: int,
+    doc_id: int,
+    q_text: str,
+    plan: SemanticPlan,
+) -> Optional[str]:
+    """
+    Репетиторский структурный ответ:
+    - НЕ один общий RAG,
+      а 3 отдельных вызова GPT по зонам: intro, chapter_1, chapter_2
+    """
+
+    has_slots = plan.slots.any_slot_requested()
+    has_sections = any(o.kind == "section" for o in plan.objects)
+
+    if not (has_sections and (plan.mode == "tutor_overview" or has_slots)):
+        return None
+
+    if chat_with_gpt is None:
+        logger.warning("answer_semantic_query: chat_with_gpt is not available")
+        return None
+
+    # берём "почти весь" текст нужных зон из БД
+    try:
+        from .retrieval import get_area_text  # новая функция в retrieval.py
+    except Exception:
+        logger.exception("answer_semantic_query: cannot import get_area_text")
+        return None
+
+    intro_text = get_area_text(uid, doc_id, role="intro", max_chars=14000)
+    ch1_text = get_area_text(uid, doc_id, role="chapter_1", max_chars=14000)
+    ch2_text = get_area_text(uid, doc_id, role="chapter_2", max_chars=14000)
+
+    # если ролей нет / не доехали → отдаём старому пайплайну
+    if not any([intro_text, ch1_text, ch2_text]):
+        logger.info("answer_semantic_query: no texts found even with fallback; fallback to legacy pipeline")
+        return None
+
+    system_prompt = (
+        "Ты репетитор по дипломным работам (ВКР). "
+        "Отвечай ТОЛЬКО по данному тексту. "
+        "Если пункта нет явно — пиши: «в тексте ВКР не сформулировано явно»."
+    )
+
+    # 1) Введение: паспорт
+    intro_answer = ""
+    if intro_text:
+        intro_user = (
+            f"Вопрос студента:\n{q_text}\n\n"
+            "Составь ТОЛЬКО блок 'Введение' по тексту введения.\n"
+            "Нужно:\n"
+            "- Актуальность\n- Объект\n- Предмет\n- Цель\n- Задачи\n- Гипотеза\n\n"
+            "Верни строго в формате:\n"
+            "## Введение\n"
+            "**Актуальность:** ...\n"
+            "**Объект:** ...\n"
+            "**Предмет:** ...\n"
+            "**Цель:** ...\n"
+            "**Задачи:** ...\n"
+            "**Гипотеза:** ...\n"
+        )
+        try:
+            intro_answer = chat_with_gpt(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "assistant", "content": "[Текст введения]\n" + intro_text},
+                    {"role": "user", "content": intro_user},
+                ],
+                temperature=0.2,
+                max_tokens=900,
+            ).strip()
+        except Exception:
+            logger.exception("answer_semantic_query: intro gpt call failed")
+            intro_answer = ""
+
+    # 2) Глава 1: идеи + выводы
+    ch1_answer = ""
+    if ch1_text:
+        ch1_user = (
+            f"Вопрос студента:\n{q_text}\n\n"
+            "Составь ТОЛЬКО блок 'Глава 1' по тексту главы 1.\n"
+            "Нужно:\n"
+            "- Главные идеи (3–7 буллетов)\n- Выводы по главе (если есть в тексте)\n\n"
+            "Верни строго в формате:\n"
+            "## Глава 1\n"
+            "**Главные идеи:** ...\n"
+            "**Выводы по главе:** ...\n"
+        )
+        try:
+            ch1_answer = chat_with_gpt(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "assistant", "content": "[Текст главы 1]\n" + ch1_text},
+                    {"role": "user", "content": ch1_user},
+                ],
+                temperature=0.2,
+                max_tokens=900,
+            ).strip()
+        except Exception:
+            logger.exception("answer_semantic_query: chapter1 gpt call failed")
+            ch1_answer = ""
+
+    # 3) Глава 2: идеи + выводы
+    ch2_answer = ""
+    if ch2_text:
+        ch2_user = (
+            f"Вопрос студента:\n{q_text}\n\n"
+            "Составь ТОЛЬКО блок 'Глава 2' по тексту главы 2.\n"
+            "Нужно:\n"
+            "- Главные идеи (3–7 буллетов)\n- Выводы по главе (если есть в тексте)\n\n"
+            "Верни строго в формате:\n"
+            "## Глава 2\n"
+            "**Главные идеи:** ...\n"
+            "**Выводы по главе:** ...\n"
+        )
+        try:
+            ch2_answer = chat_with_gpt(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "assistant", "content": "[Текст главы 2]\n" + ch2_text},
+                    {"role": "user", "content": ch2_user},
+                ],
+                temperature=0.2,
+                max_tokens=900,
+            ).strip()
+        except Exception:
+            logger.exception("answer_semantic_query: chapter2 gpt call failed")
+            ch2_answer = ""
+
+    # 4) Склейка
+    parts = [p for p in [intro_answer, ch1_answer, ch2_answer] if (p or "").strip()]
+    if not parts:
+        return None
+
+    final = "\n\n".join(parts).strip()
+
+    # ✅ если семантика не дала нормальный текст — откатываемся
+    if len(final) < 400:
+        logger.info("answer_semantic_query: final too short -> fallback legacy (len=%s)", len(final))
+        return None
+    
+    # 5) self-heal (один дозаказ)
+    must_have = ["## Введение", "## Глава 1", "## Глава 2"]
+    if any(k not in final for k in must_have):
+        try:
+            heal_user = (
+                "Ты не дописал структуру. "
+                "Дополни ТОЛЬКО отсутствующие блоки (## Введение / ## Глава 1 / ## Глава 2) "
+                "и внутри них отсутствующие поля. Не повторяй то, что уже есть.\n\n"
+                "Вот текущий ответ:\n" + final
+            )
+
+            heal_ctx = ""
+            if intro_text:
+                heal_ctx += "[Текст введения]\n" + intro_text + "\n\n"
+            if ch1_text:
+                heal_ctx += "[Текст главы 1]\n" + ch1_text + "\n\n"
+            if ch2_text:
+                heal_ctx += "[Текст главы 2]\n" + ch2_text + "\n\n"
+
+            extra = chat_with_gpt(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "assistant", "content": heal_ctx.strip()[:20000]},
+                    {"role": "user", "content": heal_user},
+                ],
+                temperature=0.2,
+                max_tokens=900,
+            ).strip()
+
+            if extra:
+                final = final.rstrip() + "\n\n" + extra
+        except Exception:
+            logger.exception("answer_semantic_query: self-heal failed")
+
+    return final

@@ -3,10 +3,9 @@ import re
 import json
 import numpy as np
 from typing import Optional, List, Dict, Tuple, Any
-
 from .db import get_conn, get_figures_for_doc
 from .polza_client import embeddings, vision_describe  # эмбеддинги + vision
-
+import logging
 # Опциональные хелперы по номерам таблиц/рисунков и «все значения»
 try:
     from .intents import extract_table_numbers, extract_figure_numbers, TABLE_ALL_VALUES_RE  # type: ignore
@@ -18,6 +17,7 @@ except Exception:
         r"|(?:\ball\b.*\b(table|values|rows|columns)\b|\bfull\s+(table|values)\b|\bentire\s+table\b)"
     )
 
+logger = logging.getLogger(__name__)
 # Кэш векторов на процесс: (owner_id, doc_id) -> {"mat": np.ndarray [N,D], "meta": list[dict]}
 _DOC_CACHE: dict[tuple[int, int], dict] = {}
 
@@ -47,20 +47,23 @@ def _load_doc(owner_id: int, doc_id: int) -> dict:
     con = get_conn()
     cur = con.cursor()
 
-    # Пытаемся взять расширенные поля (element_type, attrs), если они есть
     has_ext = _table_has_columns(con, "chunks", ["element_type", "attrs"])
+
     if has_ext:
         cur.execute(
             "SELECT id, page, section_path, text, element_type, attrs, embedding "
-            "FROM chunks WHERE owner_id=? AND doc_id=?",
+            "FROM chunks WHERE owner_id=? AND doc_id=? "
+            "ORDER BY id ASC",
             (owner_id, doc_id),
         )
     else:
         cur.execute(
             "SELECT id, page, section_path, text, embedding "
-            "FROM chunks WHERE owner_id=? AND doc_id=?",
+            "FROM chunks WHERE owner_id=? AND doc_id=? "
+            "ORDER BY id ASC",
             (owner_id, doc_id),
         )
+
     rows = cur.fetchall()
     con.close()
 
@@ -69,6 +72,25 @@ def _load_doc(owner_id: int, doc_id: int) -> dict:
         _DOC_CACHE[key] = pack
         return pack
 
+    def _parse_attrs(x):
+        # attrs может быть: None | dict | str(json) | bytes
+        if x is None:
+            return {}
+        if isinstance(x, dict):
+            return x
+        if isinstance(x, (bytes, bytearray)):
+            try:
+                x = x.decode("utf-8", errors="ignore")
+            except Exception:
+                return {}
+        if isinstance(x, str) and x.strip():
+            try:
+                v = json.loads(x)
+                return v if isinstance(v, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
     meta: List[Dict[str, Any]] = []
     vecs: List[np.ndarray] = []
     dim: Optional[int] = None
@@ -76,11 +98,10 @@ def _load_doc(owner_id: int, doc_id: int) -> dict:
     for r in rows:
         emb = r["embedding"]
         if emb is None:
-            # Пропускаем пустые эмбеддинги
             continue
 
         v = np.frombuffer(emb, dtype=np.float32)
-        # Защита от старых/битых эмбеддингов с другим размером
+
         if dim is None:
             dim = v.size
         elif v.size != dim:
@@ -88,11 +109,7 @@ def _load_doc(owner_id: int, doc_id: int) -> dict:
 
         if has_ext:
             et = (r["element_type"] or "").lower()
-            attrs_raw = r["attrs"]
-            try:
-                attrs = json.loads(attrs_raw) if attrs_raw else {}
-            except Exception:
-                attrs = {}
+            attrs = _parse_attrs(r["attrs"])
         else:
             et = ""
             attrs = {}
@@ -101,22 +118,20 @@ def _load_doc(owner_id: int, doc_id: int) -> dict:
             {
                 "id": r["id"],
                 "page": r["page"],
-                "section_path": r["section_path"],
-                "text": r["text"],
+                "section_path": r["section_path"] or "",
+                "text": r["text"] or "",
                 "element_type": et,
                 "attrs": attrs,
             }
         )
         vecs.append(v)
 
-
     if not vecs:
         pack = {"mat": np.zeros((0, 1), np.float32), "meta": []}
         _DOC_CACHE[key] = pack
         return pack
 
-    # Сшиваем и нормируем L2
-    mat = np.vstack(vecs).astype(np.float32, copy=False)  # [N, D]
+    mat = np.vstack(vecs).astype(np.float32, copy=False)
     norms = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-9
     mat = (mat / norms).astype(np.float32, copy=False)
 
@@ -386,21 +401,61 @@ def retrieve(
     *,
     section_prefix: Optional[str] = None,
     element_types: Optional[List[str]] = None,
+    role: Optional[str] = None,   # ✅ NEW
 ) -> List[Dict]:
     """
     Возвращает top-k чанков по косинусному сходству с вопросом (с лёгким переранжированием).
-    Можно ограничивать областью (section_prefix) и/или типами чанков (element_types).
+    Можно ограничивать областью (section_prefix) и/или типами чанков (element_types),
+    а также ролью секции (attrs.role), если роли проставлены на этапе ingest/index.
+
     Каждый элемент: {id, page, section_path, text, score}.
 
     NEW:
       - перед обычным семантическим поиском пробуем подтянуть «специальные» источники
-        для явных ссылок вида «Таблица 2.2», «все значения таблицы 3.1», «Рисунок 6» —
-        через _inject_special_sources_for_item();
-      - все источники (спец + обычные + синтетические по рисункам) дедуплицируем по id.
+        (таблицы/рисунки) через _inject_special_sources_for_item();
+      - дедуплицируем по id (int/str) безопасно.
     """
 
-    # 🔧 Авто-увеличение top_k для длинных и многочастных запросов,
-    # чтобы модель видела больше контекста при сложных вопросах.
+    def _norm_id(x: Any) -> Optional[Any]:
+        """Нормализуем id для used_ids: int если похоже на число, иначе оставляем как есть."""
+        if x is None:
+            return None
+        # если это уже int — отлично
+        if isinstance(x, int):
+            return x
+        # если строка/число-подобное — пробуем int
+        try:
+            s = str(x).strip()
+            if s == "":
+                return None
+            return int(s)
+        except Exception:
+            # строка тоже hashable
+            return x
+
+    def _attrs_as_dict(m: Dict[str, Any]) -> Dict[str, Any]:
+        """attrs могут быть dict или JSON-строкой; приводим к dict."""
+        a = m.get("attrs")
+        if isinstance(a, dict):
+            return a
+        if isinstance(a, str) and a.strip():
+            try:
+                return json.loads(a)
+            except Exception:
+                return {}
+        return {}
+
+    def _role_ok(meta_or_item: Dict[str, Any]) -> bool:
+        """Проверка role, если role задан."""
+        if not role:
+            return True
+        a = _attrs_as_dict(meta_or_item)
+        # если attrs пустой — считаем, что роль проверить нельзя → НЕ берём при role-фильтре
+        if not a:
+            return False
+        return (a.get("role") or "") == role
+
+    # 🔧 Авто-увеличение top_k для длинных/составных запросов
     q_norm = (query or "").strip()
     if q_norm:
         long_query = len(q_norm) > 200
@@ -408,28 +463,26 @@ def retrieve(
         multi_questions = q_norm.count("?") > 1
 
         if long_query or many_parts or multi_questions:
-            # Сложный / составной запрос — поднимаем верхнюю границу
             top_k = max(top_k, 12)
         elif len(q_norm) > 100:
-            # Умеренно длинный запрос — немного расширяем выборку
             top_k = max(top_k, 10)
 
     pack = _load_doc(owner_id, doc_id)
 
-    # Специальные источники: таблицы/рисунки, если явно упомянуты в вопросе
-    used_ids: set[int] = set()
+    used_ids: set[Any] = set()
+
+    # 1) Спец-источники (таблицы/рисунки…), если явно упомянуты
     special: List[Dict[str, Any]] = _inject_special_sources_for_item(
         pack,
         query,
-        used_ids,
+        used_ids,     # ✅ даём общий used_ids
         doc_id=doc_id,
-    ) or []  # <-- если функция вернула None, подставляем пустой список
+    ) or []
 
-    # for_item для одиночного вопроса нам не нужен
     for sp in special:
         sp["for_item"] = None
 
-
+    # 2) Семантическое ранжирование
     rescored = _score_and_rank(
         pack,
         query,
@@ -438,57 +491,89 @@ def retrieve(
         element_types=element_types,
     )
 
-    # Если ни семантики, ни спец-источников не нашли — выходим
     if not rescored and not special:
         return []
 
-    # Фильтр источников если их явно не просили
+    # 3) Пред-фильтрация результата семантики (источники/роль)
     sig = _query_signals(query)
     filtered: List[Tuple[int, float]] = []
+
     for i, sc in rescored:
-        if len(filtered) >= top_k:
+        if len(filtered) >= top_k * 3:
             break
-        if (not sig["ask_sources"]) and _chunk_type(pack["meta"][i]) == "reference":
+
+        mi = pack["meta"][int(i)]
+
+        # скрываем references, если их не просили
+        if (not sig["ask_sources"]) and _chunk_type(mi) == "reference":
             continue
-        filtered.append((i, sc))
-    best = (filtered or rescored)[:top_k]
+
+        # фильтр по роли
+        if role and not _role_ok(mi):
+            continue
+
+        filtered.append((int(i), float(sc)))
+
+    best = (filtered or [(int(i), float(sc)) for i, sc in rescored])[: max(top_k, 1)]
 
     out: List[Dict] = []
 
-    # 1) сначала добавляем спец-фрагменты (таблицы/рисунки, «все значения таблицы» и т.п.)
+    # 4) Сначала добавляем special (с роль-фильтром при необходимости)
     for sp in special:
-        if sp["id"] in used_ids:
+        if role and not _role_ok(sp):
             continue
+
+        sp_id_norm = _norm_id(sp.get("id"))
+        if sp_id_norm is not None and sp_id_norm in used_ids:
+            continue
+
         out.append(sp)
-        used_ids.add(sp["id"])
+        if sp_id_norm is not None:
+            used_ids.add(sp_id_norm)
 
-    # 2) если вопрос ссылается на «Рисунок N» — добавляем синтетические сниппеты с анализом рисунков
-    fig_snips = _figure_context_snippets_for_query(doc_id, query, max_items=2)
-    for fs in fig_snips:
-        fid = int(fs.get("id", 0))
-        if fid in used_ids:
-            continue
-        out.append(fs)
-        used_ids.add(fid)
+        if len(out) >= top_k:
+            return out
 
-    # 3) затем добираем обычные чанки до top_k
+    # 5) Синтетика по рисункам — НЕ добавляем при role-фильтре (иначе ломает “строго введение”)
+    if not role:
+        fig_snips = _figure_context_snippets_for_query(doc_id, query, max_items=2)
+        for fs in fig_snips:
+            fid_norm = _norm_id(fs.get("id"))
+            if fid_norm is not None and fid_norm in used_ids:
+                continue
+            out.append(fs)
+            if fid_norm is not None:
+                used_ids.add(fid_norm)
+            if len(out) >= top_k:
+                return out
+
+    # 6) Затем добираем обычные чанки
     for i, sc in best:
         if len(out) >= top_k:
             break
+
         m = pack["meta"][int(i)]
-        mid = m["id"]
-        if mid in used_ids:
+        mid_norm = _norm_id(m.get("id"))
+        if mid_norm is not None and mid_norm in used_ids:
             continue
+
+        # на всякий случай ещё раз роль
+        if role and not _role_ok(m):
+            continue
+
         out.append(
             {
-                "id": mid,
-                "page": m["page"],
-                "section_path": m["section_path"],
-                "text": (m["text"] or "").strip(),
+                "id": m.get("id"),
+                "page": m.get("page"),
+                "section_path": m.get("section_path"),
+                "text": (m.get("text") or "").strip(),
                 "score": float(sc),
+                # attrs не возвращаем наружу — но если тебе нужно для дебага, можно добавить:
+                # "attrs": _attrs_as_dict(m),
             }
         )
-        used_ids.add(mid)
+        if mid_norm is not None:
+            used_ids.add(mid_norm)
 
     return out
 
@@ -734,27 +819,229 @@ def invalidate_cache(owner_id: int, doc_id: int):
     """Сбрасывает кэш матрицы для документа (вызывать после переиндексации)."""
     _DOC_CACHE.pop((owner_id, doc_id), None)
 
+def find_intro_passport(
+    owner_id: int,
+    doc_id: int,
+    *,
+    intro_prefix: Optional[str] = None,
+) -> Dict[str, str]:
+    """
+    Достаёт "паспорт исследования" из введения:
+    актуальность, объект, предмет, цель, задачи, гипотеза.
+
+    Стратегия:
+      1) regex (keyword_find) строго по введению (section_prefix/role=intro)
+      2) fallback семантика retrieve(..., role=intro)
+    """
+    from .retrieval import keyword_find, retrieve  # если это в том же файле — убери и используй напрямую
+
+    fields: List[Tuple[str, str, str]] = [
+        ("relevance", "Актуальность темы:", r"(актуальност[ьи]\s+тем[ыы])"),
+        ("obj", "Объект исследования:", r"(объект\s+исследован[ияе])"),
+        ("subj", "Предмет исследования:", r"(предмет\s+исследован[ияе])"),
+        ("goal", "Цель исследования:", r"(цель\s+исследован[ияе])"),
+        ("tasks", "Задачи исследования:", r"(задач[аи]\s+исследован[ияе])"),
+        ("hypothesis", "Гипотеза исследования:", r"(гипотез[аы]\s+исследован[ияе])"),
+    ]
+
+    out: Dict[str, str] = {}
+
+    def _join_snips(hits: List[Dict[str, Any]]) -> str:
+        return " ".join((h.get("snippet") or "").strip() for h in hits if (h.get("snippet") or "").strip()).strip()
+
+    for key, prefix, rgx in fields:
+        hits = keyword_find(
+            owner_id,
+            doc_id,
+            rgx,
+            max_hits=3 if key in {"tasks"} else 2,
+            section_prefix=intro_prefix,
+            role="intro",
+        ) or []
+        if hits:
+            txt = _join_snips(hits)
+            if txt:
+                out[key] = txt
+                continue
+
+        # fallback семантика (только intro)
+        q = prefix.replace(":", "")
+        sem = retrieve(
+            owner_id,
+            doc_id,
+            q,
+            top_k=4 if key in {"tasks"} else 3,
+            section_prefix=intro_prefix,
+            role="intro",
+        ) or []
+        for h in sem:
+            t = (h.get("text") or "").strip()
+            if t:
+                out[key] = t
+                break
+
+    return out
+
+
+def get_chapter_conclusions(
+    owner_id: int,
+    doc_id: int,
+    chapter_num: int,
+    *,
+    top_k: int = 4,
+) -> List[Dict[str, Any]]:
+    """
+    Достаёт выводы/итоги по главе.
+    Стратегия:
+      1) keyword_find по маркерам "выводы/итоги/резюме"
+      2) fallback: последние top_k чанков role=chapter_N (через retrieve по нейтральному запросу)
+    """
+    from .retrieval import keyword_find, retrieve  # если в том же файле — убери
+
+    role = f"chapter_{int(chapter_num)}"
+    hits: List[Dict[str, Any]] = []
+
+    for pat in [
+        r"(вывод[ыа]\s+по\s+главе|вывод[ыа]\s+по\s+\d+\s+главе)",
+        r"(итог[иов]\s+по\s+главе|итог[иов]\s+по\s+\d+\s+главе)",
+        r"(резюме\s+по\s+главе|заключение\s+по\s+главе)",
+        r"\bвывод[ыа]\b",
+        r"\bитог[иов]\b",
+    ]:
+        hits.extend(keyword_find(owner_id, doc_id, pat, max_hits=2, role=role) or [])
+        if len(hits) >= 2:
+            break
+
+    if hits:
+        # приводим к формату snippets (text)
+        out = []
+        for h in hits[: max(1, top_k)]:
+            sn = (h.get("snippet") or "").strip()
+            if sn:
+                out.append({"id": None, "text": sn, "score": 1.0})
+        return out
+
+    # fallback: добираем “хвост” главы семантикой
+    # (запрос нейтральный, но role фильтрует только главу)
+    sem = retrieve(
+        owner_id,
+        doc_id,
+        f"выводы по главе {chapter_num}",
+        top_k=max(4, top_k),
+        role=role,
+    ) or []
+
+    # хотим именно “хвост”: берём последние элементы списка (обычно retrieve даёт релевантное,
+    # но если в главе нет явных "выводов", это хотя бы последние фрагменты).
+    sem_tail = sem[-top_k:] if len(sem) > top_k else sem
+    out = []
+    for h in sem_tail:
+        t = (h.get("text") or "").strip()
+        if t:
+            out.append({"id": h.get("id"), "text": t, "score": h.get("score", 0.0)})
+    return out
+
+
+def get_chapter_body(
+    owner_id: int,
+    doc_id: int,
+    chapter_num: int,
+    *,
+    top_k: int = 6,
+) -> List[Dict[str, Any]]:
+    """
+    Достаёт “середину” главы (главные идеи).
+    Стратегия:
+      - берём побольше чанков role=chapter_N,
+      - затем режем "середину": отбрасываем первые ~20% и последние ~20%,
+        чтобы не цеплять заголовки и выводы.
+    """
+    from .retrieval import retrieve  # если в том же файле — убери
+
+    role = f"chapter_{int(chapter_num)}"
+    sem = retrieve(
+        owner_id,
+        doc_id,
+        f"основное содержание главы {chapter_num}",
+        top_k=max(12, top_k * 2),
+        role=role,
+    ) or []
+
+    if not sem:
+        return []
+
+    # берём “середину” списка
+    n = len(sem)
+    lo = int(n * 0.2)
+    hi = int(n * 0.8)
+    mid = sem[lo:hi] if hi > lo else sem
+
+    # ужмём до top_k
+    mid = mid[:top_k]
+
+    out = []
+    for h in mid:
+        t = (h.get("text") or "").strip()
+        if t:
+            out.append({"id": h.get("id"), "text": t, "score": h.get("score", 0.0)})
+    return out
+
 # ---------------------------
 # Keyword-fallback (опционально)
 # ---------------------------
 
-def keyword_find(owner_id: int, doc_id: int, pattern: str, max_hits: int = 3) -> List[Dict]:
-    """
-    Ищем прямые вхождения паттерна regex в текстах чанков.
-    Возвращаем: [{page, section_path, snippet}]
-    """
+def keyword_find(
+    owner_id: int,
+    doc_id: int,
+    pattern: str,
+    max_hits: int = 3,
+    *,
+    section_prefix: Optional[str] = None,
+    role: Optional[str] = None,   # ✅ NEW
+) -> List[Dict]:
     rgx = re.compile(pattern, re.IGNORECASE)
     con = get_conn()
     cur = con.cursor()
-    cur.execute(
-        "SELECT page, section_path, text FROM chunks WHERE owner_id=? AND doc_id=?",
-        (owner_id, doc_id),
-    )
+
+    # берём attrs тоже, чтобы фильтровать по role (если есть)
+    if section_prefix:
+        cur.execute(
+            "SELECT page, section_path, text, attrs FROM chunks "
+            "WHERE owner_id=? AND doc_id=? AND section_path LIKE ?",
+            (owner_id, doc_id, f"{section_prefix}%"),
+        )
+    else:
+        cur.execute(
+            "SELECT page, section_path, text, attrs FROM chunks "
+            "WHERE owner_id=? AND doc_id=?",
+            (owner_id, doc_id),
+        )
+
     rows = cur.fetchall()
     con.close()
 
     hits: List[Dict] = []
     for r in rows:
+        # ✅ фильтр по роли (если просили)
+        if role:
+            raw_attrs = None
+            try:
+                raw_attrs = r["attrs"]  # sqlite3.Row
+            except Exception:
+                raw_attrs = None
+
+            a = {}
+            if isinstance(raw_attrs, dict):
+                a = raw_attrs
+            elif isinstance(raw_attrs, str) and raw_attrs.strip():
+                try:
+                    a = json.loads(raw_attrs)
+                except Exception:
+                    a = {}
+
+            if (a.get("role") or "") != role:
+                continue
+
         t = (r["text"] or "")
         m = rgx.search(t)
         if m:
@@ -770,6 +1057,414 @@ def keyword_find(owner_id: int, doc_id: int, pattern: str, max_hits: int = 3) ->
             if len(hits) >= max_hits:
                 break
     return hits
+
+def get_area_text(
+    owner_id: int,
+    doc_id: int,
+    *,
+    role: str,
+    max_chars: int = 14000,
+    head_ratio: float = 0.55,
+) -> str:
+    """
+    Возвращает текст зоны по attrs.role (intro/chapter_1/...).
+    + Fallback: если role-текста мало/нет, берём диапазон чанков между заголовками
+      (ВВЕДЕНИЕ->ГЛАВА 1, ГЛАВА 1->ГЛАВА 2, ГЛАВА 2->ЗАКЛЮЧЕНИЕ/СПИСОК ЛИТЕРАТУРЫ).
+    """
+
+    r = (role or "").strip()
+    if not r:
+        return ""
+
+    # ограничим head_ratio
+    try:
+        head_ratio = float(head_ratio)
+    except Exception:
+        head_ratio = 0.55
+    head_ratio = max(0.1, min(head_ratio, 0.9))
+
+    con = get_conn()
+    cur = con.cursor()
+
+    # колонки
+    try:
+        cur.execute("PRAGMA table_info(chunks)")
+        cols = {row[1] for row in cur.fetchall()}
+    except Exception:
+        cols = set()
+
+    if "text" not in cols or "id" not in cols:
+        con.close()
+        return ""
+
+    has_attrs = "attrs" in cols
+    has_element_type = "element_type" in cols
+
+    # -----------------------------
+    # 1) Основной путь: по attrs.role
+    # -----------------------------
+    rows = []
+    if has_attrs:
+        like1 = f'%"role":"{r}"%'
+        like2 = f'%"role": "{r}"%'
+
+        if has_element_type:
+            cur.execute(
+                """
+                SELECT id, text
+                FROM chunks
+                WHERE owner_id=? AND doc_id=?
+                  AND (attrs LIKE ? OR attrs LIKE ?)
+                  AND (element_type IS NULL OR element_type NOT IN ('reference','table_row','ocr','chart'))
+                ORDER BY id ASC
+                """,
+                (owner_id, doc_id, like1, like2),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT id, text
+                FROM chunks
+                WHERE owner_id=? AND doc_id=?
+                  AND (attrs LIKE ? OR attrs LIKE ?)
+                ORDER BY id ASC
+                """,
+                (owner_id, doc_id, like1, like2),
+            )
+
+        rows = cur.fetchall()
+
+    def _rows_to_text(rows_) -> str:
+        if not rows_:
+            return ""
+
+        all_txt: list[str] = []
+        prev = None
+
+        for row in rows_:
+            # sqlite3.Row обычно даёт доступ по ключу
+            try:
+                txt = row["text"]
+            except Exception:
+                try:
+                    txt = row[1]
+                except Exception:
+                    txt = ""
+
+            txt = (txt or "").strip()
+            if not txt:
+                continue
+            if prev == txt:
+                continue
+            all_txt.append(txt)
+            prev = txt
+
+        if not all_txt:
+            return ""
+
+        total_full = sum(len(t) for t in all_txt) + 2 * (len(all_txt) - 1)
+        if total_full <= max_chars:
+            return "\n\n".join(all_txt).strip()
+
+        head_budget = int(max_chars * head_ratio)
+        tail_budget = max_chars - head_budget
+
+        head_parts: list[str] = []
+        head_total = 0
+        for t in all_txt:
+            need = len(t) + (2 if head_parts else 0)
+            if head_total + need > head_budget:
+                remain = head_budget - head_total
+                if remain > 200:
+                    head_parts.append(t[:remain].rstrip())
+                break
+            head_parts.append(t)
+            head_total += need
+
+        tail_parts: list[str] = []
+        tail_total = 0
+        for t in reversed(all_txt):
+            need = len(t) + (2 if tail_parts else 0)
+            if tail_total + need > tail_budget:
+                remain = tail_budget - tail_total
+                if remain > 200:
+                    tail_parts.append(t[-remain:].lstrip())
+                break
+            tail_parts.append(t)
+            tail_total += need
+        tail_parts.reverse()
+
+        head_text = "\n\n".join(head_parts).strip()
+        tail_text = "\n\n".join(tail_parts).strip()
+
+        if not tail_text:
+            return head_text
+
+        return (head_text + "\n\n---\n\n[...конец раздела...]\n\n" + tail_text).strip()
+
+    text_by_role = _rows_to_text(rows)
+    logger.info("get_area_text role=%s: by_role_len=%s", r, len(text_by_role))
+
+    # 1) Для глав — как раньше: достаточно по длине → возвращаем
+    if r != "intro" and len(text_by_role) >= 1800:
+        con.close()
+        return text_by_role
+
+    # 2) Для введения: длина сама по себе не гарантия.
+    #    Если нет "паспорта" (объект/предмет/цель/задачи/гипотеза) → идём в fallback.
+    if r == "intro":
+        low = (text_by_role or "").lower()
+        passport_markers = [
+            "объект исследования",
+            "предмет исследования",
+            "цель исследования",
+            "задач",      # ловит "задачи исследования"
+            "гипотез",    # ловит "гипотеза/гипотезы"
+        ]
+        hits = sum(m in low for m in passport_markers)
+
+        # если введение похоже на настоящее (есть хотя бы 2 маркера) — возвращаем
+        if len(text_by_role) >= 1200 and hits >= 2:
+            con.close()
+            return text_by_role
+        # иначе НЕ закрываем con и НЕ возвращаем — пойдём в fallback ниже
+
+    # -----------------------------
+    # 2) Fallback: диапазон по маркерам (между заголовками)
+    # -----------------------------
+    role_markers = {
+        "intro": (
+            ["ВВЕДЕНИЕ"],
+            ["ГЛАВА 1", "ГЛАВА I"],
+        ),
+        "chapter_1": (
+            ["ГЛАВА 1", "ГЛАВА I"],
+            ["ГЛАВА 2", "ГЛАВА II"],
+        ),
+        "chapter_2": (
+            ["ГЛАВА 2", "ГЛАВА II"],
+            ["ЗАКЛЮЧЕНИЕ", "ВЫВОДЫ", "СПИСОК ЛИТЕРАТУРЫ", "БИБЛИОГРАФ"],
+        ),
+    }
+
+    if r not in role_markers:
+        con.close()
+        return text_by_role  # что нашли по роли (пусть и мало)
+
+    start_markers, end_markers = role_markers[r]
+
+    def _find_heading_id_first(markers: list[str], after_id: int | None = None) -> int | None:
+        # Ищем ТОЛЬКО заголовки: "[Заголовок] ..."
+        where_after = ""
+        params = [owner_id, doc_id]
+        if after_id is not None:
+            where_after = " AND id > ?"
+            params.append(after_id)
+
+        likes = []
+        for m in markers:
+            m = (m or "").strip()
+            if not m:
+                continue
+            likes.append("UPPER(text) LIKE ?")
+            params.append(f"%{m.upper()}%")
+
+        if not likes:
+            return None
+
+        sql = f"""
+        SELECT id
+        FROM chunks
+        WHERE owner_id=? AND doc_id=? {where_after}
+        AND text LIKE '[Заголовок]%'
+        AND LENGTH(text) < 200
+        AND text NOT LIKE '%...%'
+        AND text NOT LIKE '%..%'
+        AND text NOT LIKE '%стр.%'
+        AND text NOT LIKE '%page%'
+        AND ({' OR '.join(likes)})
+        ORDER BY id ASC
+        LIMIT 1
+        """
+        cur.execute(sql, tuple(params))
+        row = cur.fetchone()
+        if not row:
+            return None
+        try:
+            return int(row["id"])
+        except Exception:
+            return int(row[0])
+
+    def _find_heading_id_last_before(markers: list[str], before_id: int) -> int | None:
+        # Последний заголовок из markers ДО before_id
+        params = [owner_id, doc_id, before_id]
+
+        likes = []
+        for m in markers:
+            m = (m or "").strip()
+            if not m:
+                continue
+            likes.append("UPPER(text) LIKE ?")
+            params.append(f"%{m.upper()}%")
+
+        if not likes:
+            return None
+
+        sql = f"""
+        SELECT id
+        FROM chunks
+        WHERE owner_id=? AND doc_id=?
+        AND id < ?
+        AND text LIKE '[Заголовок]%'
+        AND LENGTH(text) < 200
+        AND text NOT LIKE '%...%'
+        AND text NOT LIKE '%..%'
+        AND text NOT LIKE '%стр.%'
+        AND text NOT LIKE '%page%'
+        AND ({' OR '.join(likes)})
+        ORDER BY id DESC
+        LIMIT 1
+        """
+        cur.execute(sql, tuple(params))
+        row = cur.fetchone()
+        if not row:
+            return None
+        try:
+            return int(row["id"])
+        except Exception:
+            return int(row[0])
+
+
+    # Вычисляем диапазон по заголовкам (а не по любым совпадениям в тексте)
+
+    if r == "intro":
+        # 1) найдём первую "ГЛАВА 1" как заголовок
+        end_id = _find_heading_id_first(["ГЛАВА 1", "ГЛАВА I"], after_id=None)
+        if end_id is None:
+            con.close()
+            return text_by_role
+
+        # 2) возьмём ПОСЛЕДНИЙ "ВВЕДЕНИЕ" как заголовок перед главой 1
+        # 0) попробуем найти СОДЕРЖАНИЕ / ОГЛАВЛЕНИЕ
+        toc_id = _find_heading_id_first(
+            ["СОДЕРЖАНИЕ", "ОГЛАВЛЕНИЕ"],
+            after_id=None,
+        )
+
+        # 1) ищем ПЕРВОЕ реальное "ВВЕДЕНИЕ" ПОСЛЕ содержания
+        start_id = _find_heading_id_first(
+            ["ВВЕДЕНИЕ"],
+            after_id=toc_id if toc_id is not None else None,
+        )
+
+        if start_id is None:
+            con.close()
+            return text_by_role
+
+
+    elif r == "chapter_1":
+        start_id = _find_heading_id_first(["ГЛАВА 1", "ГЛАВА I"], after_id=None)
+        if start_id is None:
+            con.close()
+            return text_by_role
+
+        end_id = _find_heading_id_first(["ГЛАВА 2", "ГЛАВА II"], after_id=start_id)
+        if end_id is None:
+            end_id = start_id + 10_000_000
+
+    elif r == "chapter_2":
+        start_id = _find_heading_id_first(["ГЛАВА 2", "ГЛАВА II"], after_id=None)
+        if start_id is None:
+            con.close()
+            return text_by_role
+
+        end_id = _find_heading_id_first(
+            ["ЗАКЛЮЧЕНИЕ", "ВЫВОДЫ", "СПИСОК ЛИТЕРАТУРЫ", "БИБЛИОГРАФ"],
+            after_id=start_id,
+        )
+        if end_id is None:
+            end_id = start_id + 10_000_000
+        
+        logger.info("get_area_text fallback role=%s: start_id=%s end_id=%s", r, start_id, end_id)
+
+    else:
+        con.close()
+        return text_by_role
+
+
+    # Вытащим тексты в диапазоне
+    if has_element_type:
+        cur.execute(
+            """
+            SELECT id, text
+            FROM chunks
+            WHERE owner_id=? AND doc_id=?
+              AND id >= ? AND id < ?
+              AND (element_type IS NULL OR element_type NOT IN ('reference','table_row','ocr','chart'))
+            ORDER BY id ASC
+            """,
+            (owner_id, doc_id, start_id, end_id),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT id, text
+            FROM chunks
+            WHERE owner_id=? AND doc_id=?
+              AND id >= ? AND id < ?
+            ORDER BY id ASC
+            """,
+            (owner_id, doc_id, start_id, end_id),
+        )
+
+    range_rows = cur.fetchall()
+    con.close()
+
+    text_by_range = _rows_to_text(range_rows)
+
+    head_preview = " ".join(text_by_range[:180].splitlines())
+    logger.info("get_area_text fallback role=%s: range_len=%s head=%s", r, len(text_by_range), head_preview)
+
+    if r == "intro":
+        low_role = (text_by_role or "").lower()
+        low_range = (text_by_range or "").lower()
+
+        markers = [
+            "объект исследования",
+            "предмет исследования",
+            "цель исследования",
+            "задач",
+            "гипотез",
+        ]
+
+        hits_role = sum(m in low_role for m in markers)
+        hits_range = sum(m in low_range for m in markers)
+
+        # выбираем текст с БОЛЬШИМ числом паспортных маркеров
+        if hits_range > hits_role and len(text_by_range) >= 800:
+            return text_by_range
+
+        if hits_role >= hits_range and len(text_by_role) >= 800:
+            return text_by_role
+
+        # если оба плохие — всё равно вернём range (он обычно шире)
+        return text_by_range or text_by_role
+
+    if r == "intro":
+        low_role = (text_by_role or "").lower()
+        low_range = (text_by_range or "").lower()
+
+        markers = ["объект", "предмет", "цель", "задач", "гипотез"]
+        hits_role = sum(m in low_role for m in markers)
+        hits_range = sum(m in low_range for m in markers)
+
+        if hits_range >= hits_role and len(text_by_range) >= 800:
+            return text_by_range
+
+    # для остальных — как было
+    if len(text_by_range) > len(text_by_role):
+        return text_by_range
+    return text_by_role
 
 # =======================================================================
 #                НОВОЕ: «РИСУНКИ» — СЧЁТЧИК, СПИСОК, КАРТОЧКИ
@@ -1769,40 +2464,92 @@ def get_section_context_for_hints(
     per_section_k: int = 3,
 ) -> List[Dict[str, Any]]:
     """
-    Возвращает контекст по подсказкам разделов/глав:
-      section_hints = ['1', '2.3', ...] — как из extract_section_hints().
-
-    Для каждого hint берём несколько чанков, у которых section_path
-    начинается с этой «головы» (например, '1', '1.1', '1.2', ...).
+    NEW:
+      - если в чанках есть attrs.role, используем его (intro/chapter_1/...)
+      - для глав берём не только начало, но и конец (голова+хвост),
+        чтобы попадали "выводы", "итоги" и т.п.
     """
     if not section_hints:
         return []
 
     pack = _load_doc(owner_id, doc_id)
+    meta = pack.get("meta") or []
+
     snippets: List[Dict[str, Any]] = []
     used_ids: set[int] = set()
+
+    def _get_role(m: Dict[str, Any]) -> str:
+        a = m.get("attrs")
+        if isinstance(a, dict):
+            return str(a.get("role") or "").strip()
+        if isinstance(a, str) and a.strip():
+            try:
+                a2 = json.loads(a)
+                if isinstance(a2, dict):
+                    return str(a2.get("role") or "").strip()
+            except Exception:
+                return ""
+        return ""
 
     for h in section_hints:
         head = str(h or "").strip()
         if not head:
             continue
 
-        # Простая фильтрация по префиксу section_path
+        head_lower = head.lower()
+
+        # ожидаемая роль по hint
+        expected_role: Optional[str] = None
+        if head_lower in {"intro", "введение", "vvedenie"}:
+            expected_role = "intro"
+        else:
+            # если hint это "1" / "2" / "3" → chapter_1 / chapter_2 ...
+            if head.isdigit():
+                expected_role = f"chapter_{head}"
+
         candidates: List[Tuple[int, Dict[str, Any]]] = []
-        for m in pack["meta"]:
+
+        for m in meta:
             sp = str(m.get("section_path") or "")
-            # section_path в формате "1", "1/1.1", "[заголовок] 1.1" и т.п. —
-            # используем грубую проверку по вхождению головы
             if not sp:
                 continue
-            if not (sp.startswith(head) or f"/{head}" in sp or f" {head}" in sp):
-                continue
+            sp_lower = sp.lower()
+
+            role = _get_role(m)
+
+            # 1) если роль доступна — фильтруем по роли (самый надёжный путь)
+            if expected_role:
+                if role != expected_role:
+                    # fallback для старых документов без role:
+                    if expected_role == "intro":
+                        if "введен" not in sp_lower:
+                            continue
+                    else:
+                        if not (
+                            sp.startswith(head)
+                            or f"/{head}" in sp
+                            or f" {head}" in sp
+                        ):
+                            continue
+            else:
+                # 2) старый путь: по section_path
+                if head_lower in {"intro", "введение", "vvedenie"}:
+                    if "введен" not in sp_lower:
+                        continue
+                else:
+                    if not (
+                        sp.startswith(head)
+                        or f"/{head}" in sp
+                        or f" {head}" in sp
+                    ):
+                        continue
+
             candidates.append(
                 (
                     int(m["id"]),
                     {
                         "id": m["id"],
-                        "page": m["page"],
+                        "page": m.get("page"),
                         "section_path": sp,
                         "text": (m.get("text") or "").strip(),
                         "score": 0.9,
@@ -1810,20 +2557,32 @@ def get_section_context_for_hints(
                 )
             )
 
-        # берём первые per_section_k по порядку появления id
+        if not candidates:
+            continue
+
         candidates.sort(key=lambda t: t[0])
-        taken = 0
-        for cid, item in candidates:
-            if taken >= per_section_k:
-                break
+
+        # ✅ ключевая часть: для глав берём начало + конец
+        # чтобы гарантированно попадали "выводы/итоги" (они почти всегда в хвосте).
+        want_tail = bool(expected_role and expected_role.startswith("chapter_"))
+        k = max(int(per_section_k or 3), 1)
+
+        if not want_tail or len(candidates) <= k:
+            picked = candidates[:k]
+        else:
+            head_k = max(1, (k + 1) // 2)   # например k=3 → 2 из головы
+            tail_k = k - head_k            # и 1 из хвоста
+            picked = candidates[:head_k] + candidates[-tail_k:] if tail_k > 0 else candidates[:head_k]
+
+        for cid, item in picked:
             if cid in used_ids:
+                continue
+            if not item.get("text"):
                 continue
             snippets.append(item)
             used_ids.add(cid)
-            taken += 1
 
     return snippets
-
 
 # =======================================================================
 #        НОВОЕ: Coverage-aware извлечение под многопунктные вопросы

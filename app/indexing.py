@@ -2,6 +2,7 @@
 import re
 import json
 import hashlib
+import logging
 import numpy as np
 from typing import List, Dict, Any, Iterable, Optional
 from decimal import Decimal
@@ -10,6 +11,7 @@ from .db import get_conn
 from .polza_client import embeddings
 from .chunking import split_into_chunks
 from .config import Cfg
+from .db import set_document_meta
 
 # мягкие зависимости для OCR
 try:
@@ -31,6 +33,7 @@ except Exception:
     OCR_MIN_CHARS = 12
     OCR_MAX_IMAGES = 6
 
+logger = logging.getLogger(__name__)
 
 # ---------- helpers ----------
 
@@ -445,8 +448,24 @@ def _yield_chunks_for_section(
             yield trimmed, {"page": page, "section_path": row_section_path}, "table_row", attrs
 
         # OCR и диаграмма-текст
-        yield from _yield_ocr_chunks_if_any(section, base_attrs)
-        yield from _yield_chart_chunks_if_any(section, base_attrs)
+            # добавим OCR-чанки и данные диаграмм
+        for txt, meta, etype, a in (_yield_ocr_chunks_if_any(section, base_attrs) or []):
+            a = dict(a or {})
+            # гарантируем, что role/chapter_num не потеряются
+            if "role" in base_attrs and not a.get("role"):
+                a["role"] = base_attrs.get("role")
+            if "chapter_num" in base_attrs and "chapter_num" not in a:
+                a["chapter_num"] = base_attrs.get("chapter_num")
+            yield txt, meta, etype, a
+
+        for txt, meta, etype, a in (_yield_chart_chunks_if_any(section, base_attrs) or []):
+            a = dict(a or {})
+            if "role" in base_attrs and not a.get("role"):
+                a["role"] = base_attrs.get("role")
+            if "chapter_num" in base_attrs and "chapter_num" not in a:
+                a["chapter_num"] = base_attrs.get("chapter_num")
+            yield txt, meta, etype, a
+
         return
 
 
@@ -484,23 +503,25 @@ def _yield_chunks_for_section(
 
 # ---------- API ----------
 
+# indexing.py
+
 def index_document(
     owner_id: int,
     doc_id: int,
     sections: List[Dict[str, Any]],
-    * ,
+    *,
     batch_size: int = 128
 ) -> None:
     """
-    Индексирует документ:
-    - Источники -> element_type='reference' (только текст записи).
-    - Таблицы -> корневой чанк + построчно с ограничениями Cfg.FULL_TABLE_MAX_ROWS/COLS.
-    - Заголовки -> отдельные короткие чанки.
-    - Фигуры/страницы/текст -> обычные чанки с контекстным префиксом.
-    - OCR картинок (attrs.images) => subtype="ocr", если нет attrs.ocr_text.
-    - Текст из диаграмм (attrs.chart_matrix / attrs.chart_data, в т.ч. из OOXML-индекса) => чанки subtype="chart".
-    - Эмбеддинги считаются батчами.
+    Индексирует документ и сохраняет attrs (включая role/chapter_num) в chunks.attrs.
     """
+    try:
+        meta = _extract_intro_meta_from_sections(sections or [])
+        if meta:
+            set_document_meta(doc_id, meta)
+    except Exception:
+        logger.exception("index_document: failed to extract intro meta for doc_id=%s", doc_id)
+
     rows_text: List[str] = []
     rows_meta: List[Dict[str, Any]] = []
     rows_type: List[str] = []
@@ -514,10 +535,25 @@ def index_document(
         ):
             if not txt.strip():
                 continue
+
             rows_text.append(txt)
             rows_meta.append(meta)
             rows_type.append(etype)
-            rows_attrs.append(attrs or {})
+
+            sec_attrs = s.get("attrs") if isinstance(s.get("attrs"), dict) else {}
+            chunk_attrs = attrs if isinstance(attrs, dict) else {}
+
+            merged_attrs = dict(sec_attrs)
+            merged_attrs.update(chunk_attrs)
+
+            # 🔒 защита: chunk_attrs не должен убить роль/номер главы
+            if sec_attrs.get("role") and not merged_attrs.get("role"):
+                merged_attrs["role"] = sec_attrs.get("role")
+
+            if "chapter_num" in sec_attrs and "chapter_num" not in merged_attrs:
+                merged_attrs["chapter_num"] = sec_attrs.get("chapter_num")
+
+            rows_attrs.append(merged_attrs)
 
     if not rows_text:
         return
@@ -531,6 +567,7 @@ def index_document(
         vecs = embeddings(batch)
         if not vecs or len(vecs) != len(batch):
             raise RuntimeError("embeddings() вернул неожиданное количество векторов.")
+
         for j, vec in enumerate(vecs):
             k = idx + j
             meta = rows_meta[k]
@@ -552,14 +589,156 @@ def index_document(
                         blob,
                     ),
                 )
-
             else:
                 cur.execute(
                     "INSERT INTO chunks(doc_id, owner_id, page, section_path, text, embedding) "
                     "VALUES(?,?,?,?,?,?)",
                     (doc_id, owner_id, meta.get("page"), meta.get("section_path"), batch[j], blob),
                 )
+
         idx += len(batch)
 
     con.commit()
     con.close()
+
+def _extract_intro_meta_from_sections(
+    sections: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """
+    Пытается найти блок ВВЕДЕНИЕ и вытащить из него:
+    - актуальность (первые абзацы),
+    - объект,
+    - предмет,
+    - цель,
+    - задачи (список),
+    - гипотезу.
+
+    Работает эвристически, но под типовые ВКР подходит.
+    """
+    if not sections:
+        return None
+
+    intro_text_parts: List[str] = []
+
+    for s in sections:
+        title = (s.get("title") or "").strip().upper()
+        # ищем раздел "ВВЕДЕНИЕ" или близкие варианты
+        if "ВВЕДЕНИЕ" in title:
+            body = (s.get("text") or "").strip()
+            if body:
+                intro_text_parts.append(body)
+
+    if not intro_text_parts:
+        return None
+
+    intro_text = "\n".join(intro_text_parts)
+
+    # очень простой парсер по ключевым фразам
+    def _find_after(label: str) -> Optional[str]:
+        idx = intro_text.lower().find(label.lower())
+        if idx < 0:
+            return None
+        tail = intro_text[idx + len(label) :]
+        # берём до первой точки / перевода строки
+        for sep in [".", "\n"]:
+            cut = tail.find(sep)
+            if cut > 0:
+                return tail[:cut].strip(" :;\n\t")
+        return tail.strip(" :;\n\t")
+
+    relevance = None
+    # актуальность обычно в первых абзацах — здесь можно брать 1–2 первых абзаца
+    paragraphs = [p.strip() for p in intro_text.split("\n") if p.strip()]
+    if paragraphs:
+        relevance = paragraphs[0]
+        # если первый абзац слишком короткий — можно добавить второй
+        if len(relevance) < 200 and len(paragraphs) > 1:
+            relevance = relevance + " " + paragraphs[1]
+
+    obj = _find_after("объект исследования")
+    subj = _find_after("предмет исследования")
+    goal = _find_after("цель исследования")
+    if goal is None:
+        goal = _find_after("целью исследования")
+    if goal is None:
+        goal = _find_after("целью работы")
+
+    # задачи часто идут списком после фразы
+    tasks_block = None
+    # 🔧 расширили список маркеров под разные формулировки во введениях ВКР
+    for marker in [
+        "задачи исследования",
+        "были поставлены следующие задачи",
+        "поставлены следующие задачи",
+        "были разработаны следующие задачи исследования",
+        "разработаны следующие задачи исследования",
+        "были разработаны следующие задачи",
+        "разработаны следующие задачи",
+        "для достижения цели необходимо решить следующие задачи",
+        "для достижения цели исследования необходимо решить следующие задачи",
+        "основными задачами исследования являются",
+    ]:
+        idx = intro_text.lower().find(marker.lower())
+        if idx >= 0:
+            tasks_block = intro_text[idx + len(marker) :]
+            break
+
+    tasks: List[str] = []
+    if tasks_block:
+        for line in tasks_block.split("\n"):
+            line = line.strip(" \t-•—;:")
+            if not line:
+                continue
+            # простая эвристика: строки, начинающиеся с цифры / маркера, считаем задачами
+            if line[0].isdigit() or line.startswith(("-", "—")):
+                tasks.append(line)
+            elif tasks:
+                # если уже начался список, а строка без цифры — можно присоединить к предыдущей
+                tasks[-1] += " " + line
+
+    # 🔧 fallback: если блок задач по маркерам не вытащился, но слово «задач» есть в введении,
+    # пробуем собрать предложения с задачами из хвоста текста
+    if not tasks and "задач" in intro_text.lower():
+        tail = intro_text.split("задач", 1)[1]
+        for line in tail.split("\n"):
+            line = line.strip(" \t-•—;:")
+            if not line:
+                continue
+            if line[0].isdigit() or line.startswith(("-", "—")):
+                tasks.append(line)
+            elif tasks:
+                tasks[-1] += " " + line
+
+
+
+    tasks: List[str] = []
+    if tasks_block:
+        for line in tasks_block.split("\n"):
+            line = line.strip(" \t-•—;:")
+            if not line:
+                continue
+            # простая эвристика: строки, начинающиеся с цифры / маркера, считаем задачами
+            if line[0].isdigit() or line.startswith(("-", "—")):
+                tasks.append(line)
+            elif tasks:
+                # если уже начался список, а строка без цифры — можно присоединить к предыдущей
+                tasks[-1] += " " + line
+
+    hypothesis = _find_after("гипотеза исследования")
+    if hypothesis is None:
+        hypothesis = _find_after("гипотеза:")
+
+    meta = {
+        "relevance": relevance,
+        "object": obj,
+        "subject": subj,
+        "goal": goal,
+        "tasks": tasks,
+        "hypothesis": hypothesis,
+    }
+
+    # если всё пусто — нет смысла сохранять
+    if not any(meta.values()):
+        return None
+
+    return meta

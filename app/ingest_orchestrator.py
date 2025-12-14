@@ -322,12 +322,118 @@ def enrich_sections(
         enable_ocr = True
         enable_table_ocr = True
 
+    sections = _assign_section_roles(sections)  # ✅ новое
     _enrich_tables(sections)
     if detect_figures:
         _enrich_figures(sections)
     sections = _split_references_block(sections)
     return sections
 
+def _assign_section_roles(sections):
+    """
+    Проставляет sections[i]["attrs"]["role"]:
+      - intro
+      - chapter_1, chapter_2, ...
+      - conclusion
+      - references
+      - appendix
+
+    Важно: функция самодостаточная — все regex и константы внутри,
+    чтобы не ловить "NameError/Undefined name" после вставки.
+    """
+    import re
+
+    if not sections:
+        return sections
+
+    # роли
+    ROLE_INTRO = "intro"
+    ROLE_CONCLUSION = "conclusion"
+    ROLE_REFERENCES = "references"
+    ROLE_APPENDIX = "appendix"
+    ROLE_CH_PREFIX = "chapter_"
+
+    # паттерны
+    INTRO_RE = re.compile(
+        r"(?i)\b("
+        r"введение|вступление|"
+        r"общая\s+характеристика\s+работы|"
+        r"общая\s+характеристика\s+вкр|"
+        r"общая\s+характеристика\s+исследования"
+        r")\b"
+    )
+    CONCLUSION_RE = re.compile(
+        r"(?i)\b("
+        r"заключение|"
+        r"выводы\s+и\s+рекомендации|"
+        r"итоги\s+работы|"
+        r"общие\s+выводы|"
+        r"результаты\s+исследования"
+        r")\b"
+    )
+    REFERENCES_RE = re.compile(r"(?i)\b(список\s+литературы|библиограф(ия|ический)\s+список|источники|литература)\b")
+    APPENDIX_RE = re.compile(r"(?i)\b(приложени[ея]|appendix)\b")
+    CHAPTER_RE = re.compile(
+        r"(?i)\b("
+        r"глава|раздел|chapter|section|"
+        r"часть|part"
+        r")\s*([0-9]{1,2})\b"
+    )
+
+    LEADING_NUM_RE = re.compile(
+        r"^\s*([0-9]{1,2})(?:[.\s]+|$)"
+    )
+
+    current_role = None
+
+    for sec in sections:
+        if "attrs" not in sec or not isinstance(sec["attrs"], dict):
+            sec["attrs"] = {}
+        attrs = sec["attrs"]
+
+        title = (sec.get("title") or "").strip()
+        spath = (sec.get("section_path") or "").strip()
+        hay = f"{title}\n{spath}".strip().lower()
+
+        detected_role = None
+
+        # 1) сначала пытаемся ОПРЕДЕЛИТЬ новую роль по заголовку/пути
+        if REFERENCES_RE.search(hay):
+            detected_role = ROLE_REFERENCES
+        elif APPENDIX_RE.search(hay):
+            detected_role = ROLE_APPENDIX
+        elif CONCLUSION_RE.search(hay):
+            detected_role = ROLE_CONCLUSION
+        else:
+            m = CHAPTER_RE.search(hay)
+            if m:
+                detected_role = f"{ROLE_CH_PREFIX}{m.group(2)}"
+            else:
+                m2 = LEADING_NUM_RE.match(title)
+                if m2:
+                    detected_role = f"{ROLE_CH_PREFIX}{m2.group(1)}"
+                elif INTRO_RE.search(hay):
+                    detected_role = ROLE_INTRO
+
+        # 2) если нашли новую роль — обновляем current_role
+        if detected_role:
+            current_role = detected_role
+
+        # 3) если у секции НЕТ роли — присваиваем текущую (протягивание)
+        if not attrs.get("role") and current_role:
+            attrs["role"] = current_role
+
+            if current_role.startswith(ROLE_CH_PREFIX):
+                try:
+                    attrs["chapter_num"] = int(current_role.replace(ROLE_CH_PREFIX, ""))
+                except Exception:
+                    pass
+
+        sec["attrs"] = attrs
+
+
+
+    return sections
 
 # ----------------------------- НОВОЕ: кеш и OCR -----------------------------
 
@@ -497,10 +603,17 @@ def ingest_document(
             sections = _load_cached_sections(sha256)
             cache_used = sections is not None
 
-        if not sections:
-            # строим с нуля
-            sections = _build_structured_sections(file_path, resolved_kind)
+        if sections:
+            sections = _assign_section_roles(sections)
             _save_cached_sections(sha256, sections)
+
+        if not sections:
+            sections = _build_structured_sections(file_path, resolved_kind)
+
+        # ✅ ВАЖНО: роли должны быть проставлены ДО кеша и ДО индексации
+        sections = _assign_section_roles(sections)
+
+        _save_cached_sections(sha256, sections)
 
         # 5) Запускаем индексатор пользователя (опционально)
                 # 5) Запускаем индексатор пользователя (опционально)

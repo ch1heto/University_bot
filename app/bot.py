@@ -17,6 +17,7 @@ from aiogram.exceptions import TelegramBadRequest
 from app.planner import is_big_complex_query, plan_tasks_from_user_query, batch_tasks, TaskType
 from aiogram.enums import ChatAction
 from aiogram.types import FSInputFile, InputMediaPhoto
+from .document_semantic_planner import build_semantic_plan, answer_semantic_query
 from .retrieval import (
     get_table_context_for_numbers,
     get_figure_context_for_numbers,
@@ -388,9 +389,9 @@ async def _answer_structured_multi(
     except Exception:
         pass
 
+    # ✅ вместо одной отправки — режем под лимиты Telegram
     await _send(m, final_answer)
     return True
-
 
 async def _describe_table_for_multi(
     uid: int,
@@ -689,7 +690,23 @@ async def _describe_section_for_multi(
         doc_id=doc_id,
         section_hints=[sec],
         per_section_k=6,
-    )
+    ) or []
+
+    # ✅ НОВОЕ: при вопросах про выводы/итоги — точечный добор
+    q_low = (question or "").lower()
+    if any(w in q_low for w in ("вывод", "итог", "резюме")):
+        try:
+            from .retrieval import keyword_find, retrieve_in_area  # type: ignore
+
+            # regex-кусочки (быстро и точно)
+            for h in (keyword_find(uid, doc_id, r"вывод[ыы]\s+по", max_hits=2, section_prefix=sec) or []):
+                snippets.append({"text": h.get("snippet") or "", "page": h.get("page"), "section_path": h.get("section_path"), "score": 1.0})
+
+            # fallback семантика внутри главы
+            snippets.extend(retrieve_in_area(uid, doc_id, "выводы по главе", section_prefix=sec, top_k=2) or [])
+        except Exception:
+            logging.exception("describe_section_for_multi: conclusions enrichment failed")
+
     if not snippets:
         return ""
 
@@ -729,8 +746,6 @@ async def _describe_section_for_multi(
     return _strip_unwanted_sections(answer)
 
 
-
-
 def _split_multipart(text: str,
                      *,
                      target: int = TG_SPLIT_TARGET,
@@ -761,7 +776,7 @@ def _split_multipart(text: str,
 
 
 async def _send(m: types.Message, text: str):
-    """Бережно отправляем длинный текст частями в HTML-режиме (нестримовый фолбэк)."""
+    """Бережно отправляем длинный текст частями в HTML-режиме (нестримовый фолбэк) + retry."""
     chunks = _split_multipart(text or "")
     logger.info(
         "SEND: %d chunk(s) to chat_id=%s (message_id=%s), total_len=%d",
@@ -770,30 +785,47 @@ async def _send(m: types.Message, text: str):
         getattr(m, "message_id", None),
         len(text or ""),
     )
+
     for i, chunk in enumerate(chunks):
-        # небольшая пауза между сообщениями, чтобы не заспамить чат
         if i > 0 and MULTIPART_SLEEP_MS > 0:
             await asyncio.sleep(MULTIPART_SLEEP_MS / 1000)
 
-        try:
-            await m.answer(
-                _to_html(chunk),
-                parse_mode="HTML",
-                disable_web_page_preview=True,
+        sent = False
+        for attempt in range(3):
+            try:
+                await m.answer(
+                    _to_html(chunk),
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+                sent = True
+                break
+            except Exception as e:
+                logger.warning(
+                    "SEND: failed chunk %d/%d (attempt=%d, len=%d): %s",
+                    i + 1, len(chunks), attempt + 1, len(chunk), repr(e),
+                )
+                await asyncio.sleep(1 + attempt)
+
+        if not sent:
+            logger.error(
+                "SEND: giving up on chunk %d/%d (len=%d) — trying plain text fallback",
+                i + 1, len(chunks), len(chunk),
             )
-            logger.debug(
-                "SEND: chunk %d/%d sent, len=%d",
-                i + 1,
-                len(chunks),
-                len(chunk),
-            )
-        except Exception:
-            logger.exception(
-                "SEND: failed to send chunk %d/%d (len=%d)",
-                i + 1,
-                len(chunks),
-                len(chunk),
-            )
+            # ✅ Последний шанс: отправить как обычный текст без HTML
+            try:
+                await m.answer(
+                    chunk,  # без _to_html
+                    disable_web_page_preview=True,
+                )
+                sent = True
+            except Exception as e2:
+                logger.error(
+                    "SEND: plain text fallback failed for chunk %d/%d: %s",
+                    i + 1, len(chunks), repr(e2),
+                )
+                # ✅ важно: НЕ return — продолжаем следующие куски
+                continue
 
 
 # ---- Verbosity helpers ----
@@ -1106,181 +1138,82 @@ def _pairs_to_bullets(pairs: list[dict]) -> str:
     return "\n".join(lines)
 
 
-async def _stream_to_telegram(m: types.Message, stream, head_text: str = "⌛️ Печатаю ответ…") -> None:
+async def _stream_to_telegram(
+    m: types.Message,
+    stream,
+    head_text: str = "⌛️ Печатаю ответ…",
+) -> None:
+    """
+    Новый смысл: стрим используем только как источник текста.
+    Сначала полностью собираем ответ, потом отправляем его как обычное длинное сообщение.
+    Это защищает от обрывов: либо ответ пришёл целиком, либо не пришёл вообще.
+    """
     logger.info(
-        "STREAM: start for chat_id=%s message_id=%s",
+        "STREAM: start (collect-then-send) for chat_id=%s message_id=%s",
         m.chat.id,
         getattr(m, "message_id", None),
     )
-    current_text = ""
-    sent_parts = 0
+
+    # 1) показываем "печатаю" и запускаем typing-индикатор
     initial = await m.answer(
         _to_html(head_text),
         parse_mode="HTML",
         disable_web_page_preview=True,
     )
-    last_edit_at = _now_ms() - STREAM_HEAD_START_MS
     stop_typer = asyncio.Event()
     typer_task = asyncio.create_task(_typing_loop(m.chat.id, stop_event=stop_typer))
 
-    # 🔧 новое: после первой части в multi больше не редактируем initial
-    freeze_initial = False
+    full_text = ""
 
     try:
+        # 2) полностью собираем текст из стрима
         async for delta in _iterate_chunks(_ensure_iterable(stream)):
-            current_text += delta
+            full_text += delta
 
-            # 3.a) мульти-режим: сбрасываем порциями
-            if STREAM_MODE == "multi" and len(current_text) >= TG_SPLIT_TARGET:
-                cut = -1
-                for mm in _SPLIT_ANCHOR_RE.finditer(current_text[: min(len(current_text), TG_MAX_CHARS)]):
-                    if mm.start() < TG_SPLIT_TARGET:
-                        cut = mm.start()
-                if cut <= 0:
-                    cut = _smart_cut_point(current_text, min(TG_MAX_CHARS, TG_SPLIT_TARGET))
+        full_text = (full_text or "").strip()
+        if not full_text:
+            # ничего не пришло от модели — просто гасим "печатаю"
+            logger.warning("STREAM: empty full_text, nothing to send")
+            return
 
-                part = current_text[:cut].rstrip()
-                try:
-                    if sent_parts == 0:
-                        await initial.edit_text(
-                            _to_html(part),
-                            parse_mode="HTML",
-                            disable_web_page_preview=True,
-                        )
-                        freeze_initial = True  # <- больше не трогаем initial
-                    else:
-                        await m.answer(
-                            _to_html(part),
-                            parse_mode="HTML",
-                            disable_web_page_preview=True,
-                        )
-                except TelegramBadRequest:
-                    await m.answer(
-                        _to_html(part),
-                        parse_mode="HTML",
-                        disable_web_page_preview=True,
-                    )
+        logger.info("STREAM: collected full_text, len=%d", len(full_text))
 
-                sent_parts += 1  # ### ДОБАВЛЕНО: считаем отправленные части
-                current_text = current_text[cut:].lstrip()
-                last_edit_at = _now_ms()
-                continue
+        # 3) режем на части, как в обычном нестримовом режиме
+        parts = _split_multipart(full_text)
 
-            # 3.b) защита от лимита
-            if len(current_text) >= TG_MAX_CHARS:
-                cut = _smart_cut_point(current_text, TG_MAX_CHARS)
-                final_part = current_text[:cut]
-
-                if STREAM_MODE == "multi" and (freeze_initial or sent_parts > 0):
-                    # 🔧 в multi не редактируем initial после 1-й части
-                    await m.answer(
-                        _to_html(final_part),
-                        parse_mode="HTML",
-                        disable_web_page_preview=True,
-                    )
-                else:
-                    try:
-                        await initial.edit_text(
-                            _to_html(final_part),
-                            parse_mode="HTML",
-                            disable_web_page_preview=True,
-                        )
-                    except TelegramBadRequest:
-                        await m.answer(
-                            _to_html(final_part),
-                            parse_mode="HTML",
-                            disable_web_page_preview=True,
-                        )
-
-                sent_parts += 1  # ### ДОБАВЛЕНО: эта часть тоже считается отправленной
-                current_text = current_text[cut:].lstrip()
-                # 🔧 новый плейсхолдер нужен только в edit-режиме
-                if STREAM_MODE == "edit":
-                    initial = await m.answer(
-                        _to_html("…"),
-                        parse_mode="HTML",
-                        disable_web_page_preview=True,
-                    )
-                last_edit_at = _now_ms()
-                continue
-
-            # 3.c) периодические правки — 🔧 ТОЛЬКО в режиме edit
-            now = _now_ms()
-            if (
-                STREAM_MODE == "edit"
-                and (now - last_edit_at) >= STREAM_EDIT_INTERVAL_MS
-                and len(current_text) >= STREAM_MIN_CHARS
-            ):
+        first = True
+        for part in parts:
+            html_part = _to_html(part)
+            if first:
+                # первую часть кладём в initial
                 try:
                     await initial.edit_text(
-                        _to_html(current_text),
+                        html_part,
                         parse_mode="HTML",
                         disable_web_page_preview=True,
                     )
-                    last_edit_at = now
                 except TelegramBadRequest:
-                    pass
-
-        # финальный хвост
-        if current_text:
-            logger.info(
-                "STREAM: finishing with tail, len=%d, sent_parts=%d",
-                len(current_text),
-                sent_parts,
-            )
-            # аккуратно режем остаток так же, как в нестримовом режиме
-            tail_parts = _split_multipart(current_text or "")
-
-            if STREAM_MODE == "multi" and sent_parts > 0:
-                # в multi-режиме после первой части всё остальное — отдельными сообщениями
-                for part in tail_parts:
-                    html_part = _to_html(part)
-                    try:  # ### ДОБАВЛЕНО: не даём исключению убить весь хвост
-                        await m.answer(
-                            html_part,
-                            parse_mode="HTML",
-                            disable_web_page_preview=True,
-                        )
-                    except TelegramBadRequest:
-                        # если HTML/длина сломали разметку — шлём как есть
-                        await m.answer(part)
+                    # если редактирование не удалось — шлём отдельным сообщением
+                    await m.answer(
+                        html_part,
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                first = False
             else:
-                # в edit-режиме (или когда ещё не было частей) первый кусок пытаемся
-                # положить в initial, а остальное — отдельными сообщениями
-                first = True
-                for part in tail_parts:
-                    html_part = _to_html(part)
-                    if first:
-                        try:
-                            await initial.edit_text(
-                                html_part,
-                                parse_mode="HTML",
-                                disable_web_page_preview=True,
-                            )
-                        except TelegramBadRequest:
-                            # если редактирование не удалось — шлём отдельным сообщением
-                            try:
-                                await m.answer(
-                                    html_part,
-                                    parse_mode="HTML",
-                                    disable_web_page_preview=True,
-                                )
-                            except TelegramBadRequest:
-                                await m.answer(part)
-                        first = False
-                    else:
-                        try:
-                            await m.answer(
-                                html_part,
-                                parse_mode="HTML",
-                                disable_web_page_preview=True,
-                            )
-                        except TelegramBadRequest:
-                            await m.answer(part)
+                # остальные — отдельными сообщениями
+                try:
+                    await m.answer(
+                        html_part,
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                except TelegramBadRequest:
+                    await m.answer(part)
 
     except Exception:
         logger.exception(
-            "STREAM: unexpected error for chat_id=%s",
+            "STREAM: unexpected error (collect-then-send) for chat_id=%s",
             m.chat.id,
         )
     finally:
@@ -6361,6 +6294,49 @@ def _full_document_text(owner_id: int, doc_id: int, *, limit_chars: int | None =
         total += len(t)
     return "\n\n".join(parts)
 
+
+def _real_table_exists(owner_id: int, doc_id: int, table_num: str) -> bool:
+    """
+    Проверяем, что в ТЕКСТЕ документа реально есть упоминание
+    именно «таблица <table_num>».
+
+    Нужен, чтобы не пытаться описывать несуществующие «таблицу 2.2»
+    и «2.3», если в файле только «таблица 2» и «таблица 3».
+    """
+    if not table_num:
+        return False
+
+    # Нормализуем номер: "2.2" → "2.2", "2,2" → "2.2"
+    num_norm = table_num.strip().replace(",", ".").lower()
+
+    like_patterns = [
+        f"%таблица {num_norm}%",     # таблица 2.2
+        f"%таблица №{num_norm}%",    # таблица №2.2
+        f"%таблица № {num_norm}%",   # таблица № 2.2
+    ]
+
+    con = get_conn()
+    cur = con.cursor()
+    for pat in like_patterns:
+        cur.execute(
+            """
+            SELECT 1
+            FROM chunks
+            WHERE owner_id = ?
+              AND doc_id = ?
+              AND lower(text) LIKE ?
+            LIMIT 1
+            """,
+            (owner_id, doc_id, pat),
+        )
+        row = cur.fetchone()
+        if row:
+            con.close()
+            return True
+
+    con.close()
+    return False
+
 def _fullread_try_answer(uid: int, doc_id: int, q_text: str) -> str | None:
     """
     DIRECT: отдаём модели целиком весь текст документа как единый контекст.
@@ -6866,28 +6842,57 @@ def _is_structural_intro_question(q: str) -> bool:
     """
     Вопрос явно про структуру ВКР:
     введение / главы / объект / предмет / цель / задачи / гипотеза / выводы.
-    Для таких запросов запускаем спец-режим fullread по всему тексту диплома.
+    Для таких запросов запускаем спец-режим по ВЕСЬ текст диплома (fulltext).
     """
     if not q:
         return False
 
     text = q.lower()
 
-    # Ключевые триггеры по структуре работы
+    # Базовые триггеры, часто встречающиеся в таких вопросах
     trigger_words = [
-        "введение",
-        "глава 1", "глава 2", "первая глава", "вторая глава",
-        "1 глава", "2 глава",
-        "объект исследования", "предмет исследования",
+        "объект исследования",
+        "предмет исследования",
         "объект и предмет",
-        "актуальность темы", "актуальность исследования",
-        "цель исследования", "цель работы",
-        "задачи исследования", "задачи работы",
-        "гипотеза исследования", "гипотеза работы",
-        "выводы по главе", "основные выводы по главе",
+        "актуальность темы",
+        "актуальность исследования",
+        "цель исследования",
+        "цель работы",
+        "задачи исследования",
+        "задачи работы",
+        "гипотеза исследования",
+        "гипотеза работы",
+        "выводы по главе",
+        "основные выводы по главе",
+        "по главе 1",
+        "по главе 2",
+        "вкp", "вкр",               # иногда без точки
+        "дипломной работы",
+        "дипломной работе",
     ]
 
-    return any(w in text for w in trigger_words)
+    # Если что-то из этого есть в тексте — уже считаем структурным запросом
+    if any(w in text for w in trigger_words):
+        return True
+
+    # Любое упоминание введения: "во введении", "из введения" и т.п.
+    # ловим по корню "введени"
+    if "введени" in text:
+        return True
+
+    # Любые конструкции вида "в 1 главе", "во 2 главе", "в первой главе", "во второй главе"
+    # чтобы не перечислять все варианты строками
+    import re
+
+    # в 1 главе / во 2 главе
+    if re.search(r"\b(в|во)\s+\d+\s*главе?\b", text):
+        return True
+
+    # в первой/второй главе
+    if re.search(r"\b(в|во)\s+(первой|первую|первой|второй|вторую)\s+главе?\b", text):
+        return True
+
+    return False
 
 def _extract_struct_meta_block(full_text: str) -> str:
     """
@@ -6984,7 +6989,13 @@ async def _answer_fulltext_simple(
     Возвращаем True, если ответ отправлен. Если не получилось — False,
     чтобы дальше мог сработать обычный пайплайн.
     """
-    _limit = int(getattr(Cfg, "DIRECT_MAX_CHARS", 60000))
+
+    # ⚙️ Жёсткий лимит на длину текста, чтобы не забивать весь контекст
+    # и оставить модели место для нормального ответа.
+    raw_limit = int(getattr(Cfg, "DIRECT_MAX_CHARS", 60000))
+    hard_cap = 30000  # можно 25000–40000, но лучше не раздувать
+    _limit = min(raw_limit, hard_cap)
+
     full_text = _full_document_text(uid, doc_id, limit_chars=_limit)
     if not (full_text or "").strip():
         # нет текста — пусть дальше отработает стандартный пайплайн
@@ -6999,29 +7010,23 @@ async def _answer_fulltext_simple(
         "пропускать."
     )
 
-    user_content = (
-        "Вот текст дипломной работы:\n"
-        "[Текст ВКР]\n" + full_text + "\n\n"
-        "Вопрос студента:\n" + q_text + "\n\n"
-        "Ответь на вопрос, сделай связный и понятный ответ, опираясь только на этот текст."
-    )
-
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_content},
+
+        # ассистент сообщает модели текст ВКР (так правильнее)
+        {"role": "assistant", "content": f"[Текст ВКР]\n{full_text}"},
+
+        # пользователь задаёт вопрос
+        {
+            "role": "user",
+            "content": (
+                f"Вопрос студента: {q_text}\n\n"
+                "Ответь строго по тексту ВКР выше."
+            ),
+        },
     ]
 
     try:
-        # если включён стрим — используем его как есть
-        if STREAM_ENABLED and chat_with_gpt_stream is not None:
-            stream = chat_with_gpt_stream(
-                messages,
-                temperature=0.2,
-                max_tokens=FINAL_MAX_TOKENS,
-            )
-            await _stream_to_telegram(m, stream)
-            return True
-
         # обычный (нестримовый) вызов
         ans = chat_with_gpt(
             messages,
@@ -7040,7 +7045,7 @@ async def _answer_fulltext_simple(
 
     text = _strip_unwanted_sections(ans)
 
-    # 🔪 ЧТО МЫ ДОБАВЛЯЕМ: нарезка ответа на куски для Телеги
+    # 🔪 Нарезка ответа на куски для Телеги
     MAX_TG_LEN = 3500  # чуть меньше лимита, чтобы не упереться в ограничение Telegram
     start = 0
     n = len(text)
@@ -7252,37 +7257,136 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
     # для коротких реплик вида «опиши подробнее», «расскажи про него»
     q_text = _expand_with_last_referent(uid, q_text)
 
-    # Примеры: "опиши таблицу 4", "что показывает таблица 2.3", "сделай выводы по таблице 4"
-    if _is_pure_table_request(q_text):
-        verbosity = _detect_verbosity(q_text)
-        base_text = (orig_q_text or "")
-        mode = "more" if _FOLLOWUP_MORE_RE.search(base_text) else "normal"
-        logger.info(
-            "ANSWER: pure table request detected (uid=%s, doc_id=%s, mode=%s)",
-            uid,
-            doc_id,
-            mode,
-        )
-        handled = await _answer_table_query(
-            m, uid, doc_id, q_text, verbosity=verbosity, mode=mode
-        )
-        logger.info(
-            "ANSWER: _answer_table_query finished (uid=%s, doc_id=%s, handled=%s)",
-            uid,
-            doc_id,
-            handled,
-        )
+    # 👇 Строим семантический план вопроса
+    plan = build_semantic_plan(q_text)
+    logger.info(
+        "SEMANTIC_PLAN mode=%s, objects=%s, slots=%s",
+        plan.mode,
+        [o.label for o in plan.objects],
+        {
+            "relevance": plan.slots.relevance,
+            "obj": plan.slots.obj,
+            "subj": plan.slots.subj,
+            "goal": plan.slots.goal,
+            "tasks": plan.slots.tasks,
+            "hypothesis": plan.slots.hypothesis,
+            "chapter_conclusions": plan.slots.chapter_conclusions,
+        },
+    )
+
+    # 👇 Пытаемся ответить новой семантической логикой.
+    # Если она вернула None — дальше всё обрабатывает старый пайплайн.
+    semantic_answer = None
+    try:
+        semantic_answer = await answer_semantic_query(uid, doc_id, q_text, plan)
+    except Exception:
+        logger.exception("answer_semantic_query failed, fallback to old pipeline")
+
+    if semantic_answer:
+        cleaned = _strip_unwanted_sections(semantic_answer).strip()
+
+        # ✅ если ответ слишком короткий / явно неструктурный — считаем, что семантика провалилась
+        too_short = len(cleaned) < 400
+        has_any_block = any(h in cleaned for h in ("Введение", "Глава 1", "Глава 2"))
+
+        # можно жёстче: требовать хотя бы 2 блока
+        blocks = sum(h in cleaned for h in ("Введение", "Глава 1", "Глава 2"))
+
+        if too_short or blocks < 2:
+            logger.info("semantic_answer rejected (len=%s, blocks=%s) -> fallback to legacy", len(cleaned), blocks)
+        else:
+            await _send(m, cleaned)
+            return
+
+    # =============================================
+    # 🔥 СУПЕР-РАННИЙ ПЕРЕХВАТ СТРУКТУРНЫХ ВОПРОСОВ
+    # =============================================
+    if _is_structural_intro_question(q_text):
+        handled = await _answer_fulltext_simple(m, uid, doc_id, q_text)
         if handled:
             return
+
+
+        # Примеры: "опиши таблицу 4", "что показывает таблица 2.3", "сделай выводы по таблице 4"
+    if _is_pure_table_request(q_text):
+        # Пытаемся вытащить номер таблицы из вопроса,
+        # чтобы не лезть в таблицы, которых в документе вообще нет.
+        refs = extract_struct_refs(q_text) or []
+        table_nums = [r["num"] for r in refs if r.get("kind") == "table" and r.get("num")]
+
+        if table_nums:
+            tbl_num = table_nums[0]
+            if not _real_table_exists(uid, doc_id, tbl_num):
+                logger.info(
+                    "ANSWER: requested table %s not found in document text, "
+                    "skip table-pipeline (uid=%s, doc_id=%s)",
+                    tbl_num,
+                    uid,
+                    doc_id,
+                )
+                # просто НЕ идём в _answer_table_query → дальше отработает
+                # общий RAG/fulltext-пайплайн
+            else:
+                verbosity = _detect_verbosity(q_text)
+                base_text = (orig_q_text or "")
+                mode = "more" if _FOLLOWUP_MORE_RE.search(base_text) else "normal"
+                logger.info(
+                    "ANSWER: pure table request detected (uid=%s, doc_id=%s, mode=%s, table=%s)",
+                    uid,
+                    doc_id,
+                    mode,
+                    tbl_num,
+                )
+                handled = await _answer_table_query(
+                    m, uid, doc_id, q_text, verbosity=verbosity, mode=mode
+                )
+                logger.info(
+                    "ANSWER: _answer_table_query finished (uid=%s, doc_id=%s, handled=%s)",
+                    uid,
+                    doc_id,
+                    handled,
+                )
+                if handled:
+                    return
+                else:
+                    logger.info(
+                        "ANSWER: table pipeline did not handle request, falling back to general pipeline "
+                        "(uid=%s, doc_id=%s)",
+                        uid,
+                        doc_id,
+                    )
         else:
+            # на всякий случай: если номер таблицы не смогли распарсить,
+            # ведём себя как раньше — пробуем table-пайплайн как есть
+            verbosity = _detect_verbosity(q_text)
+            base_text = (orig_q_text or "")
+            mode = "more" if _FOLLOWUP_MORE_RE.search(base_text) else "normal"
             logger.info(
-                "ANSWER: table pipeline did not handle request, falling back to general pipeline "
-                "(uid=%s, doc_id=%s)",
+                "ANSWER: pure table request (no explicit num) (uid=%s, doc_id=%s, mode=%s)",
                 uid,
                 doc_id,
+                mode,
             )
-        # если _answer_table_query не смог ответить (таблица не нашлась в OOXML/картинке),
-        # просто проваливаемся дальше в общий пайплайн
+            handled = await _answer_table_query(
+                m, uid, doc_id, q_text, verbosity=verbosity, mode=mode
+            )
+            logger.info(
+                "ANSWER: _answer_table_query finished (uid=%s, doc_id=%s, handled=%s)",
+                uid,
+                doc_id,
+                handled,
+            )
+            if handled:
+                return
+            else:
+                logger.info(
+                    "ANSWER: table pipeline did not handle request, falling back to general pipeline "
+                    "(uid=%s, doc_id=%s)",
+                    uid,
+                    doc_id,
+                )
+        # если сюда дошли — просто проваливаемся дальше в общий пайплайн
+
 
     # быстрый путь для запросов про рисунки (старый, через _answer_figure_query)
     if _is_pure_figure_request(q_text):
@@ -7371,7 +7475,7 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
             await _send(m, "Не удалось описать рисунки." + suffix)
         return
 
-    # NEW: мультинумерная ветка — как только увидели номера таблиц/рисунков/глав,
+        # NEW: мультинумерная ветка — как только увидели номера таблиц/рисунков/глав,
     # проходимся по ним циклом и, если это действительно мультийнтент,
     # даём один собранный ответ и НЕ идём в generic-ветки ниже.
     refs = extract_struct_refs(q_text)
@@ -7394,6 +7498,30 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
         # больше НЕ отдаём в _answer_structured_multi — их обработаем ниже
         # через RAG + специальную "only_figures"-ветку.
         if (not is_single_ref or len(kinds) > 1) and kinds != {"figure"}:
+            # 🔍 Дополнительно проверяем: это именно СРАВНИТЕЛЬНЫЙ/АНАЛИТИЧЕСКИЙ запрос?
+            if _is_comparative_struct_request(q_text, refs):
+                logger.info(
+                    "ANSWER: structured-comparative pipeline (uid=%s, doc_id=%s, refs=%r)",
+                    uid,
+                    doc_id,
+                    refs,
+                )
+                handled = await _answer_structured_comparative(
+                    m, uid, doc_id, q_text, refs
+                )
+                if handled:
+                    # ответ уже отправлен, дальше не идём
+                    return
+                else:
+                    logger.info(
+                        "ANSWER: structured-comparative not handled, "
+                        "falling back to structured-multi (uid=%s, doc_id=%s)",
+                        uid,
+                        doc_id,
+                    )
+
+            # если это не сравнительный запрос ИЛИ сравнительная ветка не справилась —
+            # используем старый structured-multi как раньше
             logger.info(
                 "ANSWER: structured-multi pipeline (uid=%s, doc_id=%s, refs=%r)",
                 uid,
@@ -7570,8 +7698,11 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
             return
 
     # ====== FULLREAD: auto ======
-        # ====== FULLREAD: auto ======
     fr_mode = getattr(Cfg, "FULLREAD_MODE", "off")
+
+    # 🚫 Блокируем FULLREAD для структурных вопросов (страховка)
+    if _is_structural_intro_question(q_text):
+        fr_mode = "off"
     # FULLREAD(auto) включаем только для общих вопросов по содержанию,
     # чтобы не перебивать спец-логики по таблицам/рисункам/источникам
     # и по введению/главам (их обрабатываем отдельно).
@@ -7688,7 +7819,7 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
                 # без return — ниже спокойно отработает обычный RAG-ответ
 
     # ====== FULLREAD: iterative/digest ======
-    if fr_mode in {"iterative", "digest"} and not pure_figs:
+    if fr_mode in {"iterative", "digest"} and not pure_figs and not _is_structural_intro_question(q_text):
         messages, err = _iterative_fullread_build_messages(uid, doc_id, q_text)
         if messages:
             if STREAM_ENABLED and chat_with_gpt_stream is not None:
@@ -7738,7 +7869,7 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
             re.search(r"\b(введение|глава|раздел|пункт)\b", q_text, re.IGNORECASE)
         )
 
-        if no_ctx and mentions_structure:
+        if no_ctx and mentions_structure and not _is_structural_intro_question(q_text):
             # 👇 Вместо одного огромного текста — итеративный fullread по кусочкам
             messages, err = _iterative_fullread_build_messages(uid, doc_id, q_text)
 
@@ -7995,6 +8126,138 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
         )
 
     await _send(m, _strip_unwanted_sections(answer))
+
+def _is_comparative_struct_request(q_text: str, refs: list[dict]) -> bool:
+    """
+    Возвращает True, если:
+      - в вопросе есть ссылки на НЕСКОЛЬКО объектов (таблицы/рисунки/главы),
+      - и по тексту видно, что пользователя интересует СРАВНЕНИЕ / ОБЩИЕ И ОТЛИЧИЯ,
+        а не просто «опиши таблицу X».
+    """
+    if not q_text or not refs:
+        return False
+
+    # Нужно как минимум два разных объекта
+    nums = {(r.get("kind"), r.get("num")) for r in refs}
+    if len(nums) <= 1:
+        return False
+
+    text = q_text.lower()
+    comparative_markers = [
+        "сравни", "сравнение", "сопостав",
+        "что общего", "чем отличаются",
+        "общие и отличия", "сходств", "различи",
+        "динамик", "тенденци",
+    ]
+    return any(marker in text for marker in comparative_markers)
+
+async def _answer_structured_comparative(
+    m: types.Message,
+    uid: int,
+    doc_id: int,
+    q_text: str,
+    refs: list[dict],
+) -> bool:
+    """
+    Умный режим для сравнительных вопросов по нескольким таблицам/главам/рисункам:
+      - читаем ПОЛНЫЙ текст ВКР (как во fulltext),
+      - даём модели вопрос пользователя,
+      - просим сравнить/сопоставить по смыслу, даже если каких-то таблиц формально нет,
+        но честно об этом написать.
+    Возвращаем True, если ответ уже отправлен пользователю.
+    """
+    _limit = int(getattr(Cfg, "DIRECT_MAX_CHARS", 60000))
+    full_text = _full_document_text(uid, doc_id, limit_chars=_limit)
+    if not (full_text or "").strip():
+        # ничего не читабельно — пусть дальше отработает обычный пайплайн
+        return False
+
+    # Небольшой человеко-понятный список того, что просили сравнить
+    ref_strs: list[str] = []
+    for r in refs:
+        kind = (r.get("kind") or "").lower()
+        num = (r.get("num") or "").strip()
+        if kind and num:
+            if kind == "table":
+                ref_strs.append(f"таблица {num}")
+            elif kind == "figure":
+                ref_strs.append(f"рисунок {num}")
+            elif kind == "section":
+                ref_strs.append(f"раздел/пункт {num}")
+            else:
+                ref_strs.append(f"{kind} {num}")
+
+    refs_human = ", ".join(ref_strs) if ref_strs else "несколько элементов работы"
+
+    system_prompt = (
+        "Ты репетитор по ВКР. Тебе дан полный текст дипломной работы студента.\n"
+        "Отвечай ТОЛЬКО на русском языке, простым понятным студенту языком.\n"
+        "Опирайся строго на текст работы, не придумывай того, чего в тексте нет.\n"
+        "Пользователь задаёт сравнительный/аналитический вопрос по нескольким таблицам, "
+        "рисункам или разделам работы.\n"
+        "Если каких-то указанных таблиц/рисунков с такими номерами в тексте нет, честно напиши об этом,\n"
+        "но всё равно постарайся сделать содержательное сравнение по теме, используя доступный текст "
+        "глав и разделов (уровни самооценки, стили воспитания, результаты, выводы и т.п.).\n"
+        "Структурируй ответ: сначала кратко опиши, какие объекты сравниваются, затем укажи, что общего, "
+        "чем они отличаются, и какие главные выводы можно сделать."
+    )
+
+    user_content = (
+        "Вот текст дипломной работы:\n"
+        "[Текст ВКР]\n"
+        f"{full_text}\n\n"
+        "Вопрос студента:\n"
+        f"{q_text}\n\n"
+        f"Сравни и проанализируй по смыслу указанные элементы работы ({refs_human}). "
+        "Если какая-то таблица/рисунок с таким номером не найдена в тексте, напиши об этом явно, "
+        "но сделай сравнение по имеющимся данным и общему содержанию глав."
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+
+    try:
+        # если доступен стрим — шлём как стрим
+        if STREAM_ENABLED and chat_with_gpt_stream is not None:
+            stream = chat_with_gpt_stream(
+                messages,
+                temperature=0.2,
+                max_tokens=FINAL_MAX_TOKENS,
+            )
+            # чтобы Телега не резала — _stream_to_telegram сам по кусочкам отправит
+            await _stream_to_telegram(m, stream)
+            return True
+
+        # обычный (нестримовый) вызов
+        ans = chat_with_gpt(
+            messages,
+            temperature=0.2,
+            max_tokens=FINAL_MAX_TOKENS,
+        ) or ""
+    except Exception as e:
+        logging.exception("structured_comparative failed: %s", e)
+        # не рвём общий пайплайн — дадим шансы старым веткам
+        return False
+
+    ans = (ans or "").strip()
+    if not ans:
+        # Пустой ответ — тоже не считаем успехом, пусть ниже отработают другие ветки
+        return False
+
+    text = _strip_unwanted_sections(ans)
+
+    # Чтоб Телега не резала длинный текст – шлём чанками
+    MAX_TG_LEN = 3500
+    start = 0
+    n = len(text)
+    while start < n:
+        chunk = text[start:start + MAX_TG_LEN]
+        await _send(m, chunk)
+        start += MAX_TG_LEN
+
+    return True
 
 
 async def _qa_worker(m: types.Message, uid: int, doc_id: int, text: str):

@@ -319,17 +319,15 @@ def chat_with_gpt(
 ) -> str:
     """
     Нестримовый чат-вызов (с санацией сообщений).
-    Поддерживает сообщения с image_url-партами (data: или http/https).
-    Допускает дополнительные параметры, напр. response_format={"type":"json_object"}.
+    ВАЖНО: умеет "дозаказывать" ответ, если completion оборвалась (finish_reason != 'stop').
     """
     try:
         smsg = _sanitize_messages(messages)
+
         # Выбор модели: если в сообщениях есть image_url — используем vision-модель.
         use_vision = any(
-            isinstance(m.get("content"), list) and any(
-                isinstance(p, dict) and p.get("type") == "image_url"
-                for p in m["content"]
-            )
+            isinstance(m.get("content"), list)
+            and any(isinstance(p, dict) and p.get("type") == "image_url" for p in m["content"])
             for m in smsg
         )
         model = Cfg.vision_model() if (use_vision and Cfg.vision_active()) else Cfg.POLZA_CHAT
@@ -338,21 +336,83 @@ def chat_with_gpt(
         blocked = {"model", "messages", "temperature", "max_tokens", "stream"}
         pass_extra = {k: v for k, v in (extra or {}).items() if k not in blocked}
 
-        cmpl = _client.chat.completions.create(
-            model=model,
-            messages=smsg,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            **pass_extra,
-        )
+        # ---- helper: один запрос ----
+        def _one_call(msgs: List[Dict[str, Any]]) -> Any:
+            return _client.chat.completions.create(
+                model=model,
+                messages=msgs,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                **pass_extra,
+            )
 
-        msg = cmpl.choices[0].message
-        text = (msg.content or "").strip()
+        # ---- 1) первый ответ ----
+        cmpl = _one_call(smsg)
+
+        choice = (cmpl.choices or [None])[0]
+        if not choice or not getattr(choice, "message", None):
+            return ""
+
+        text = ((choice.message.content or "") if hasattr(choice.message, "content") else "") or ""
+        text = text.strip()
+
+        finish_reason = getattr(choice, "finish_reason", None) or ""
+
+        # ---- 2) если ответ оборван — дозаказываем "продолжение" ----
+        # Иногда API возвращает кусок, но finish_reason не 'stop' → это и есть "обрыв".
+        # Дозаказ делаем аккуратно: передаем уже выданный текст и просим продолжить.
+        max_continuations = 2  # обычно хватает 1-2
+        continuations_done = 0
+
+        def _looks_cut(s: str) -> bool:
+            if not s:
+                return False
+            # обрыв посреди слова/строки (как у тебя "корр")
+            if re.search(r"[А-Яа-яA-Za-z0-9]\Z", s) and not s.endswith((".", "!", "?", "…", ")", "]", '"', "»")):
+                # если последняя строка слишком "сырая" — вероятно обрыв
+                last = s.splitlines()[-1].strip()
+                return len(last) > 0 and not last.endswith((".", "!", "?", "…", ")", "]", '"', "»"))
+            return False
+
+        while continuations_done < max_continuations and (finish_reason and finish_reason != "stop" or _looks_cut(text)):
+            continuations_done += 1
+
+            cont_msgs = list(smsg)
+            cont_msgs.append(
+                {
+                    "role": "assistant",
+                    "content": text,
+                }
+            )
+            cont_msgs.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Продолжи ответ с места, где оборвалось. "
+                        "Ничего не повторяй, просто допиши оставшиеся пункты/разделы до конца."
+                    ),
+                }
+            )
+
+            cmpl2 = _one_call(cont_msgs)
+            ch2 = (cmpl2.choices or [None])[0]
+            if not ch2 or not getattr(ch2, "message", None):
+                break
+
+            add = ((ch2.message.content or "") if hasattr(ch2.message, "content") else "") or ""
+            add = add.strip()
+
+            if not add:
+                break
+
+            # склеиваем
+            text = (text.rstrip() + "\n" + add.lstrip()).strip()
+            finish_reason = getattr(ch2, "finish_reason", None) or ""
+
         return text
 
-
     except Exception as e:
-        logging.error("Ошибка при запросе к чат-модели: %s", e)
+        logging.exception("Ошибка при запросе к чат-модели: %s", e)
         return "Произошла ошибка при обработке запроса. Попробуйте позже."
 
 
