@@ -15,7 +15,7 @@ from decimal import Decimal, InvalidOperation
 
 def _json_default(obj: Any):
     """
-    JSON-serializator for non-standard types inside index.
+    JSON-serializer for non-standard types inside index.
     Сейчас нам нужен прежде всего для Decimal в chart-структурах.
     """
     if isinstance(obj, Decimal):

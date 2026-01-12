@@ -11,7 +11,7 @@
 """
 
 from __future__ import annotations
-from .db import get_document_meta
+from .db import get_document_base_meta
 import re
 import logging
 from dataclasses import dataclass, field
@@ -200,26 +200,43 @@ def _detect_slots(text: str) -> SemanticSlots:
     if re.search(r"актуал(ьн|изир)", t):
         slots.relevance = True
 
-    # объект / предмет
-    if (
-        re.search(r"объект(ом|а)?\s+исследован", t)
-        or "кто объект" in t
-        or "объект работы" in t
-        or "объект и предмет" in t
-    ):
-        slots.obj = True
+    # --- НОРМАЛИЗАЦИЯ ДЛЯ КЕЙСА "объектом и предметом исследования" ---
+    # Если в вопросе одновременно упоминаются объект+предмет+исследование — это ВСЕГДА два слота.
+    has_obj_root = bool(re.search(r"\bобъект\w*\b", t))
+    has_subj_root = bool(re.search(r"\bпредмет\w*\b", t))
+    has_research_root = bool(re.search(r"\bисслед\w*\b", t))
 
-    if (
-        re.search(r"предмет(ом|а)?\s+исследован", t)
-        or "что является предмет" in t
-        or "предмет работы" in t
-        or "объект и предмет" in t
-    ):
+    if has_obj_root and has_subj_root and has_research_root:
+        slots.obj = True
         slots.subj = True
 
-    # цель / задачи
+    # объект
+    if not slots.obj:
+        if (
+            re.search(r"\bобъект\w*\s+исслед\w*\b", t)
+            or re.search(r"\bобъект\w*\s+работ\w*\b", t)
+            or "кто объект" in t
+            or "объект работы" in t
+            or "объект и предмет" in t
+            or "объектом и предметом" in t
+        ):
+            slots.obj = True
+
+    # предмет
+    if not slots.subj:
+        if (
+            re.search(r"\bпредмет\w*\s+исслед\w*\b", t)
+            or re.search(r"\bпредмет\w*\s+работ\w*\b", t)
+            or "что является предмет" in t
+            or "предмет работы" in t
+            or "объект и предмет" in t
+            or "объектом и предметом" in t
+        ):
+            slots.subj = True
+
+    # цель
     if (
-        re.search(r"цель(ю)?\s+исследован", t)
+        re.search(r"\bцель\w*\s+(исслед\w*|работ\w*)\b", t)
         or "цель работы" in t
         or "как сформулирована цель" in t
         or "как сформулированы цель" in t
@@ -227,8 +244,9 @@ def _detect_slots(text: str) -> SemanticSlots:
     ):
         slots.goal = True
 
+    # задачи
     if (
-        re.search(r"задач(и|ами)\s+исследован", t)
+        re.search(r"\bзадач\w*\s+(исслед\w*|работ\w*)\b", t)
         or "какие задачи" in t
         or "как сформулированы задачи" in t
         or "цель и задачи" in t
@@ -236,16 +254,14 @@ def _detect_slots(text: str) -> SemanticSlots:
         slots.tasks = True
 
     # гипотеза
-    if "гипотез" in t or "какая гипотеза" in t:
+    if re.search(r"\bгипотез\w*\b", t) or "какая гипотеза" in t:
         slots.hypothesis = True
 
     # выводы по главам / разделам
     if re.search(r"вывод(ы)?\s+по\s+(глав|раздел|параграф|част)", t) or "главные выводы" in t:
         slots.chapter_conclusions = True
 
-    # мягкий фолбэк для репетиторского режима: если явно не просили слоты,
-    # но есть «как репетитор» и упоминание введения/глав — считаем, что нужны
-    # как минимум цель/задачи/выводы.
+    # мягкий фолбэк для репетиторского режима
     if _TUTOR_RE.search(t) and (" глава" in t or "главе" in t or _INTRO_RE.search(t)):
         if not slots.goal and not slots.tasks and not slots.chapter_conclusions:
             slots.goal = True
@@ -253,7 +269,6 @@ def _detect_slots(text: str) -> SemanticSlots:
             slots.chapter_conclusions = True
 
     return slots
-
 
 # ------------------------------------
 # Извлечение ссылок на объекты документа
@@ -410,12 +425,14 @@ def extract_document_objects(text: str) -> List[DocumentObjectRef]:
 def build_semantic_plan(question: str) -> SemanticPlan:
     q = (question or "").strip()
 
+    q_norm = re.sub(r"\s+", " ", q).strip()
+
     plan = SemanticPlan(
-        mode=_detect_mode(q),
-        objects=extract_document_objects(q),
-        slots=_detect_slots(q),
+        mode=_detect_mode(q_norm),
+        objects=extract_document_objects(q_norm),
+        slots=_detect_slots(q_norm),
         original_question=q,
-        normalized_question=q,
+        normalized_question=q_norm,
     )
 
     # Если спрашивают учебные слоты, но разделы не распознаны — добавляем введение.
@@ -524,8 +541,8 @@ async def answer_semantic_query(
 ) -> Optional[str]:
     """
     Репетиторский структурный ответ:
-    - НЕ один общий RAG,
-      а 3 отдельных вызова GPT по зонам: intro, chapter_1, chapter_2
+    - GPT по зонам: intro/chapter_1/chapter_2 (по необходимости)
+    - Строгое извлечение паспорта (объект/предмет/цель/задачи/гипотеза/актуальность)
     """
 
     has_slots = plan.slots.any_slot_requested()
@@ -538,133 +555,240 @@ async def answer_semantic_query(
         logger.warning("answer_semantic_query: chat_with_gpt is not available")
         return None
 
-    # берём "почти весь" текст нужных зон из БД
     try:
-        from .retrieval import get_area_text  # новая функция в retrieval.py
+        from .retrieval import get_area_text
     except Exception:
         logger.exception("answer_semantic_query: cannot import get_area_text")
         return None
 
-    intro_text = get_area_text(uid, doc_id, role="intro", max_chars=14000)
-    ch1_text = get_area_text(uid, doc_id, role="chapter_1", max_chars=14000)
-    ch2_text = get_area_text(uid, doc_id, role="chapter_2", max_chars=14000)
+    # --- Определяем, какие зоны реально нужны ---
+    want_intro = any(o.kind == "section" and o.key == "intro" for o in plan.objects) or has_slots
+    want_ch1 = any(o.kind == "section" and o.key == "1" for o in plan.objects) or plan.slots.chapter_conclusions
+    want_ch2 = any(o.kind == "section" and o.key == "2" for o in plan.objects) or plan.slots.chapter_conclusions
 
-    # если ролей нет / не доехали → отдаём старому пайплайну
+    intro_text = get_area_text(uid, doc_id, role="intro", max_chars=20000) if want_intro else ""
+    ch1_text = get_area_text(uid, doc_id, role="chapter_1", max_chars=20000) if want_ch1 else ""
+    ch2_text = get_area_text(uid, doc_id, role="chapter_2", max_chars=20000) if want_ch2 else ""
+
     if not any([intro_text, ch1_text, ch2_text]):
         logger.info("answer_semantic_query: no texts found even with fallback; fallback to legacy pipeline")
         return None
 
-    system_prompt = (
-        "Ты репетитор по дипломным работам (ВКР). "
-        "Отвечай ТОЛЬКО по данному тексту. "
-        "Если пункта нет явно — пиши: «в тексте ВКР не сформулировано явно»."
+    strict_system = (
+        "Ты репетитор по дипломным работам (ВКР).\n"
+        "Тебе дан ТОЛЬКО текст ВКР.\n"
+        "Правила:\n"
+        "1) Отвечай ТОЛЬКО по данному тексту.\n"
+        "2) Запрещено додумывать типовые формулировки.\n"
+        "3) Если формулировка не найдена явно — пиши: «в тексте ВКР не найдено».\n"
+        "4) Для полей паспорта (объект/предмет/цель/задачи/гипотеза/актуальность) "
+        "ОБЯЗАТЕЛЬНО приводи короткую цитату (5–25 слов) в кавычках."
     )
 
-    # 1) Введение: паспорт
+    def _sanitize_passport_block(text: str) -> str:
+        if not (text or "").strip():
+            return ""
+
+        fields = ["Актуальность", "Объект", "Предмет", "Цель", "Задачи", "Гипотеза"]
+        out_lines: list[str] = []
+        for line in (text or "").splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            if s.startswith("## "):
+                out_lines.append(s)
+                continue
+
+            m = re.match(r"^\*\*(.+?)\*\*:\s*(.*)$", s)
+            if not m:
+                out_lines.append(s)
+                continue
+
+            name = m.group(1).strip()
+            val = (m.group(2) or "").strip()
+
+            if name in fields:
+                low = val.lower()
+                has_not_found = "не найден" in low
+                has_quote = ("«" in val and "»" in val) or ('"' in val)
+                if has_not_found:
+                    out_lines.append(f"**{name}:** в тексте ВКР не найдено")
+                elif has_quote:
+                    out_lines.append(f"**{name}:** {val}")
+                else:
+                    out_lines.append(f"**{name}:** в тексте ВКР не найдено")
+            else:
+                out_lines.append(s)
+
+        return "\n".join(out_lines).strip()
+
+    # --- Поля введения формируем по реально запрошенным слотам ---
+    slot_to_field = [
+        ("relevance", "Актуальность"),
+        ("obj", "Объект"),
+        ("subj", "Предмет"),
+        ("goal", "Цель"),
+        ("tasks", "Задачи"),
+        ("hypothesis", "Гипотеза"),
+    ]
+
+    requested_fields: list[str] = []
+    if plan.slots.relevance:
+        requested_fields.append("Актуальность")
+    if plan.slots.obj:
+        requested_fields.append("Объект")
+    if plan.slots.subj:
+        requested_fields.append("Предмет")
+    if plan.slots.goal:
+        requested_fields.append("Цель")
+    if plan.slots.tasks:
+        requested_fields.append("Задачи")
+    if plan.slots.hypothesis:
+        requested_fields.append("Гипотеза")
+
+    # Если пользователь не просил конкретные слоты (tutor_overview), то делаем полный паспорт
+    if not requested_fields and plan.mode == "tutor_overview":
+        requested_fields = ["Актуальность", "Объект", "Предмет", "Цель", "Задачи", "Гипотеза"]
+
+    def _intro_format_block(fields: list[str]) -> str:
+        # строгое требование формата под существующий санитайзер
+        lines = ["## Введение"]
+        for f in fields:
+            lines.append(f"**{f}:** <формулировка> (цитата: «...»)")
+        return "\n".join(lines)
+
     intro_answer = ""
-    if intro_text:
+    if intro_text and requested_fields:
         intro_user = (
             f"Вопрос студента:\n{q_text}\n\n"
             "Составь ТОЛЬКО блок 'Введение' по тексту введения.\n"
-            "Нужно:\n"
-            "- Актуальность\n- Объект\n- Предмет\n- Цель\n- Задачи\n- Гипотеза\n\n"
-            "Верни строго в формате:\n"
-            "## Введение\n"
-            "**Актуальность:** ...\n"
-            "**Объект:** ...\n"
-            "**Предмет:** ...\n"
-            "**Цель:** ...\n"
-            "**Задачи:** ...\n"
-            "**Гипотеза:** ...\n"
+            "Заполни ТОЛЬКО перечисленные поля. "
+            "Если нет явной формулировки — «в тексте ВКР не найдено».\n"
+            "К каждому заполненному полю добавь короткую цитату из текста в кавычках.\n\n"
+            "Формат строго такой:\n"
+            + _intro_format_block(requested_fields)
+            + "\n"
         )
         try:
             intro_answer = chat_with_gpt(
                 [
-                    {"role": "system", "content": system_prompt},
+                    {"role": "system", "content": strict_system},
                     {"role": "assistant", "content": "[Текст введения]\n" + intro_text},
                     {"role": "user", "content": intro_user},
                 ],
-                temperature=0.2,
-                max_tokens=900,
+                temperature=0.0,
+                max_tokens=700,
             ).strip()
+            intro_answer = _sanitize_passport_block(intro_answer)
         except Exception:
             logger.exception("answer_semantic_query: intro gpt call failed")
             intro_answer = ""
 
-    # 2) Глава 1: идеи + выводы
+    ch_system = (
+        "Ты репетитор по ВКР.\n"
+        "Отвечай ТОЛЬКО по данному тексту главы.\n"
+        "Запрещено добавлять внешние факты.\n"
+        "Если в тексте главы нет выводов/идей — так и напиши: «в тексте ВКР не найдено»."
+    )
+
     ch1_answer = ""
     if ch1_text:
         ch1_user = (
             f"Вопрос студента:\n{q_text}\n\n"
             "Составь ТОЛЬКО блок 'Глава 1' по тексту главы 1.\n"
             "Нужно:\n"
-            "- Главные идеи (3–7 буллетов)\n- Выводы по главе (если есть в тексте)\n\n"
-            "Верни строго в формате:\n"
+            "- Главные идеи (3–7 буллетов)\n"
+            "- Выводы по главе (если они явно есть в тексте; иначе «в тексте ВКР не найдено»)\n\n"
+            "Формат строго такой:\n"
             "## Глава 1\n"
-            "**Главные идеи:** ...\n"
+            "**Главные идеи:**\n"
+            "- ...\n"
             "**Выводы по главе:** ...\n"
         )
         try:
             ch1_answer = chat_with_gpt(
                 [
-                    {"role": "system", "content": system_prompt},
+                    {"role": "system", "content": ch_system},
                     {"role": "assistant", "content": "[Текст главы 1]\n" + ch1_text},
                     {"role": "user", "content": ch1_user},
                 ],
-                temperature=0.2,
+                temperature=0.1,
                 max_tokens=900,
             ).strip()
         except Exception:
             logger.exception("answer_semantic_query: chapter1 gpt call failed")
             ch1_answer = ""
 
-    # 3) Глава 2: идеи + выводы
     ch2_answer = ""
     if ch2_text:
         ch2_user = (
             f"Вопрос студента:\n{q_text}\n\n"
             "Составь ТОЛЬКО блок 'Глава 2' по тексту главы 2.\n"
             "Нужно:\n"
-            "- Главные идеи (3–7 буллетов)\n- Выводы по главе (если есть в тексте)\n\n"
-            "Верни строго в формате:\n"
+            "- Главные идеи (3–7 буллетов)\n"
+            "- Выводы по главе (если они явно есть в тексте; иначе «в тексте ВКР не найдено»)\n\n"
+            "Формат строго такой:\n"
             "## Глава 2\n"
-            "**Главные идеи:** ...\n"
+            "**Главные идеи:**\n"
+            "- ...\n"
             "**Выводы по главе:** ...\n"
         )
         try:
             ch2_answer = chat_with_gpt(
                 [
-                    {"role": "system", "content": system_prompt},
+                    {"role": "system", "content": ch_system},
                     {"role": "assistant", "content": "[Текст главы 2]\n" + ch2_text},
                     {"role": "user", "content": ch2_user},
                 ],
-                temperature=0.2,
+                temperature=0.1,
                 max_tokens=900,
             ).strip()
         except Exception:
             logger.exception("answer_semantic_query: chapter2 gpt call failed")
             ch2_answer = ""
 
-    # 4) Склейка
     parts = [p for p in [intro_answer, ch1_answer, ch2_answer] if (p or "").strip()]
     if not parts:
         return None
 
     final = "\n\n".join(parts).strip()
 
-    # ✅ если семантика не дала нормальный текст — откатываемся
+    # --- Новое правило "короткий ответ допустим", если вопрос был паспортный/точечный ---
+    passport_only = (
+        has_slots
+        and not plan.slots.chapter_conclusions
+        and not want_ch1
+        and not want_ch2
+    )
+
+    if passport_only:
+        # достаточно, чтобы в финале были хотя бы запрошенные поля (или "не найдено")
+        need_any = any(f"**{f}:" in final for f in requested_fields) if requested_fields else False
+        if need_any and len(final) >= 120:
+            return final
+        # иначе — пусть падает в legacy/RAG
+        logger.info("answer_semantic_query: passport_only too weak -> fallback legacy (len=%s)", len(final))
+        return None
+
+    # для “репетиторского” режима с главами оставляем более высокий порог
     if len(final) < 400:
         logger.info("answer_semantic_query: final too short -> fallback legacy (len=%s)", len(final))
         return None
-    
-    # 5) self-heal (один дозаказ)
-    must_have = ["## Введение", "## Глава 1", "## Глава 2"]
-    if any(k not in final for k in must_have):
+
+    must_have = []
+    if want_intro:
+        must_have.append("## Введение")
+    if want_ch1:
+        must_have.append("## Глава 1")
+    if want_ch2:
+        must_have.append("## Глава 2")
+
+    if must_have and any(k not in final for k in must_have):
         try:
             heal_user = (
                 "Ты не дописал структуру. "
-                "Дополни ТОЛЬКО отсутствующие блоки (## Введение / ## Глава 1 / ## Глава 2) "
-                "и внутри них отсутствующие поля. Не повторяй то, что уже есть.\n\n"
+                "Дополни ТОЛЬКО отсутствующие блоки/поля. Не повторяй то, что уже есть.\n"
+                "Правила: никаких домыслов, если нет формулировки в тексте — «в тексте ВКР не найдено».\n\n"
                 "Вот текущий ответ:\n" + final
             )
 
@@ -678,15 +802,16 @@ async def answer_semantic_query(
 
             extra = chat_with_gpt(
                 [
-                    {"role": "system", "content": system_prompt},
+                    {"role": "system", "content": strict_system},
                     {"role": "assistant", "content": heal_ctx.strip()[:20000]},
                     {"role": "user", "content": heal_user},
                 ],
-                temperature=0.2,
+                temperature=0.0,
                 max_tokens=900,
             ).strip()
 
             if extra:
+                extra = _sanitize_passport_block(extra)
                 final = final.rstrip() + "\n\n" + extra
         except Exception:
             logger.exception("answer_semantic_query: self-heal failed")

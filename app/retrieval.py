@@ -2,6 +2,7 @@
 import re
 import json
 import numpy as np
+from .config import Cfg
 from typing import Optional, List, Dict, Tuple, Any
 from .db import get_conn, get_figures_for_doc
 from .polza_client import embeddings, vision_describe  # эмбеддинги + vision
@@ -414,23 +415,24 @@ def retrieve(
       - перед обычным семантическим поиском пробуем подтянуть «специальные» источники
         (таблицы/рисунки) через _inject_special_sources_for_item();
       - дедуплицируем по id (int/str) безопасно.
+
+    STRICT (новое поведение):
+      - отсекаем слишком слабые совпадения, чтобы не подсовывать модели “шум”.
+      - если всё слабое и нет special — возвращаем [].
     """
 
     def _norm_id(x: Any) -> Optional[Any]:
         """Нормализуем id для used_ids: int если похоже на число, иначе оставляем как есть."""
         if x is None:
             return None
-        # если это уже int — отлично
         if isinstance(x, int):
             return x
-        # если строка/число-подобное — пробуем int
         try:
             s = str(x).strip()
             if s == "":
                 return None
             return int(s)
         except Exception:
-            # строка тоже hashable
             return x
 
     def _attrs_as_dict(m: Dict[str, Any]) -> Dict[str, Any]:
@@ -450,10 +452,12 @@ def retrieve(
         if not role:
             return True
         a = _attrs_as_dict(meta_or_item)
-        # если attrs пустой — считаем, что роль проверить нельзя → НЕ берём при role-фильтре
         if not a:
             return False
         return (a.get("role") or "") == role
+
+    # ✅ Порог “минимально полезного” совпадения. Можно вынести в конфиг.
+    MIN_SCORE = float(getattr(Cfg, "RETRIEVE_MIN_SCORE", 0.24))
 
     # 🔧 Авто-увеличение top_k для длинных/составных запросов
     q_norm = (query or "").strip()
@@ -475,7 +479,7 @@ def retrieve(
     special: List[Dict[str, Any]] = _inject_special_sources_for_item(
         pack,
         query,
-        used_ids,     # ✅ даём общий used_ids
+        used_ids,
         doc_id=doc_id,
     ) or []
 
@@ -494,7 +498,7 @@ def retrieve(
     if not rescored and not special:
         return []
 
-    # 3) Пред-фильтрация результата семантики (источники/роль)
+    # 3) Пред-фильтрация результата семантики (источники/роль + слабые совпадения)
     sig = _query_signals(query)
     filtered: List[Tuple[int, float]] = []
 
@@ -504,16 +508,22 @@ def retrieve(
 
         mi = pack["meta"][int(i)]
 
-        # скрываем references, если их не просили
         if (not sig["ask_sources"]) and _chunk_type(mi) == "reference":
             continue
 
-        # фильтр по роли
         if role and not _role_ok(mi):
+            continue
+
+        if float(sc) < MIN_SCORE:
             continue
 
         filtered.append((int(i), float(sc)))
 
+    # если всё отфильтровали и нет special — значит релевантного контекста нет
+    if not filtered and not special:
+        return []
+
+    # если special есть — оставляем возможность вернуть его даже без семантики
     best = (filtered or [(int(i), float(sc)) for i, sc in rescored])[: max(top_k, 1)]
 
     out: List[Dict] = []
@@ -552,12 +562,14 @@ def retrieve(
         if len(out) >= top_k:
             break
 
+        if float(sc) < MIN_SCORE:
+            continue
+
         m = pack["meta"][int(i)]
         mid_norm = _norm_id(m.get("id"))
         if mid_norm is not None and mid_norm in used_ids:
             continue
 
-        # на всякий случай ещё раз роль
         if role and not _role_ok(m):
             continue
 
@@ -568,8 +580,6 @@ def retrieve(
                 "section_path": m.get("section_path"),
                 "text": (m.get("text") or "").strip(),
                 "score": float(sc),
-                # attrs не возвращаем наружу — но если тебе нужно для дебага, можно добавить:
-                # "attrs": _attrs_as_dict(m),
             }
         )
         if mid_norm is not None:
@@ -722,7 +732,8 @@ def _chart_rows_from_attrs(attrs: str | dict | None) -> list[dict] | None:
 
 def _format_chart_values(rows: list[dict]) -> str:
     """
-    Формирует человекочитаемые строки значений диаграммы из нормализованных rows.
+    Формирует человекочитаемые строки значений диаграммы из rows.
+    ВАЖНО: не выводим "пустые" значения (например, просто "%"), чтобы не создавать ощущение выдумок.
     """
     def _fmt_percent(v: float) -> str:
         if abs(v - round(v)) < 0.05:
@@ -732,6 +743,17 @@ def _format_chart_values(rows: list[dict]) -> str:
 
     def _fmt_number(v: float) -> str:
         return f"{v:.6g}"
+
+    def _is_empty_value_string(s: str) -> bool:
+        # считаем мусором: "", "%", "—", "-", "нет", "n/a" (можно расширять)
+        t = (s or "").strip()
+        if not t:
+            return True
+        if t in {"%", "-", "—"}:
+            return True
+        if t.lower() in {"n/a", "na", "нет", "нет данных"}:
+            return True
+        return False
 
     lines: list[str] = []
 
@@ -750,36 +772,52 @@ def _format_chart_values(rows: list[dict]) -> str:
 
         unit = r.get("unit")
         value = r.get("value")
+
         num_val: float | None = None
         if isinstance(value, (int, float)):
             num_val = float(value)
 
         vstr = ""
-        if raw:
+
+        # 1) Если есть raw — показываем его как есть (это "как в документе")
+        # НО: если raw фактически пустой/мусорный ("%") — игнорируем
+        if raw and not _is_empty_value_string(raw):
+            # если unit == "%" и raw без %, а num_val есть — можно отформатировать числом
+            # но не заменяем raw, если он уже выглядит "как в документе"
             if unit == "%" and "%" not in raw and isinstance(num_val, float):
                 vstr = _fmt_percent(num_val)
             else:
                 vstr = raw
+
+        # 2) Иначе пробуем числовое value
         elif isinstance(num_val, float):
             if unit == "%":
                 vstr = _fmt_percent(num_val)
             else:
                 vstr = _fmt_number(num_val)
+
+        # 3) Иначе берём "другое" значение (строковое), но опять же фильтруем мусор
         else:
             other = r.get("value")
-            vstr = str(other) if other is not None else ""
+            if other is not None:
+                v = str(other).strip()
+                if not _is_empty_value_string(v):
+                    vstr = v
 
-        if not lab and not vstr:
+        # если значения нет — лучше НЕ выводить строку вообще
+        if not vstr:
+            # можно оставить только label без значения, но это обычно бесполезно и путает
+            # поэтому пропускаем
             continue
 
+        # суффикс единицы добавляем только если это не проценты (проценты уже в vstr)
         unit_suffix = ""
         if isinstance(unit, str) and unit.strip() and unit.strip() != "%":
             unit_suffix = f" {unit.strip()}"
 
-        if lab and vstr:
+        # label обязателен для понятной строки; если нет label — просто значение
+        if lab:
             line = f"— {lab}: {vstr}{unit_suffix}"
-        elif lab:
-            line = f"— {lab}"
         else:
             line = f"— {vstr}{unit_suffix}"
 
@@ -795,24 +833,53 @@ def retrieve_in_area(owner_id: int, doc_id: int, query: str, section_prefix: str
 def build_context(snippets: List[Dict], max_chars: int = 6000) -> str:
     """
     Склеиваем контекст, предварительно очищая служебные метки и нормализуя пробелы/тире.
-    Страницы/разделы не вставляем — только чистый текст.
+    STRICT: добавляем метки источников [S# ...] к каждому фрагменту, чтобы модель могла ссылаться
+    и чтобы можно было валидировать "строго по документу".
     """
     parts: List[str] = []
     total = 0
+    idx = 0
+
     for s in snippets:
         raw = (s.get("text") or "")
         block = _clean_for_ctx(raw)
         if not block:
             continue
-        if total + len(block) > max_chars:
+
+        idx += 1
+
+        # собираем максимально полезную привязку, но без лишнего мусора
+        spath = (s.get("section_path") or "").strip()
+        page = s.get("page")
+        sid = s.get("id")
+
+        meta_bits: List[str] = []
+        if page is not None:
+            meta_bits.append(f"стр.{page}")
+        if spath:
+            meta_bits.append(spath)
+        if sid:
+            meta_bits.append(f"id={sid}")
+
+        meta = " | ".join(meta_bits)
+        prefix = f"[S{idx}" + (f" {meta}" if meta else "") + "] "
+
+        # учитываем лимит по символам с учётом префикса
+        if total + len(prefix) + len(block) > max_chars:
             remaining = max_chars - total
             if remaining <= 0:
                 break
-            block = block[:remaining]
-        parts.append(block)
-        total += len(block)
+            # оставляем место под prefix, иначе получится обрезанный маркер
+            if remaining <= len(prefix):
+                break
+            block = block[: remaining - len(prefix)]
+
+        parts.append(prefix + block)
+        total += len(prefix) + len(block)
+
         if total >= max_chars:
             break
+
     return "\n\n".join(parts)
 
 def invalidate_cache(owner_id: int, doc_id: int):
@@ -1214,14 +1281,14 @@ def get_area_text(
     #    Если нет "паспорта" (объект/предмет/цель/задачи/гипотеза) → идём в fallback.
     if r == "intro":
         low = (text_by_role or "").lower()
-        passport_markers = [
-            "объект исследования",
-            "предмет исследования",
-            "цель исследования",
-            "задач",      # ловит "задачи исследования"
-            "гипотез",    # ловит "гипотеза/гипотезы"
+        passport_markers_re = [
+            r"\bобъект\w*\s+исслед\w*\b",
+            r"\bпредмет\w*\s+исслед\w*\b",
+            r"\bцель\w*\s+(исслед\w*|работ\w*)\b",
+            r"\bзадач\w*\s+(исслед\w*|работ\w*)\b",
+            r"\bгипотез\w*\b",
         ]
-        hits = sum(m in low for m in passport_markers)
+        hits = sum(bool(re.search(p, low)) for p in passport_markers_re)
 
         # если введение похоже на настоящее (есть хотя бы 2 маркера) — возвращаем
         if len(text_by_role) >= 1200 and hits >= 2:
@@ -1338,28 +1405,53 @@ def get_area_text(
     # Вычисляем диапазон по заголовкам (а не по любым совпадениям в тексте)
 
     if r == "intro":
-        # 1) найдём первую "ГЛАВА 1" как заголовок
-        end_id = _find_heading_id_first(["ГЛАВА 1", "ГЛАВА I"], after_id=None)
-        if end_id is None:
-            con.close()
-            return text_by_role
+        toc_id = _find_heading_id_first(["СОДЕРЖАНИЕ", "ОГЛАВЛЕНИЕ"], after_id=None)
 
-        # 2) возьмём ПОСЛЕДНИЙ "ВВЕДЕНИЕ" как заголовок перед главой 1
-        # 0) попробуем найти СОДЕРЖАНИЕ / ОГЛАВЛЕНИЕ
-        toc_id = _find_heading_id_first(
-            ["СОДЕРЖАНИЕ", "ОГЛАВЛЕНИЕ"],
-            after_id=None,
-        )
-
-        # 1) ищем ПЕРВОЕ реальное "ВВЕДЕНИЕ" ПОСЛЕ содержания
-        start_id = _find_heading_id_first(
-            ["ВВЕДЕНИЕ"],
-            after_id=toc_id if toc_id is not None else None,
-        )
-
+        # Ищем кандидат "ВВЕДЕНИЕ" после оглавления, но если это оказалось оглавлением (частый кейс),
+        # переходим к следующему совпадению.
+        start_id = _find_heading_id_first(["ВВЕДЕНИЕ"], after_id=toc_id if toc_id is not None else None)
         if start_id is None:
             con.close()
             return text_by_role
+
+        # Пропуск "введение" из оглавления: если рядом нет паспорта, ищем следующее "ВВЕДЕНИЕ"
+        def _intro_candidate_looks_real(h_id: int) -> bool:
+            try:
+                cur.execute(
+                    """
+                    SELECT text
+                    FROM chunks
+                    WHERE owner_id=? AND doc_id=?
+                    AND id >= ? AND id < ?
+                    ORDER BY id ASC
+                    """,
+                    (owner_id, doc_id, h_id, h_id + 250),
+                )
+                window = "\n".join((r[0] if not isinstance(r, dict) else r.get("text","")) for r in cur.fetchall())
+            except Exception:
+                return True  # если не можем проверить — не блокируем
+
+            low = (window or "").lower()
+            # хотя бы один маркер “паспорта” рядом
+            return (
+                re.search(r"\bобъект\w*\s+исслед\w*\b", low) is not None
+                or re.search(r"\bпредмет\w*\s+исслед\w*\b", low) is not None
+                or re.search(r"\bцель\w*\s+(исслед\w*|работ\w*)\b", low) is not None
+                or re.search(r"\bзадач\w*\s+(исслед\w*|работ\w*)\b", low) is not None
+            )
+
+        if toc_id is not None and not _intro_candidate_looks_real(start_id):
+            # ищем следующее "ВВЕДЕНИЕ" после текущего
+            nxt = _find_heading_id_first(["ВВЕДЕНИЕ"], after_id=start_id)
+            if nxt is not None:
+                start_id = nxt
+
+        # end_id ищем ПОСЛЕ start_id, чтобы не поймать оглавление/ранний “ГЛАВА 1”
+        end_id = _find_heading_id_first(["ГЛАВА 1", "ГЛАВА I"], after_id=start_id)
+        if end_id is None:
+            end_id = start_id + 10_000_000
+
+        logger.info("get_area_text fallback role=%s: start_id=%s end_id=%s", r, start_id, end_id)
 
 
     elif r == "chapter_1":
@@ -1449,17 +1541,6 @@ def get_area_text(
 
         # если оба плохие — всё равно вернём range (он обычно шире)
         return text_by_range or text_by_role
-
-    if r == "intro":
-        low_role = (text_by_role or "").lower()
-        low_range = (text_by_range or "").lower()
-
-        markers = ["объект", "предмет", "цель", "задач", "гипотез"]
-        hits_role = sum(m in low_role for m in markers)
-        hits_range = sum(m in low_range for m in markers)
-
-        if hits_range >= hits_role and len(text_by_range) >= 800:
-            return text_by_range
 
     # для остальных — как было
     if len(text_by_range) > len(text_by_role):
@@ -2352,12 +2433,38 @@ def get_table_context_for_numbers(
     used_ids: set[int] = set()
     snippets: List[Dict[str, Any]] = []
 
+    def _etype(ch: Dict[str, Any]) -> str:
+        return (ch.get("element_type") or ch.get("type") or ch.get("kind") or "").strip().lower()
+
+    def _text(ch: Dict[str, Any]) -> str:
+        return (ch.get("text") or "").strip()
+
     for raw in numbers:
         num = _num_norm(str(raw))
         if not num:
             continue
 
         bases = _find_table_bases_by_number(pack, num)
+
+        # ✅ Fallback: если базы не нашлись, но в документе есть "table"-чанки,
+        # которые явно содержат "Таблица <num>" в тексте — добавим их в контекст.
+        if not bases:
+            try:
+                ru_pat = re.compile(
+                    rf"(?i)\b(?:таблица|табл\.)\s*№?\s*{re.escape(num)}(?!\d)"
+                )
+                for ch in (pack.get("meta") or []):
+                    if _etype(ch) != "table":
+                        continue
+                    if ru_pat.search(_text(ch) or ""):
+                        cid = int(ch.get("id") or 0)
+                        if cid and cid not in used_ids:
+                            snippets.append(ch)
+                            used_ids.add(cid)
+            except Exception:
+                pass
+
+        # Обычный путь по base/rows
         for base in bases:
             chunks = _gather_table_chunks_for_base(
                 pack,
@@ -2732,6 +2839,8 @@ def retrieve_coverage(
         "by_item": {"1":[...], "2":[...], ...},
         "by": {"1":[idx, ...], ...},          # карта: подпункт -> индексы в snippets (для bot.py)
         "snippets": [...],
+        "max_score": float,                  # NEW: максимальный score в snippets (если есть)
+        "strong_hits": int,                  # NEW: сколько snippets со score >= RETRIEVE_MIN_SCORE
       }
 
     subitems может быть:
@@ -2739,42 +2848,60 @@ def retrieve_coverage(
       - списком словарей из intents.detect_intents():
         [{"id": 1, "ask": "...", ...}, ...].
     """
-    # Если subitems не передан, пытаемся сами распланировать подпункты
     if subitems is None:
         items_list: List[str] = list(plan_subitems(question)) if question else []
         items_norm = [{"id": i + 1, "ask": it} for i, it in enumerate(items_list)]
     else:
-        # subitems передан явно: может быть list[str] или list[dict]
         if subitems and isinstance(subitems[0], dict):
-            # Формат из intents.detect_intents(): уже есть id и ask
             items_norm = []
             items_list = []
             for it in subitems:
                 ask = (it.get("ask") or "").strip()
                 if not ask:
                     continue
-                # если id уже есть — используем его, иначе пронумеруем позже
-                items_norm.append({"id": it.get("id"), "ask": ask, **{k: v for k, v in it.items() if k not in {"id", "ask"}}})
+                items_norm.append(
+                    {
+                        "id": it.get("id"),
+                        "ask": ask,
+                        **{k: v for k, v in it.items() if k not in {"id", "ask"}},
+                    }
+                )
                 items_list.append(ask)
-            # Пронумеруем те элементы, у кого id отсутствует
             next_id = 1
             for it in items_norm:
                 if it.get("id") is None:
                     it["id"] = next_id
                     next_id += 1
         else:
-            # Старый формат: список строк
             items_list = [str(it or "").strip() for it in subitems if str(it or "").strip()]
             items_norm = [{"id": i + 1, "ask": it} for i, it in enumerate(items_list)]
 
+    min_score = float(getattr(Cfg, "RETRIEVE_MIN_SCORE", 0.24))
+
     if not items_list:
-        # Если подпункты не распознаны — обычный retrieve с небольшим расширением k
         base = retrieve(owner_id, doc_id, question, top_k=max(10, backfill_k * 2))
+
+        max_score = 0.0
+        strong = 0
+        for s in base or []:
+            try:
+                sc = float(s.get("score") or 0.0)
+            except Exception:
+                sc = 0.0
+            if sc > max_score:
+                max_score = sc
+            if sc >= min_score:
+                strong += 1
+
         by_indices = {"_single": list(range(len(base)))}
-        return {"items": [], "by_item": {"_single": base}, "by": by_indices, "snippets": base}
-
-    # ниже оставляем существующую логику как есть
-
+        return {
+            "items": [],
+            "by_item": {"_single": base},
+            "by": by_indices,
+            "snippets": base,
+            "max_score": max_score,
+            "strong_hits": strong,
+        }
 
     if items_list:
         by_item = retrieve_for_items(
@@ -2787,7 +2914,6 @@ def retrieve_coverage(
             backfill_k=backfill_k,
         )
 
-        # round-robin порядок: 1-й из каждого подпункта, затем 2-й и т.д.
         buckets = [by_item.get(str(i + 1), []) for i in range(len(items_list))]
         merged: List[Dict] = []
         for r in range(per_item_k):
@@ -2795,57 +2921,87 @@ def retrieve_coverage(
                 if r < len(b):
                     merged.append(b[r])
 
-        # Для подпунктов вида «дай все значения» — добавляем ОСТАЛЬНЫЕ строчки их bucket
         for i, ask in enumerate(items_list, start=1):
             if _wants_all_values(ask):
                 bucket = by_item.get(str(i), [])
                 if len(bucket) > per_item_k:
                     merged.extend(bucket[per_item_k:])
 
-        # добавим backfill в конце
         if by_item.get("_backfill"):
             merged.extend(by_item["_backfill"])
 
-        # Построим карту индексов для bot.py: { "1": [indices in merged], ... }
         by_indices: Dict[str, List[int]] = {}
         for idx, sn in enumerate(merged):
             fid = sn.get("for_item")
             if fid:
                 by_indices.setdefault(str(fid), []).append(idx)
 
-        return {"items": items_norm, "by_item": by_item, "by": by_indices, "snippets": merged}
+        max_score = 0.0
+        strong = 0
+        for s in merged or []:
+            try:
+                sc = float(s.get("score") or 0.0)
+            except Exception:
+                sc = 0.0
+            if sc > max_score:
+                max_score = sc
+            if sc >= min_score:
+                strong += 1
 
-    # Если подпункты не распознаны — обычный retrieve с небольшим расширением k
+        return {
+            "items": items_norm,
+            "by_item": by_item,
+            "by": by_indices,
+            "snippets": merged,
+            "max_score": max_score,
+            "strong_hits": strong,
+        }
+
     base = retrieve(owner_id, doc_id, question, top_k=max(10, backfill_k * 2))
-    # Единый «by» для удобства: вся выдача принадлежит "_single"
+
+    max_score = 0.0
+    strong = 0
+    for s in base or []:
+        try:
+            sc = float(s.get("score") or 0.0)
+        except Exception:
+            sc = 0.0
+        if sc > max_score:
+            max_score = sc
+        if sc >= min_score:
+            strong += 1
+
     by_indices = {"_single": list(range(len(base)))}
-    return {"items": [], "by_item": {"_single": base}, "by": by_indices, "snippets": base}
+    return {
+        "items": [],
+        "by_item": {"_single": base},
+        "by": by_indices,
+        "snippets": base,
+        "max_score": max_score,
+        "strong_hits": strong,
+    }
+
 
 def build_context_coverage(
     snippets: List[Dict],
-    * ,
+    *,
     items_count: Optional[int] = None,
     base_chars: int = 6000,
     per_item_bonus: int = 900,
     hard_limit: int = 18000,
 ) -> str:
     """
-    Адаптивная сборка контекста под многопунктные вопросы:
-      - итоговый лимит = base_chars + per_item_bonus*(items_count-1), но не больше hard_limit;
-      - тексты склеиваются в round-robin порядке по подпунктам (если есть for_item),
-        чтобы каждый подпункт появился в начале контекста хотя бы раз.
-      - удаляются дубликаты (по id/section_path/тексту).
+    Адаптивная сборка контекста под многопунктные вопросы (round-robin по for_item).
+    STRICT: добавляем метки источников [S# ...] к каждому фрагменту.
     """
     if not snippets:
         return ""
 
-    # Считаем количество подпунктов из меток for_item, если явно не задано
     if items_count is None:
         items_count = len({s.get("for_item") for s in snippets if s.get("for_item")}) or 1
 
     max_chars = min(hard_limit, int(base_chars + max(0, items_count - 1) * per_item_bonus))
 
-    # Группировка по подпунктам
     groups: Dict[str, List[Dict]] = {}
     extras: List[Dict] = []
     for s in snippets:
@@ -2855,7 +3011,6 @@ def build_context_coverage(
         else:
             extras.append(s)
 
-    # round-robin
     ordered: List[Dict] = []
     if groups:
         keys = sorted(groups.keys(), key=lambda x: (len(x), x))
@@ -2873,11 +3028,12 @@ def build_context_coverage(
     else:
         ordered = snippets[:]
 
-    # дедуп по id/section_path/тексту
     seen_ids: set[int] = set()
     seen_keys: set[str] = set()
     parts: List[str] = []
     total = 0
+    idx = 0
+
     for s in ordered:
         sid = s.get("id")
         spath = (s.get("section_path") or "").strip()
@@ -2886,20 +3042,44 @@ def build_context_coverage(
         if not block:
             continue
 
+        # ✅ отсечём обрывки (часто заголовки/мусор)
+        if len(block) < 80:
+            continue
+
         k = f"{sid or 0}|{spath}|{hash(block)}"
         if sid and sid in seen_ids:
             continue
         if k in seen_keys:
             continue
 
-        if total + len(block) > max_chars:
+        idx += 1
+        page = s.get("page")
+        fid = s.get("for_item")
+
+        meta_bits: List[str] = []
+        if fid:
+            meta_bits.append(f"item={fid}")
+        if page is not None:
+            meta_bits.append(f"стр.{page}")
+        if spath:
+            meta_bits.append(spath)
+        if sid:
+            meta_bits.append(f"id={sid}")
+
+        meta = " | ".join(meta_bits)
+        prefix = f"[S{idx}" + (f" {meta}" if meta else "") + "] "
+
+        if total + len(prefix) + len(block) > max_chars:
             remaining = max_chars - total
             if remaining <= 0:
                 break
-            block = block[:remaining]
+            if remaining <= len(prefix):
+                break
+            block = block[: remaining - len(prefix)]
 
-        parts.append(block)
-        total += len(block)
+        parts.append(prefix + block)
+        total += len(prefix) + len(block)
+
         if sid:
             seen_ids.add(sid)
         seen_keys.add(k)

@@ -22,3 +22,4 @@ docx2pdf>=0.1.8; sys_platform == "win32" or sys_platform == "darwin"
 
 # Только для Windows (MS Word COM, опционально)
 pywin32; sys_platform == "win32"
+

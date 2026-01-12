@@ -78,7 +78,11 @@ class Cfg:
         os.getenv("POLZA_MODEL"),
         os.getenv("MODEL_CHAT"),
     ]
-    POLZA_CHAT: str = next((c for c in _CHAT_CANDIDATES if c and c.strip()), "openai/gpt-5")
+    POLZA_CHAT: str = next(
+        (c for c in _CHAT_CANDIDATES if c and c.strip()),
+        "openai/gpt-5-mini"
+    )
+    POLZA_MODEL: str = POLZA_CHAT
 
     #   POLZA_VISION_MODEL | MODEL_VISION | <fallback: POLZA_CHAT>
     _VISION_CANDIDATES = [
@@ -100,7 +104,6 @@ class Cfg:
     # =========================
     # Включает подачу изображений напрямую в чат-модель (b64/url/file).
     VISION_ENABLED: bool = _env_bool("VISION_ENABLED", True)
-    POLZA_VISION_MODEL: str = os.getenv("POLZA_VISION_MODEL", "openai/gpt-5")
 
     # Базовый язык ответов vision-пайплайна (используется как запасной)
     VISION_LANG: str = _env_str("VISION_LANG", "ru")
@@ -508,7 +511,7 @@ class Cfg:
 
         # Backward-compat alias (если где-то обращались к старому опечатанному имени)
         # MSG_NOT_READY_QUEУED — с русской буквой 'У'
-        setattr(cls, "MSG_NOT_READY_QUEУЕД", cls.MSG_NOT_READY_QUEUED)
+        setattr(cls, "MSG_NOT_READY_QUEУED", cls.MSG_NOT_READY_QUEUED)
 
     @classmethod
     def fullread_enabled(cls) -> bool:
@@ -525,13 +528,7 @@ class Cfg:
 
     @classmethod
     def vision_model(cls) -> str:
-        """Модель, которую polza_client будет использовать для image_url."""
-        return cls.POLZA_VISION_MODEL or cls.POLZA_CHAT
-
-    @classmethod
-    def vision_model(cls) -> str:
-        """Выбор модели для мультимодального чата (с запасным вариантом)."""
-        return cls.POLZA_VISION_MODEL or cls.POLZA_CHAT
+        return cls.POLZA_VISION_MODEL
 
     @classmethod
     def is_image_ext_allowed(cls, ext: str | None) -> bool:

@@ -403,40 +403,61 @@ def _classify_item(text: str) -> Dict[str, any]:
 
 def detect_intents(text: str, *, list_limit: int = 25) -> Dict:
     """
-    Возвращает структуру намерений:
-    {
-      "language": "ru" | "en",
-    "tables":  {
-         "want": bool, "count": bool, "list": bool,
-         "describe": [str], "limit": int,
-         "include_all_values": bool, "rows_limit": int|None,
-         "section_hints": [str],
-         "from_section": bool,
-         "single_only": bool,   # одна конкретная таблица (например, "таблица 2.2")
-         "exact_numbers": bool, # нужны точные числа/формат как в документе
-      },
-
-      "figures": {
-         "want": bool, "count": bool, "list": bool,
-         "describe": [str], "limit": int, "want_vision": bool,
-         "section_hints": [str], "from_section": bool
-      },
-      "sources": {"want": bool, "count": bool, "list": bool, "limit": int},
-      "summary": bool,
-      "practical": bool,
-      "gost": bool,
-      "exact_numbers": bool,
-      "want_links": bool,
-      "general_question": str,
-      "subitems": [{"id": int, "ask": str, ... модальные подсказки ...}],
-      "multi_want": bool
-    }
+    Возвращает структуру намерений.
+    STRICT-режим (новая логика):
+      - добавляем strict_doc_only: модель должна отвечать только по документу;
+      - добавляем must_quote для "опасных" вопросов (объект/предмет/цель/задачи/актуальность/новизна и т.п.),
+        чтобы пайплайн требовал явного фрагмента из документа.
+      - добавляем doc_anchors: якорные фразы для точного поиска по документу.
     """
     q = (text or "").strip()
     lang = _language_guess(q)
 
+    # --- эвристика для "опасных" вопросов, где модель чаще всего отвечает учебником ---
+    must_quote = False
+    doc_anchors: List[str] = []
+
+    q_low = q.lower()
+
+    # ключевые поля ВКР (обычно во "Введении")
+    # если запрос похож на такие поля — требуем явный фрагмент из текста
+    if re.search(
+        r"\b(объект(ом)? исследования|предмет(ом)? исследования|цель(ю)? (работы|исследования)|"
+        r"задач(и|ами) (работы|исследования)|актуальност(ь|и)|научн(ая|ую) новизн(а|у)|"
+        r"практическ(ая|ую) значимост(ь|и)|гипотез(а|ы)|метод(ы|ика) исследования|"
+        r"теоретическ(ая|ую) основ(а|у)|информационн(ая|ую) баз(а|у))\b",
+        q_low,
+        re.IGNORECASE,
+    ):
+        must_quote = True
+        doc_anchors = [
+            "Объект исследования",
+            "Предмет исследования",
+            "Цель работы",
+            "Цель исследования",
+            "Задачи исследования",
+            "Актуальность",
+            "Научная новизна",
+            "Практическая значимость",
+            "Гипотеза",
+            "Методы исследования",
+            "Теоретическая основа",
+            "Информационная база",
+            "Введение",
+        ]
+
     intents: Dict = {
         "language": lang,
+
+        # ✅ глобальный переключатель: работаем только по документу
+        "strict_doc_only": True,
+
+        # ✅ для "опасных" вопросов: требуем явную цитату/фрагмент
+        "must_quote": bool(must_quote),
+
+        # ✅ якоря для точного поиска в документе (можно использовать в bot.py/retrieval)
+        "doc_anchors": list(doc_anchors),
+
         "tables":  {
             "want": False,
             "count": False,
@@ -447,8 +468,8 @@ def detect_intents(text: str, *, list_limit: int = 25) -> Dict:
             "rows_limit": None,
             "section_hints": [],
             "from_section": False,
-            "single_only": False,   # одна конкретная таблица
-            "exact_numbers": False, # нужны точные числа/формат
+            "single_only": False,
+            "exact_numbers": False,
         },
 
         "figures": {
@@ -460,8 +481,8 @@ def detect_intents(text: str, *, list_limit: int = 25) -> Dict:
             "want_vision": False,
             "section_hints": [],
             "from_section": False,
-            "single_only": False,   # NEW: фокус на одном рисунке
-            "exact_numbers": False, # NEW: нужны исходные числа для него
+            "single_only": False,
+            "exact_numbers": False,
         },
         "sources": {"want": False, "count": False, "list": False, "limit": int(list_limit)},
         "summary": is_summary_intent(q),
@@ -474,7 +495,6 @@ def detect_intents(text: str, *, list_limit: int = 25) -> Dict:
         "multi_want": False,
         "id_specific": None,
 
-        # Унифицированный список целей: чем именно интересуется пользователь
         "targets": {
             "tables": [],
             "figures": [],
@@ -482,7 +502,7 @@ def detect_intents(text: str, *, list_limit: int = 25) -> Dict:
         },
     }
 
-    # ---- Многочастные запросы (план подпунктов — на будущее для пайплайна)
+    # ---- Многочастные запросы (план подпунктов)
     subparts = _split_into_subitems(q)
     if len(subparts) >= 2:
         intents["multi_want"] = True
@@ -492,20 +512,16 @@ def detect_intents(text: str, *, list_limit: int = 25) -> Dict:
             if not isinstance(cls, dict):
                 cls = {"ask": sp}
 
-            # определяем id_specific для этого подпункта
             candidates = []
 
-            # таблица
             t_info = cls.get("tables") or {}
             if t_info.get("single_only") and t_info.get("describe"):
                 candidates.append(("table", t_info["describe"][0]))
 
-            # рисунок
             f_info = cls.get("figures") or {}
             if f_info.get("single_only") and f_info.get("describe"):
                 candidates.append(("figure", f_info["describe"][0]))
 
-            # секция/глава
             s_info = cls.get("section") or {}
             if s_info.get("single_only") and s_info.get("hints"):
                 candidates.append(("section", s_info["hints"][0]))
@@ -514,12 +530,40 @@ def detect_intents(text: str, *, list_limit: int = 25) -> Dict:
                 kind, num = candidates[0]
                 cls["id_specific"] = {"kind": kind, "num": num}
             else:
-                # либо несколько объектов в подпункте, либо ни одного — ID-режим для него отключаем
                 cls["id_specific"] = None
+
+            # ✅ пробросим строгие флаги в подпункт (полезно для пайплайна)
+            sp_low = (sp or "").lower()
+            if re.search(
+                r"\b(объект(ом)? исследования|предмет(ом)? исследования|цель(ю)? (работы|исследования)|"
+                r"задач(и|ами) (работы|исследования)|актуальност(ь|и)|научн(ая|ую) новизн(а|у)|"
+                r"практическ(ая|ую) значимост(ь|и)|гипотез(а|ы)|метод(ы|ика) исследования|"
+                r"теоретическ(ая|ую) основ(а|у)|информационн(ая|ую) баз(а|у))\b",
+                sp_low,
+                re.IGNORECASE,
+            ):
+                cls["must_quote"] = True
+                cls["doc_anchors"] = [
+                    "Объект исследования",
+                    "Предмет исследования",
+                    "Цель работы",
+                    "Цель исследования",
+                    "Задачи исследования",
+                    "Актуальность",
+                    "Научная новизна",
+                    "Практическая значимость",
+                    "Гипотеза",
+                    "Методы исследования",
+                    "Теоретическая основа",
+                    "Информационная база",
+                    "Введение",
+                ]
+            else:
+                cls["must_quote"] = False
+                cls["doc_anchors"] = []
 
             cls["id"] = i
             intents["subitems"].append(cls)
-
 
     # --- Таблицы (общий слой)
     if TABLE_ANY_RE.search(q):
@@ -534,7 +578,6 @@ def detect_intents(text: str, *, list_limit: int = 25) -> Dict:
         if nums:
             intents["tables"]["describe"] = nums
 
-        # одна конкретная таблица: "таблица 2.2" без "сколько/какие"
         if nums and len(nums) == 1 and not intents["tables"]["list"] and not intents["tables"]["count"]:
             intents["tables"]["single_only"] = True
 
@@ -543,17 +586,13 @@ def detect_intents(text: str, *, list_limit: int = 25) -> Dict:
         if rows_limit is not None:
             intents["tables"]["rows_limit"] = int(rows_limit)
 
-        # запрос на точные числа/формат как в документе
         if EXACT_NUMBERS_RE.search(q):
             intents["tables"]["exact_numbers"] = True
 
-
-        # Подсказки, в какой главе/разделе искать таблицу
         sects = extract_section_hints(q)
         if sects:
             intents["tables"]["section_hints"] = sects
 
-        # «В (этой) главе есть таблица …» ИЛИ «таблица в главе …» — без конкретного номера
         if (not nums) and sects and (SECTION_HAS_TABLE_RE.search(q) or TABLE_IN_SECTION_RE.search(q)):
             intents["tables"]["from_section"] = True
             if rows_limit is None and not intents["tables"]["list"] and not intents["tables"]["count"]:
@@ -579,28 +618,22 @@ def detect_intents(text: str, *, list_limit: int = 25) -> Dict:
         if nums_f:
             intents["figures"]["describe"] = nums_f
 
-        # Определяем, нацелен ли вопрос на один конкретный рисунок
         if nums_f and len(nums_f) == 1 and not intents["figures"]["list"] and not intents["figures"]["count"]:
             intents["figures"]["single_only"] = True
 
         if FIG_VISION_HINT_RE.search(q):
             intents["figures"]["want_vision"] = True
 
-        # «точные числа» для фигур (например: "дай точные значения по рисунку 6")
         if EXACT_NUMBERS_RE.search(q):
             intents["figures"]["exact_numbers"] = True
 
-        # Секционные подсказки
         sects_f = extract_section_hints(q)
         if sects_f:
             intents["figures"]["section_hints"] = sects_f
 
-        # «В (этой) главе есть рисунки …» ИЛИ «рисунок(и) в главе …» — без номера
         if (not nums_f) and sects_f and (SECTION_HAS_FIG_RE.search(q) or FIG_IN_SECTION_RE.search(q)):
             intents["figures"]["from_section"] = True
 
-    # Собираем унифицированный список целей (таблицы/рисунки/главы),
-    # чтобы answer_builder мог легко понять, что запрос многотаргетный.
     intents["targets"]["tables"] = intents["tables"]["describe"][:]
     intents["targets"]["figures"] = intents["figures"]["describe"][:]
 
@@ -613,9 +646,6 @@ def detect_intents(text: str, *, list_limit: int = 25) -> Dict:
             sec_uniq.append(s)
     intents["targets"]["sections"] = sec_uniq
 
-    # Если явных подпунктов нет, но пользователь в одной фразе упомянул
-    # сразу несколько типов объектов (таблица + рисунок + глава),
-    # помечаем запрос как многотаргетный.
     if not intents["multi_want"]:
         targets_cnt = sum(
             1
@@ -629,8 +659,6 @@ def detect_intents(text: str, *, list_limit: int = 25) -> Dict:
         if targets_cnt >= 2:
             intents["multi_want"] = True
 
-    # Если запрос многочастный, не используем глобальный single_only для ID-режима —
-    # ID-таргеты берём только из subitems[i]["id_specific"]
     if intents["multi_want"]:
         intents["tables"]["single_only"] = False
         intents["figures"]["single_only"] = False

@@ -239,14 +239,11 @@ def extract_struct_refs(question: str) -> list[dict]:
     Поддерживает перечисления вида:
       - "рисунки 2.1 и 2.2"
       - "таблицы 1.1, 1.2, 1.3"
-    Возвращает список словарей:
-      {"kind": "table"|"figure"|"chapter", "num": "2.1", "raw": "таблицу 2.1, 2.2 и 2.3"}
     """
     result: list[dict] = []
     if not question:
         return result
 
-    # чтобы не плодить дубли
     seen: set[tuple[str, str]] = set()
 
     for m in _STRUCT_REF_RE.finditer(question):
@@ -259,14 +256,12 @@ def extract_struct_refs(question: str) -> list[dict]:
         elif kw.startswith(("рис", "fig", "figure")):
             kind = "figure"
         else:
-            # глава / раздел / chapter / section
             kind = "chapter"
 
         def _add_num(num_str: str) -> None:
             n = (num_str or "").strip()
             if not n:
                 return
-            # нормализация: убираем пробелы и заменяем запятую на точку
             n = n.replace(" ", "").replace(",", ".")
             key = (kind, n)
             if not n or key in seen:
@@ -274,13 +269,27 @@ def extract_struct_refs(question: str) -> list[dict]:
             seen.add(key)
             result.append({"kind": kind, "num": n, "raw": raw})
 
-        # 1) первый номер из самого матча
         if first_num:
             _add_num(first_num)
 
-        # 2) все последующие номера после матча:
-        #    "рисунки 2.2, 2.3 и 2.4"
         tail = question[m.end():]
+
+        # ✅ режем до конца предложения/строки (минимизируем подсасывание лишних чисел)
+        cut = len(tail)
+        for sep in ("\n", ".", "?", "!", "—"):
+            p = tail.find(sep)
+            if p != -1:
+                cut = min(cut, p)
+        tail = tail[:cut]
+
+        # ✅ доп.страховка: ограничение длины
+        tail = tail[:200]
+
+        # ✅ если дальше начинается новый объект — режем
+        stop = re.search(r"(?i)\b(табл(?:ица)?|рис(?:унок)?|figure|fig|table|глава|раздел|chapter|section)\b", tail)
+        if stop:
+            tail = tail[:stop.start()]
+
         for mm in re.finditer(
             r"\s*(?:,|;|\s+и\s+|\s+and\s+)\s*(\d+(?:[.,]\d+)*)",
             tail,
@@ -300,21 +309,15 @@ async def _answer_structured_multi(
 ) -> bool:
     """
     Мультирежим: в вопросе одновременно упомянуты таблицы/рисунки/разделы.
-
-    В НОВОЙ версии вместо одного большого вызова GPT мы:
-      * по каждому объекту делаем отдельный GPT-разбор (как в одиночных режимах);
-      * собираем все кусочки в один текст и шлём одним сообщением.
     """
     if not refs:
         return False
 
-    # без GPT этот режим не имеет смысла
     if "chat_with_gpt" not in globals() or chat_with_gpt is None:
         return False
 
     verbosity = _detect_verbosity(q_text)
 
-    # пройдёмся по объектам в ТОМ ЖЕ ПОРЯДКЕ, как они идут в вопросе
     parts: list[str] = []
     used_tables: set[str] = set()
     used_figs: set[str] = set()
@@ -327,7 +330,6 @@ async def _answer_structured_multi(
             continue
 
         norm_num = raw_num.replace(" ", "").replace(",", ".")
-        # локальный текст запроса именно про этот объект
         raw_ref = (r.get("raw") or "").strip()
 
         # --- таблицы ---
@@ -336,9 +338,18 @@ async def _answer_structured_multi(
                 continue
             used_tables.add(norm_num)
 
-            # вместо всего q_text используем локальный саб-вопрос
+            # ЖЁСТКО: если таблицы нет — не зовём LLM
+            try:
+                if not _real_table_exists(uid, doc_id, norm_num):
+                    parts.append(f"- Таблица {raw_num}: данной таблицы нет в работе.")
+                    continue
+            except Exception:
+                # если БД/проверка упала — лучше продолжить старым путём
+                pass
+
             local_q = raw_ref or f"опиши таблицу {raw_num}"
             text = await _describe_table_for_multi(uid, doc_id, norm_num, local_q, verbosity)
+            text = (text or "").strip()
             if not text:
                 parts.append(f"- Таблица {raw_num}: данной таблицы нет в работе.")
             else:
@@ -350,8 +361,17 @@ async def _answer_structured_multi(
                 continue
             used_figs.add(norm_num)
 
+            # ЖЁСТКО: если рисунка нет — не зовём LLM/vision
+            try:
+                if not _real_figure_exists(uid, doc_id, norm_num):
+                    parts.append(f"- Рисунок {raw_num}: данного рисунка нет в работе.")
+                    continue
+            except Exception:
+                pass
+
             local_q = raw_ref or f"опиши рисунок {raw_num}"
             text = await _describe_figure_for_multi(uid, doc_id, norm_num, local_q, verbosity)
+            text = (text or "").strip()
             if not text:
                 parts.append(f"- Рисунок {raw_num}: данного рисунка нет в работе.")
             else:
@@ -363,33 +383,39 @@ async def _answer_structured_multi(
                 continue
             used_sections.add(norm_num)
 
+            # ЖЁСТКО: если секции нет — не зовём LLM
+            try:
+                if "_section_context" in globals():
+                    ctx = (_section_context(uid, doc_id, norm_num, max_chars=1500) or "").strip()
+                    if not ctx:
+                        parts.append(f"- Глава/раздел {raw_num}: данный раздел в явном виде не найден в работе.")
+                        continue
+            except Exception:
+                pass
+
             local_q = raw_ref or f"опиши главу {raw_num}"
             text = await _describe_section_for_multi(uid, doc_id, norm_num, local_q, verbosity)
+            text = (text or "").strip()
             if not text:
                 parts.append(f"- Глава/раздел {raw_num}: данный раздел в явном виде не найден в работе.")
             else:
                 parts.append(f"**Глава/раздел {raw_num}**\n{text}")
 
-
     if not parts:
-        # вообще ничего осмысленного собрать не удалось — пусть дальше отработает обычный пайплайн
         return False
 
     final_answer = "\n\n".join(parts)
 
-    # обновим "последние упомянутые" объекты для follow-up вопросов
     try:
         if used_tables:
             LAST_REF.setdefault(uid, {})["table_nums"] = list(used_tables)
         if used_figs:
             LAST_REF.setdefault(uid, {})["figure_nums"] = list(used_figs)
         if used_sections:
-            # берём первый как текущую область
             LAST_REF.setdefault(uid, {})["area"] = next(iter(used_sections))
     except Exception:
         pass
 
-    # ✅ вместо одной отправки — режем под лимиты Telegram
     await _send(m, final_answer)
     return True
 
@@ -467,26 +493,15 @@ async def _describe_figure_for_multi(
     num: str,
     question: str,
     verbosity: str,
-    rec: dict | None = None,   # ⬅️ новый необязательный аргумент
+    rec: dict | None = None,
 ) -> str:
-    """
-    Вспомогательный помощник для мультирежима: делает GPT-разбор одного рисунка.
-
-    Данные по рисунку берём из _build_figure_records, который уже:
-      - подтягивает пути к изображениям и подписи;
-      - подмешивает числовые значения диаграммы (chart_data/chart_matrix);
-      - при их отсутствии может использовать значения из таблицы-источника.
-
-    Для нечисловых схем (org_chart / flowchart / text_blocks / schema / ...),
-    где нет внутренних текстов/значений, стараемся давать только общее описание
-    без перечисления конкретных подразделений, чтобы не галлюцинировать структуру.
-    """
     num = (num or "").strip()
     if not num:
         return ""
 
-    # Если карточка рисунка уже собрана снаружи (в _answer_figure_query),
-    # используем её. Иначе — старое поведение: собираем по номеру.
+    def _norm_num(x: str) -> str:
+        return (x or "").strip().replace(" ", "").replace(",", ".")
+
     if rec is None:
         try:
             records = _build_figure_records(uid, doc_id, [num], need_values=True) or []
@@ -497,20 +512,33 @@ async def _describe_figure_for_multi(
         if not records:
             return ""
 
-        rec = records[0]
+        want = _norm_num(num)
+        picked = None
+        for rr in records:
+            got = _norm_num(str(rr.get("num") or rr.get("label") or ""))
+            if got and want and got == want:
+                picked = rr
+                break
+        if picked is None:
+            return ""
+        rec = picked
+
+    # ✅ если rec не про этот номер — выходим
+    if _norm_num(str(rec.get("num") or "")) != _norm_num(num):
+        return ""
 
     parts: list[str] = []
-
     disp = rec.get("display") or f"Рисунок {rec.get('num') or ''}".strip()
+
     caption = (rec.get("caption") or "").strip()
     if caption:
         parts.append(f"Подпись: {caption}")
 
     near = rec.get("near_text") or []
+    joined = ""
     if near:
         joined = " ".join((t or "").strip() for t in near if t).strip()
         if joined:
-            # чуть ограничим длину, чтобы не раздувать контекст
             joined = joined[:1200]
             parts.append("Текст рядом: " + joined)
 
@@ -520,45 +548,31 @@ async def _describe_figure_for_multi(
 
     values_text = (rec.get("values_text") or rec.get("values") or "").strip()
     if values_text:
-        # ВНИМАНИЕ: здесь значения только для контекста GPT, в ответе их
-        # будет добавлять _fig_values_text_from_records.
         parts.append("Точные значения (как в документе):\n" + values_text[:1500])
 
-    if not parts:
+    # ✅ КЛЮЧЕВОЕ: если нет НИКАКИХ данных — не зовём GPT
+    if not caption and not joined and not vision and not values_text:
         return ""
 
     ctx = f"{disp}\n\n" + "\n\n".join(parts)
 
-    has_near = bool(near)
+    has_near = bool(joined)
     has_vision = bool(vision)
     has_values = bool(values_text)
     num_display = rec.get("num") or num
 
-    # ---- ОПРЕДЕЛЯЕМ ТИП РИСУНКА ----
     figure_kind = (rec.get("figure_kind") or "").strip().lower()
-
     textual_kinds = {
-        "org_chart",
-        "orgchart",
-        "flowchart",
-        "text_blocks",
-        "schema",
-        "scheme",
-        "block_diagram",
-        "structure",
+        "org_chart", "orgchart", "flowchart", "text_blocks",
+        "schema", "scheme", "block_diagram", "structure",
     }
     is_textual_figure = (figure_kind in textual_kinds) or (not has_values and bool(vision))
 
-    # 💡 Мини-фикс: если у нас по сути только подпись и нет ни vision, ни текста рядом, ни чисел —
-    # не гоняем GPT с «учебной» простынёй, а даём короткий понятный ответ.
-    # Это универсальный fallback и для схем, и для любых других рисунков.
     if not has_near and not has_vision and not has_values:
         if caption:
             return f"На рисунке {num_display} показано: {caption}"
         return f"Не удалось извлечь содержимое рисунка {num_display} из текста документа."
 
-
-    # ---- ВЕТКА ДЛЯ ЧИСЛОВЫХ ДИАГРАММ ----
     if not is_textual_figure:
         system_prompt = (
             "Ты репетитор по дипломным работам. Ниже даны подпись к рисунку, текст рядом с ним "
@@ -574,70 +588,32 @@ async def _describe_figure_for_multi(
             "- ...\n"
             "- ...\n\n"
             "Не придумывай новых чисел и не вводи предметную область, если её нет в подписи/тексте. "
-            "Не добавляй блок с точными значениями — он будет подставлен отдельно. "
-            "Никогда не пиши, что «рисунка с таким номером нет» или что «есть только другой рисунок» — "
-            "давай максимально возможное описание по тем данным, которые приведены, и если их мало, "
-            "просто укажи, что информации недостаточно для подробного анализа."
+            "Не добавляй блок с точными значениями — он будет подставлен отдельно."
         )
-
-
-        # ⬇️ Важное дополнение: явно говорим модели сфокусироваться ТОЛЬКО на этом номере,
-        # даже если в исходном вопросе упоминались несколько рисунков.
-        num_display = rec.get("num") or num
-
         user_prompt = (
             f"Пользовательский вопрос: {question}\n\n"
-            f"Сосредоточься ТОЛЬКО на рисунке {num_display}, "
-            "другие рисунки из вопроса игнорируй.\n\n"
-            f"Сделай понятное пояснение по рисунку {num_display}: что на нём изображено "
-            "и какие 2–3 вывода можно сделать.\n\n"
+            f"Сосредоточься ТОЛЬКО на рисунке {num_display}.\n\n"
             "[Данные по рисунку]\n"
             f"{ctx}"
             f"{_verbosity_addendum(verbosity, 'объяснения рисунка')}"
         )
-
-
-    # ---- ВЕТКА ДЛЯ ТЕКСТОВЫХ СХЕМ / ОРГСТРУКТУР ----
     else:
         system_prompt = (
             "Ты репетитор по дипломным работам. Ниже даны подпись к рисунку, текст рядом с ним "
-            "и текстовое описание содержимого изображения (включая распознанный текст с рисунка, "
-            "если он есть). Это не числовая диаграмма, а схема/структура/оргструктура или другой рисунок, "
-            "где главное — элементы и связи между ними.\n\n"
-            "Если в данных ЯВНО указаны элементы схемы (названия подразделений, блоков, ролей, "
-            "приведённые списком в подписи, тексте рядом или в описании изображения) — можешь "
-            "на них опираться и кратко перечислить.\n"
-            "Если таких явных элементов нет, дай только ОБЩЕЕ описание схемы в 2–4 предложениях "
-            "без выдумывания названий отделов, ролей и блоков.\n\n"
-            "Строго соблюдай правило: не придумывай ни одного нового названия элемента, которого "
-            "нет в предоставленных данных. Если информации мало, лучше напиши об этом явно, чем домысливать. "
-            "Никогда не пиши, что «рисунка с таким номером нет» или что «есть только рисунок с другим номером» — "
-            "всегда давай описание по тем данным, которые есть, и при нехватке данных просто укажи на это."
+            "и текстовое описание содержимого изображения (если есть). Это схема/структура.\n\n"
+            "Не придумывай названия элементов, которых нет в данных."
         )
-
-
-        num_display = rec.get("num") or num
-
         user_prompt = (
             f"Пользовательский вопрос: {question}\n\n"
-            f"Сосредоточься ТОЛЬКО на рисунке {num_display}, "
-            "другие рисунки из вопроса игнорируй.\n\n"
-            f"Сделай понятное пояснение по рисунку {num_display}: что на нём в целом изображено, "
-            "какую идею иллюстрирует схема и какие 2–3 вывода можно сделать.\n\n"
-            "Если в данных нет явного списка элементов схемы, НЕ перечисляй выдуманные подразделения "
-            "или должности — просто опиши характер структуры (иерархическая, функциональная и т.п.).\n\n"
+            f"Сосредоточься ТОЛЬКО на рисунке {num_display}.\n\n"
             "[Данные по рисунку]\n"
             f"{ctx}"
             f"{_verbosity_addendum(verbosity, 'объяснения схемы')}"
         )
 
-
     try:
         answer = chat_with_gpt(
-            [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
+            [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
             temperature=0.2,
             max_tokens=FINAL_MAX_TOKENS,
         )
@@ -646,20 +622,13 @@ async def _describe_figure_for_multi(
         return ""
 
     answer = (answer or "").strip()
-
     if not answer:
         if caption:
             return f"Описание рисунка {num_display}.\n\nНа рисунке показано: {caption}"
         return ""
 
-    # подчистим хвосты
     answer = _strip_unwanted_sections(answer)
-
-    # заголовок для читаемости
     header = f"Описание рисунка {num_display}.\n\n"
-
-    # эта функция отвечает только за "человеческое объяснение",
-    # блок с точными значениями добавляется снаружи (_fig_values_text_from_records)
     return header + answer
 
 
@@ -882,108 +851,251 @@ async def _typing_loop(chat_id: int, stop_event: asyncio.Event):
 
 
 def _section_context(owner_id: int, doc_id: int, sec: str, *, max_chars: int = 9000) -> str:
-    # 1) генерим варианты записи номера
-    base = (sec or "").strip()
+    import re
+
+    base_raw = (sec or "").strip()
+    if not base_raw:
+        return ""
+
+    # Нормализуем к "2.1.3" виду (без хвостовой точки)
+    base = base_raw.replace(" ", "").replace(",", ".").strip().strip(".")
+    # Глубина: "2" -> 1, "2.1" -> 2, "2.1.3" -> 3
+    base_depth = 1 + base.count(".")
+
+    # Варианты (включая запятую как разделитель)
     variants = {
         base,
-        base.replace(" ", ""),
-        base.replace(" ", "").replace(",", "."),
-        base.replace(" ", "").replace(".", ","),
+        base.replace(".", ","),
+        base_raw.strip(),
+        base_raw.strip().replace(" ", ""),
     }
-    prefixes = ["", "Раздел ", "Пункт ", "Глава ", "Подраздел "]
-    patterns = set()
 
-    # 1️⃣ Точные и нормализованные варианты
+    prefixes = ["Глава", "Раздел", "Пункт", "Подраздел", "Chapter", "Section"]
+
+    # Паттерны для section_path (как раньше, но чуть шире)
+    sp_patterns = set()
     for v in variants:
-        patterns.add(f"%{v}%")
-        # Поддержка вида: "3." "3.1", "3.2" — всё, что начинается с нужной главы
-        patterns.add(f"{v}.%")
+        v_norm = str(v).replace(" ", "").strip().strip(".")
+        if not v_norm:
+            continue
+        sp_patterns.add(f"%{v_norm}%")
+        sp_patterns.add(f"{v_norm}.%")  # "2.1.%"
 
-    # 2️⃣ Любые форматы с ключевыми словами "Глава", "Раздел", "Пункт"
-    prefixes = ["Глава", "Раздел", "Пункт", "Chapter", "Section"]
     for p in prefixes:
-        patterns.add(f"%{p} {base}%")
-        patterns.add(f"%{p}{base}%")   # без пробела тоже ловим
+        sp_patterns.add(f"%{p} {base_raw}%")
+        sp_patterns.add(f"%{p}{base_raw}%")
+        sp_patterns.add(f"%{p} {base}%")
+        sp_patterns.add(f"%{p}{base}%")
 
-    # преобразуем обратно в список
-    patterns = list(patterns)[:12]  # оставим небольшой лимит
+    # Паттерны для text — ВАЖНО: добавляем "начинается с номера"
+    tx_patterns = set()
+    for v in variants:
+        v_norm = str(v).replace(" ", "").replace(",", ".").strip().strip(".")
+        if not v_norm:
+            continue
+        # Внутри текста
+        tx_patterns.add(f"%{v_norm}%")
+        tx_patterns.add(f"%{v_norm}.%")
+        # Начало строки: "2.1 " / "2.1." / "2.1–" / "2.1—"
+        tx_patterns.add(f"{v_norm} %")
+        tx_patterns.add(f"{v_norm}.%")
+        tx_patterns.add(f"{v_norm}-%")
+        tx_patterns.add(f"{v_norm}—%")
+        tx_patterns.add(f"{v_norm}–%")
 
+    for p in prefixes:
+        tx_patterns.add(f"%{p} {base}%")
+        tx_patterns.add(f"%{p}{base}%")
+        tx_patterns.add(f"%{p} {base_raw}%")
+        tx_patterns.add(f"%{p}{base_raw}%")
+
+    # Лимиты, чтобы SQL не раздувать
+    sp_list = list(sp_patterns)[:16]
+    tx_list = list(tx_patterns)[:24]
 
     con = get_conn()
     cur = con.cursor()
 
+    has_et = _table_has_columns(con, "chunks", ["element_type"])
+
     rows = []
-    if patterns:
-        placeholders = " OR ".join(["section_path LIKE ?"] * len(patterns))
+
+    # 1) Основной поиск: section_path ИЛИ text
+    where_parts = []
+    args = [owner_id, doc_id]
+
+    if sp_list:
+        where_parts.append("(" + " OR ".join(["section_path LIKE ?"] * len(sp_list)) + ")")
+        args.extend(sp_list)
+
+    if tx_list:
+        where_parts.append("(" + " OR ".join(["text LIKE ?"] * len(tx_list)) + ")")
+        args.extend(tx_list)
+
+    if where_parts:
         cur.execute(
             f"""
-            SELECT page, section_path, text
+            SELECT id, page, section_path, text, { "element_type" if has_et else "NULL as element_type" }
             FROM chunks
-            WHERE owner_id=? AND doc_id=? AND ({placeholders})
+            WHERE owner_id=? AND doc_id=? AND ({" OR ".join(where_parts)})
             ORDER BY page ASC, id ASC
             """,
-            (owner_id, doc_id, *patterns),
+            tuple(args),
         )
         rows = cur.fetchall() or []
 
-    # 2) фолбэк: найдём heading с номером и возьмём его секцию
-    if not rows:
-        has_et = _table_has_columns(con, "chunks", ["element_type"])
-        if has_et:
-            cur.execute(
-                """
-                SELECT section_path
-                FROM chunks
-                WHERE owner_id=? AND doc_id=?
-                AND (element_type='heading' OR element_type IS NULL)
-                AND (section_path LIKE ? OR text LIKE ?)
-                ORDER BY page ASC, id ASC LIMIT 1
-                """,
-                (owner_id, doc_id, f"%{base}%", f"%{base}%"),
+    def _is_bad_scope(rs: list) -> bool:
+        """
+        Если вытащили только заголовок/обрывок — считаем, что секция не найдена нормально.
+        """
+        if not rs:
+            return True
+        joined = "\n".join([(r["text"] or "").strip() for r in rs if (r["text"] or "").strip()])
+        if len(joined) < 250:
+            return True
+        # типичный мусор в docx->chunks: "Без названия"
+        if "без названия" in joined.lower():
+            return True
+        return False
+
+    # 2) Fallback: якорь (anchor) по номеру секции в ТЕКСТЕ, дальше берём диапазон до следующего заголовка
+    if _is_bad_scope(rows):
+        # Ищем якорный chunk: начало текста "2.1 ..." или "Глава 2.1 ..."
+        anchor_like = [
+            f"{base} %",
+            f"{base}.%",
+            f"%Глава {base}%",
+            f"%Раздел {base}%",
+            f"%Пункт {base}%",
+        ]
+
+        cur.execute(
+            f"""
+            SELECT id, page, section_path, text, { "element_type" if has_et else "NULL as element_type" }
+            FROM chunks
+            WHERE owner_id=? AND doc_id=? AND (
+                text LIKE ? OR text LIKE ? OR text LIKE ? OR text LIKE ? OR text LIKE ?
             )
-        else:
-            # старая схема — без условия по element_type
-            cur.execute(
-                """
-                SELECT section_path
-                FROM chunks
-                WHERE owner_id=? AND doc_id=?
-                AND (section_path LIKE ? OR text LIKE ?)
-                ORDER BY page ASC, id ASC LIMIT 1
-                """,
-                (owner_id, doc_id, f"%{base}%", f"%{base}%"),
-            )
-        h = cur.fetchone()
-        if h and h["section_path"]:
-            cur.execute(
-                """
-                SELECT page, section_path, text
-                FROM chunks
-                WHERE owner_id=? AND doc_id=? AND section_path=?
-                ORDER BY page ASC, id ASC
-                """,
-                (owner_id, doc_id, h["section_path"]),
-            )
-            rows = cur.fetchall() or []
+            ORDER BY page ASC, id ASC
+            LIMIT 1
+            """,
+            (owner_id, doc_id, *anchor_like),
+        )
+        anchor = cur.fetchone()
+
+        if anchor:
+            anchor_id = int(anchor["id"])
+
+            # Подтянем ближайшие заголовки после якоря и в Python найдём границу секции
+            next_headings = []
+            if has_et:
+                cur.execute(
+                    """
+                    SELECT id, text
+                    FROM chunks
+                    WHERE owner_id=? AND doc_id=? AND id>? AND element_type='heading'
+                    ORDER BY id ASC
+                    LIMIT 200
+                    """,
+                    (owner_id, doc_id, anchor_id),
+                )
+                next_headings = cur.fetchall() or []
+            else:
+                # если element_type нет — берём просто ближайшие куски и в Python считаем заголовком по паттерну
+                cur.execute(
+                    """
+                    SELECT id, text
+                    FROM chunks
+                    WHERE owner_id=? AND doc_id=? AND id>?
+                    ORDER BY id ASC
+                    LIMIT 400
+                    """,
+                    (owner_id, doc_id, anchor_id),
+                )
+                next_headings = cur.fetchall() or []
+
+            end_id = None
+            num_re = re.compile(r"^\s*(\d+(?:[.,]\d+){0,6})\b")
+
+            for h in next_headings:
+                ht = (h["text"] or "").strip()
+                if not ht:
+                    continue
+
+                # если element_type нет — считаем "заголовком" только если начинается с номера или слова Глава/Раздел/Пункт
+                if not has_et:
+                    if not (num_re.match(ht) or re.match(r"^(Глава|Раздел|Пункт|Подраздел)\b", ht, re.IGNORECASE)):
+                        continue
+
+                m = num_re.match(ht)
+                if m:
+                    num = m.group(1).replace(",", ".").strip().strip(".")
+                    depth = 1 + num.count(".")
+                    # граница: следующий заголовок того же или более высокого уровня
+                    # и при этом это не продолжение "2.1" (например "2.1.1" — это всё ещё внутри)
+                    if depth <= base_depth and not num.startswith(base + ".") and num != base:
+                        end_id = int(h["id"]) - 1
+                        break
+                else:
+                    # "Глава ..." / "Раздел ..." без номера в начале — тоже может быть границей
+                    # считаем это границей секции на всякий случай
+                    end_id = int(h["id"]) - 1
+                    break
+
+            # Если границу не нашли — просто возьмём хвост до лимита
+            if end_id is None:
+                cur.execute(
+                    f"""
+                    SELECT id, page, section_path, text, { "element_type" if has_et else "NULL as element_type" }
+                    FROM chunks
+                    WHERE owner_id=? AND doc_id=? AND id>=?
+                    ORDER BY id ASC
+                    LIMIT 300
+                    """,
+                    (owner_id, doc_id, anchor_id),
+                )
+                rows = cur.fetchall() or []
+            else:
+                cur.execute(
+                    f"""
+                    SELECT id, page, section_path, text, { "element_type" if has_et else "NULL as element_type" }
+                    FROM chunks
+                    WHERE owner_id=? AND doc_id=? AND id BETWEEN ? AND ?
+                    ORDER BY id ASC
+                    """,
+                    (owner_id, doc_id, anchor_id, end_id),
+                )
+                rows = cur.fetchall() or []
 
     con.close()
+
     if not rows:
         return ""
 
+    # Формирование итогового текста
     parts, total = [], 0
     header_inserted = False
+
     for r in rows:
         secpath = (r["section_path"] or "").strip()
         t = (r["text"] or "").strip()
         if not t:
             continue
-        chunk = (f"[{secpath}]\n{t}") if not header_inserted else t
+
+        # один раз показываем "шапку" секции (если есть)
+        chunk = (f"[{secpath}]\n{t}") if (secpath and not header_inserted) else t
         header_inserted = True
+
         if total + len(chunk) > max_chars:
             parts.append(chunk[: max_chars - total])
             break
+
         parts.append(chunk)
         total += len(chunk)
+
+        if total >= max_chars:
+            break
+
     return "\n\n".join(parts)
 
 
@@ -1424,10 +1536,11 @@ async def _run_multistep_answer(
     discovered_items: list[dict] | None = None,
 ) -> bool:
     """
-    Многошаговый ответ без ACE:
+    Многошаговый ответ без ACE (строгий):
     1) План подпунктов — через _plan_subtasks_via_gpt или coverage.
-    2) По каждому подпункту — отдельный вызов GPT с жёстким контекстом.
-    3) (опц.) финальный merge через _merge_subanswers_via_gpt.
+    2) По каждому подпункту — отдельный ответ ТОЛЬКО если найден релевантный контекст.
+    3) Если контекста нет/он слабый — НЕ вызываем GPT, а возвращаем "не найдено" по подпункту.
+    4) (опц.) финальный merge через _merge_subanswers_via_gpt (только по найденным подпунктам).
     """
     if not MULTI_STEP_SEND_ENABLED:
         return False
@@ -1479,31 +1592,87 @@ async def _run_multistep_answer(
         cov = None
     cov_map = (cov or {}).get("by_item") or {}
 
+    # пороги для строгого режима
+    min_score = float(getattr(Cfg, "RETRIEVE_MIN_SCORE", 0.24))
+    min_ctx_chars = int(getattr(Cfg, "MIN_GROUNDED_CTX_CHARS", 260))
+
+    def _snip_metrics(snips: list[dict]) -> tuple[float, int]:
+        mx = 0.0
+        strong = 0
+        for s in snips or []:
+            try:
+                sc = float(s.get("score") or 0.0)
+            except Exception:
+                sc = 0.0
+            if sc > mx:
+                mx = sc
+            if sc >= min_score:
+                strong += 1
+        return mx, strong
+
+    def _not_found_text() -> str:
+        return (
+            "В документе не найдено фрагментов, которые позволяют уверенно ответить на этот подпункт.\n"
+            "Уточните формулировку или укажите главу/раздел/страницу, либо пришлите фрагмент текста."
+        )
+
     # по очереди: A → send, B → send, ...
     for i, it in enumerate(items, start=1):
         ask = (it.get("ask") or "").strip()
         if not ask:
             continue
 
-        # контекст для конкретного подпункта
         ctx_text = ""
-        try:
-            # если есть coverage-бакет — собираем контекст прямо из чанков подпункта
-            bucket = cov_map.get(str(it.get("id") or i)) or []
-            if bucket:
-                ctx_text = build_context_coverage(bucket, items_count=1)
-        except Exception:
-            ctx_text = ""
+        ctx_source = None
+        strongest = 0.0
+        strong_hits = 0
 
-        # фолбэки по контексту
+        # 1) coverage bucket
+        bucket = []
+        try:
+            bucket = cov_map.get(str(it.get("id") or i)) or []
+        except Exception:
+            bucket = []
+
+        if bucket:
+            strongest, strong_hits = _snip_metrics(bucket)
+            if strong_hits > 0:
+                try:
+                    tmp = build_context_coverage(bucket, items_count=1)
+                except Exception:
+                    tmp = ""
+                if tmp and len(tmp.strip()) >= min_ctx_chars:
+                    ctx_text = tmp
+                    ctx_source = "coverage_bucket"
+                else:
+                    ctx_text = ""
+                    ctx_source = None
+
+        # 2) lex best_context (страховка по длине)
         if not ctx_text:
-            ctx_text = best_context(uid, doc_id, ask, max_chars=6000) or ""
+            tmp = best_context(uid, doc_id, ask, max_chars=6000) or ""
+            if tmp and len(tmp.strip()) >= min_ctx_chars:
+                ctx_text = tmp
+                ctx_source = "best_context"
+
+        # 3) vector retrieve (только если есть сильные score)
         if not ctx_text:
-            hits = retrieve(uid, doc_id, ask, top_k=8)
-            if hits:
-                ctx_text = build_context(hits)
+            hits = retrieve(uid, doc_id, ask, top_k=8) or []
+            strongest, strong_hits = _snip_metrics(hits)
+            if hits and strong_hits > 0:
+                tmp = build_context(hits)
+                if tmp and len(tmp.strip()) >= min_ctx_chars:
+                    ctx_text = tmp
+                    ctx_source = "vector"
+
+        # ❗ ВАЖНО: больше НЕ делаем fallback на первые куски документа.
+        # Если контекста нет/он слабый — НЕ вызываем GPT.
         if not ctx_text:
-            ctx_text = _first_chunks_context(uid, doc_id, n=12, max_chars=6000)
+            header = f"**{i}. {ask}**\n\n"
+            await _send(m, header + _not_found_text())
+            subanswers.append(f"{header}{_not_found_text()}")
+            await asyncio.sleep(MULTI_STEP_PAUSE_MS / 1000)
+            continue
 
         # генерация по подпункту через GPT (без ACE)
         try:
@@ -1517,12 +1686,10 @@ async def _run_multistep_answer(
             logging.exception("answer_subpoint_via_gpt failed: %s", e)
             part = ""
 
-        # отправка блока
         header = f"**{i}. {ask}**\n\n"
         await _send(m, header + (part or "Не удалось сгенерировать ответ по этому подпункту."))
         subanswers.append(f"{header}{part}")
 
-        # микропаузa, чтобы не упереться в rate/чаты
         await asyncio.sleep(MULTI_STEP_PAUSE_MS / 1000)
 
     # (опционально) финальный сводный блок
@@ -1540,6 +1707,7 @@ async def _run_multistep_answer(
             logging.exception("merge_subanswers_via_gpt failed: %s", e)
 
     return True
+
 
 def _should_use_multistep(q_text: str, discovered_items: list[dict] | None) -> bool:
     """
@@ -1643,7 +1811,10 @@ except Exception:
 # «Активный документ» в памяти процесса
 ACTIVE_DOC: dict[int, int] = {}  # user_id -> doc_id
 # NEW: короткая «память» последнего упомянутого объекта пользователем
-LAST_REF: dict[int, dict] = {}   # {uid: {"figure_nums": list[str], "area": "3.2"}}
+LAST_REF: dict[int, dict] = {}
+# ⬇️ NEW: последний содержательный запрос по документу
+LAST_DOC_QUERY: dict[int, dict] = {}
+  # {uid: {"figure_nums": list[str], "area": "3.2"}}
 FIG_INDEX: dict[int, dict] = {}
 OOXML_INDEX: dict[int, dict] = {}
 # NEW: кеш для распознанных «таблиц-картинок» (doc_id, num) -> текстовый блок
@@ -1696,7 +1867,17 @@ def _expand_with_last_referent(uid: int, text: str) -> str:
     if not (_ANAPH_HINT_RE.search(t) or _FOLLOWUP_MORE_RE.search(t)):
         return text
 
+    # NEW: если это "опиши подробнее" и нет явного объекта — продолжаем прошлый запрос
+    if _FOLLOWUP_MORE_RE.search(t):
+        last_q = (LAST_DOC_QUERY.get(uid) or "").strip()
+        if last_q:
+            return (
+                f"{last_q}\n\n"
+                f"Пожалуйста, {t}. Раскрой подробнее ТО ЖЕ САМОЕ, что было в предыдущем ответе, по тексту документа."
+            )
+
     last = LAST_REF.get(uid) or {}
+
 
     # 1) приоритет — последняя таблица
     tables = last.get("table_nums") or []
@@ -1719,6 +1900,41 @@ def _expand_with_last_referent(uid: int, text: str) -> str:
 
     return text
 
+def _expand_followup_to_last_doc_query(uid: int, doc_id: int, text: str) -> str:
+    """
+    Если пользователь пишет короткий follow-up («опиши подробнее» и т.п.),
+    то подставляем предыдущий ЗАПРОС ПО ДОКУМЕНТУ.
+
+    ВАЖНО: у тебя LAST_DOC_QUERY[uid] хранится строкой (см. respond_with_answer),
+    поэтому здесь поддерживаем и str, и dict (если вдруг где-то по старому формату).
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return text
+
+    if not _FOLLOWUP_MORE_RE.search(t):
+        return text
+
+    last = LAST_DOC_QUERY.get(uid)
+    if not last:
+        return text
+
+    prev_q = ""
+
+    # новый/текущий формат: строка
+    if isinstance(last, str):
+        prev_q = last.strip()
+
+    # старый/возможный формат: dict
+    elif isinstance(last, dict):
+        if last.get("doc_id") != doc_id:
+            return text
+        prev_q = (last.get("q_text") or "").strip()
+
+    if not prev_q:
+        return text
+
+    return f"{prev_q}. Опиши подробнее."
 
 # ------------------------ Гардрейлы ------------------------
 
@@ -2113,22 +2329,28 @@ async def _maybe_run_gost(m: types.Message, uid: int, doc_id: int, text: str) ->
     if not _GOST_HINT.search(text or ""):
         return False
 
-    con = get_conn()
-    cur = con.cursor()
-    cur.execute("SELECT path FROM documents WHERE id=? AND owner_id=?", (doc_id, uid))
-    row = cur.fetchone()
-    con.close()
-    if not row:
+    def _build_gost_report_sync() -> str | None:
+        con = get_conn()
+        cur = con.cursor()
+        cur.execute("SELECT path FROM documents WHERE id=? AND owner_id=?", (doc_id, uid))
+        row = cur.fetchone()
+        con.close()
+        if not row:
+            return None
+
+        path = row["path"]
+        try:
+            sections = _parse_by_ext(path)
+        except Exception:
+            return None
+
+        report = validate_gost(sections)
+        return render_report(report, max_issues=25)
+
+    text_rep = await asyncio.to_thread(_build_gost_report_sync)
+    if not text_rep:
         return False
 
-    path = row["path"]
-    try:
-        sections = _parse_by_ext(path)
-    except Exception:
-        return False
-
-    report = validate_gost(sections)
-    text_rep = render_report(report, max_issues=25)
     await _send(m, text_rep)
     return True
 
@@ -2677,6 +2899,7 @@ async def cmd_diag(m: types.Message):
 
 # ------------------------------ /reindex ------------------------------
 
+# СТАЛО (всё тяжёлое/блокирующее — в asyncio.to_thread)
 @dp.message(Command("reindex"))
 async def cmd_reindex(m: types.Message):
     uid = ensure_user(str(m.from_user.id))
@@ -2685,31 +2908,38 @@ async def cmd_reindex(m: types.Message):
         await _send(m, "Активного документа нет. Пришлите файл сначала.")
         return
 
-    con = get_conn()
-    cur = con.cursor()
-    cur.execute("SELECT path FROM documents WHERE id=? AND owner_id=?", (doc_id, uid))
-    row = cur.fetchone()
-    con.close()
+    # 1) чтение пути из БД — тоже лучше вынести в thread (sqlite может блокировать event loop)
+    def _get_doc_path() -> str | None:
+        con = get_conn()
+        try:
+            cur = con.cursor()
+            cur.execute("SELECT path FROM documents WHERE id=? AND owner_id=?", (doc_id, uid))
+            row = cur.fetchone()
+            return row["path"] if row else None
+        finally:
+            con.close()
 
-    if not row:
+    path = await asyncio.to_thread(_get_doc_path)
+    if not path:
         await _send(m, "Не смог найти путь к файлу. Загрузите документ заново.")
         return
 
-    path = row["path"]
-    try:
+    # 2) весь парсинг/обогащение/индексация — в thread
+    def _reindex_sync() -> None:
         sections = _parse_by_ext(path)
-        # обогащаем секции перед индексом
         sections = enrich_sections(sections, doc_kind=os.path.splitext(path)[1].lower().strip("."))
         delete_document_chunks(doc_id, uid)
         index_document(uid, doc_id, sections)
         invalidate_cache(uid, doc_id)
         set_document_indexer_version(doc_id, CURRENT_INDEXER_VERSION)
         update_document_meta(doc_id, layout_profile=_current_embedding_profile())
+
+    try:
+        await asyncio.to_thread(_reindex_sync)
         await _send(m, f"Документ #{doc_id} переиндексирован.")
     except Exception as e:
         logging.exception("reindex failed: %s", e)
         await _send(m, f"Не удалось переиндексировать документ: {e}")
-
 
 
 # ---------- Рисунки: вспомогательные функции (локальные, без зависимостей от retrieval.py) ----------
@@ -3847,21 +4077,11 @@ def _build_figure_records(
     doc_id: int,
     nums: list[str],
     *,
-    need_values: bool = False,   # нужен ли акцент на числах
+    need_values: bool = False,
 ) -> list[dict]:
-    """
-    Единая "сборка" информации о рисунках:
-    — номер и красивый display;
-    — пути к картинкам;
-    — точные числовые значения (из chart_data/OOXML/таблиц);
-    — подпись и текст рядом;
-    — vision-описание (если есть и не «описание не распознано»);
-    — тип рисунка (bar/pie/line/org_chart/…).
-    """
     if not nums:
         return []
 
-    # вспомогательный хелпер: пытаемся вытащить реальный номер рисунка из row
     def _row_fig_label(row, attrs_json=None) -> str:
         num = None
         try:
@@ -3878,7 +4098,6 @@ def _build_figure_records(
         except Exception:
             num = None
 
-        # если в attrs не нашли — пробуем вытащить из текста «Рис. 2.1»
         if not num:
             try:
                 text = (row["text"] if ("text" in row.keys()) else "") or ""
@@ -3890,7 +4109,7 @@ def _build_figure_records(
 
         return _num_norm_fig(num) if num else ""
 
-    # заранее тянем карточки из retrieval, чтобы получить images/текст рядом/vision
+    # карточки retrieval
     try:
         cards = describe_figures_by_numbers(
             uid,
@@ -3913,19 +4132,17 @@ def _build_figure_records(
     idx_oox = _ooxml_get_index(doc_id)
     fig_idx = FIG_INDEX.get(doc_id)
 
-    # ключ: нормализованный номер рисунка → record
     records_by_num: dict[str, dict] = {}
 
     for orig in nums:
         norm = _num_norm_fig(orig)
         if not norm:
             continue
-
-        # если этот номер уже собран — не создаём дубль
         if norm in records_by_num:
             continue
 
         card = cards_by_norm.get(norm)
+
         rec: dict = {
             "owner_id": uid,
             "doc_id": doc_id,
@@ -3933,22 +4150,19 @@ def _build_figure_records(
             "orig": orig,
             "display": None,
             "images": [],
-            # единый источник истины по числам
             "raw_values": None,
             "values_text": None,
-            "values_source": None,     # "ooxml" | "summary" | "vision" | "table" | "rag"
-            "values": None,            # для обратной совместимости со старым кодом
+            "values_source": None,
+            "values": None,
             "near_text": [],
             "caption": None,
             "vision_desc": None,
             "chunk_id": None,
-            "figure_kind": None,       # bar / pie / line / org_chart / text_blocks / ...
+            "figure_kind": None,
         }
 
-                # --- 1) данные из RAG-карточек ---
+        # --- 1) данные из карточек ---
         if card:
-            # display из карточки используем только если он про тот же номер,
-            # иначе игнорируем, чтобы 1.1/1.2 не подменялись на 2.1 и т.п.
             card_display = (card.get("display") or "").strip()
             if card_display:
                 disp_num = _num_norm_fig(card_display)
@@ -3957,56 +4171,40 @@ def _build_figure_records(
 
             rec["images"] = [p for p in (card.get("images") or []) if p]
 
-            # хайлайты из RAG берём как предварительный контекст,
-            # но отбрасываем абзацы, где явно упомянут ДРУГОЙ номер рисунка
             clean_highlights: list[str] = []
             for h in (card.get("highlights") or []):
                 txt = (h or "").strip()
                 if not txt:
                     continue
-                m = re.search(r"(?:Рис\.?|Рисунок)\s+([\d.]+)", txt, flags=re.IGNORECASE)
-                if m:
-                    other = _num_norm_fig(m.group(1))
+                m2 = re.search(r"(?:Рис\.?|Рисунок)\s+([\d.]+)", txt, flags=re.IGNORECASE)
+                if m2:
+                    other = _num_norm_fig(m2.group(1))
                     if other and other != norm:
-                        # это явно про другой рисунок → пропускаем
                         continue
                 clean_highlights.append(txt)
-
             rec["near_text"] = clean_highlights
 
-
-
-            # VISION: забираем максимум текста с картинки
             vision = card.get("vision") or {}
             vis_parts: list[str] = []
-
             desc = (vision.get("description") or "").strip()
             if desc:
                 vis_parts.append(desc)
-
             raw_text = (vision.get("raw_text") or vision.get("text") or "").strip()
             if raw_text:
                 vis_parts.append(raw_text)
 
             vis_clean = " ".join(vis_parts).strip()
             low = vis_clean.lower()
-            logging.info(
-                "FIGURE %s kind=%r vision_desc=%r",
-                rec["num"],
-                rec.get("figure_kind"),
-                vis_clean[:300],
-            )
             if vis_clean and "описание не распознано" not in low and "содержимое изображения" not in low:
                 rec["vision_desc"] = vis_clean
 
-            # NEW: числовые значения/строки из retrieval (в т.ч. из таблицы-источника)
             vals = (card.get("values_str") or "").strip()
             if vals and not rec.get("values_text"):
                 rec["values_text"] = vals
                 rec["values_source"] = rec.get("values_source") or "rag"
                 rec["values"] = rec["values_text"]
 
-        # --- 2) OOXML-индекс: подпись и image_path ---
+        # --- 2) OOXML индекс ---
         if idx_oox:
             oox_rec = _ooxml_find_figure_by_label(idx_oox, norm) or _ooxml_find_figure_by_label(idx_oox, orig)
             if oox_rec:
@@ -4019,12 +4217,11 @@ def _build_figure_records(
                 path = oox_rec.get("image_path")
                 if path and path not in rec["images"]:
                     rec["images"].append(path)
-
                 kind_oox = (oox_rec.get("kind") or "").strip()
                 if kind_oox and not rec.get("figure_kind"):
                     rec["figure_kind"] = kind_oox
 
-        # --- 3) локальный индекс figures.py: путь к картинке + подпись ---
+        # --- 3) локальный индекс figures.py ---
         if fig_idx:
             try:
                 recs = fig_find(fig_idx, number=orig) or fig_find(fig_idx, number=norm) or []
@@ -4041,106 +4238,52 @@ def _build_figure_records(
                     rec["caption"] = cap_text
                 if not rec["near_text"] and cap_text:
                     rec["near_text"].append(cap_text)
-
                 kind_loc = (r.get("kind") or "").strip()
                 if kind_loc and not rec.get("figure_kind"):
                     rec["figure_kind"] = kind_loc
 
-                # 🔎 3.bis. Мягкая эвристика "по подписи": только общие схемы
-        # ВАЖНО:
-        #  - больше НЕ помечаем ничего как org_chart только по словам в подписи,
-        #    чтобы рисунки 1.1 / 1.2 не «притягивались» к оргструктурам из 2.1;
-        #  - org_chart теперь может появиться только из OOXML/figures-индекса,
-        #    где явно указан kind для конкретного рисунка.
-        if not rec.get("figure_kind"):
-            cap_low = (rec.get("caption") or "").strip().lower()
-            # только очень общие "схема/модель/алгоритм", без "организационная структура"
-            if cap_low and any(kw in cap_low for kw in ("схема", "модель", "алгоритм", "блок-схема")):
-                rec["figure_kind"] = "schema"
-
-
-        # --- 4) chart_data из attrs (ТОЧНЫЕ числовые значения из OOXML) ---
+        # --- 4) figure-chunk (ТОЛЬКО строгие паттерны) ---
         row = _fetch_figure_row_by_num(uid, doc_id, orig)
-        logging.info("FIGURE %s: fetch_row(orig=%r) -> %s", norm, orig, "HIT" if row else "MISS")
-
         if not row and norm != orig:
             row = _fetch_figure_row_by_num(uid, doc_id, norm)
-            logging.info("FIGURE %s: fetch_row(norm=%r) -> %s", norm, norm, "HIT" if row else "MISS")
 
-        # ⬇️ НОВОЕ: даже если fetch_row что-то нашёл, проверяем,
-        # что внутри chunk’а реально этот же номер рисунка, а не, например, 2.1
         if row:
             try:
                 real_label = _row_fig_label(row)
             except Exception:
                 real_label = ""
-
             if real_label and real_label != norm:
-                logging.info(
-                    "FIGURE %s: fetch_row returned foreign figure (real=%s), ignore row",
-                    norm,
-                    real_label,
-                )
                 row = None
 
-        # ⬇️ НОВОЕ: если figure-чанка нет, пробуем собрать контекст по строке "Рисунок N"
-        if not row and not rec.get("caption") and not rec.get("near_text"):
-            cap_fallback, near_fallback = _figure_fallback_context_from_caption(uid, doc_id, norm)
-            if cap_fallback:
-                rec["caption"] = rec.get("caption") or cap_fallback
-            if near_fallback:
-                rec["near_text"] = near_fallback
-
-        # если по caption_num не нашли — пробуем достать figure-chunk по тексту/section_path
         if not row:
+            # строгий SQL fallback: только "Рисунок N" / "Рис. N"
             try:
                 con = get_conn()
                 cur = con.cursor()
-
-                pats = []
-                cap = (rec.get("caption") or "").strip()
-                if cap:
-                    cap_snip = cap[:60]
-                    pats.append(f"%{cap_snip}%")
-
-                pats.extend([
+                pats = [
                     f"%Рисунок {norm}%",
                     f"%Рис. {norm}%",
                     f"%Рис.{norm}%",
-                    f"%{norm}%",
-                ])
-
+                ]
                 for pat in pats:
                     cur.execute(
                         """
                         SELECT id, page, section_path, attrs, text
                         FROM chunks
                         WHERE owner_id=? AND doc_id=? AND element_type='figure'
-                          AND (
-                                (text IS NOT NULL AND text LIKE ? COLLATE NOCASE)
-                             OR (section_path IS NOT NULL AND section_path LIKE ? COLLATE NOCASE)
-                          )
+                          AND (text IS NOT NULL AND lower(text) LIKE lower(?))
                         ORDER BY id ASC LIMIT 1
                         """,
-                        (uid, doc_id, pat, pat),
+                        (uid, doc_id, pat),
                     )
                     row = cur.fetchone()
                     if not row:
                         continue
 
-                    # 🔍 NEW: проверяем, что найденный chunk реально про нужный номер рисунка
                     real_label = _row_fig_label(row)
                     if real_label and real_label != norm:
-                        logging.info(
-                            "FIGURE %s: SQL fallback matched foreign figure %r (real=%s), skip",
-                            norm,
-                            row.get("id") if hasattr(row, "get") else None,
-                            real_label,
-                        )
                         row = None
                         continue
-
-                    # если номера нет вообще (не удалось извлечь) — пусть остаётся
                     break
             except Exception:
                 row = None
@@ -4150,27 +4293,9 @@ def _build_figure_records(
                 except Exception:
                     pass
 
-        # ⬇️ НОВОЕ: если даже после всех попыток figure-чанк так и не нашли,
-        # пробуем вытащить подпись и текст по номеру "Рисунок X.Y" из обычных абзацев.
-        if not row:
-            fb = _figure_fallback_from_caption(uid, doc_id, norm)
-            if fb:
-                cap_fb = (fb.get("caption") or "").strip()
-                if cap_fb and not rec.get("caption"):
-                    rec["caption"] = cap_fb
-
-                near_fb = fb.get("near_text") or []
-                if near_fb and not rec.get("near_text"):
-                    rec["near_text"] = near_fb
-
-                # если тип ещё не определён, считаем это текстовой схемой
-                if not rec.get("figure_kind"):
-                    rec["figure_kind"] = "schema"
-
         if row:
             try:
                 rec["chunk_id"] = row["id"]
-
             except Exception:
                 pass
 
@@ -4178,17 +4303,13 @@ def _build_figure_records(
 
             try:
                 if attrs_json and not rec.get("figure_kind"):
-                    if isinstance(attrs_json, str):
-                        _attrs_obj = json.loads(attrs_json)
-                    else:
-                        _attrs_obj = attrs_json or {}
+                    _attrs_obj = json.loads(attrs_json) if isinstance(attrs_json, str) else (attrs_json or {})
                     kind_attr = (_attrs_obj.get("figure_kind") or "").strip()
                     if kind_attr:
                         rec["figure_kind"] = kind_attr
             except Exception:
                 pass
 
-            # 4.a) пробуем достать структурированные raw_values из OOXML
             raw = _extract_raw_values_from_attrs(attrs_json)
             if raw:
                 rec["raw_values"] = raw
@@ -4199,10 +4320,7 @@ def _build_figure_records(
             if not rec.get("raw_values"):
                 cd, _ctype, _attrs = _parse_chart_data(attrs_json)
                 if cd:
-                    categories = [
-                        str(r.get("label") or r.get("name") or r.get("category") or "")
-                        for r in cd
-                    ]
+                    categories = [str(r.get("label") or r.get("name") or r.get("category") or "") for r in cd]
                     values = []
                     for r in cd:
                         v = r.get("value")
@@ -4221,56 +4339,33 @@ def _build_figure_records(
                     rec["values_source"] = "ooxml"
                     rec["values"] = rec["values_text"]
 
-            # 4.b) display — как и раньше
             if not rec["display"]:
                 title_text = row["text"] if ("text" in row.keys()) else None
-                rec["display"] = _compose_figure_display(
-                    attrs_json,
-                    row["section_path"],
-                    title_text,
-                )
+                rec["display"] = _compose_figure_display(attrs_json, row["section_path"], title_text)
 
-            # 4.c) текст после рисунка: 2–3 абзаца прямо из диплома
             try:
-                follow = _figure_following_paragraphs(
-                    uid, doc_id, row, max_paragraphs=3, max_chars=1500
-                )
+                follow = _figure_following_paragraphs(uid, doc_id, row, max_paragraphs=3, max_chars=1500)
                 if follow:
-                    # ⚠️ ВАЖНО: считаем именно этот текст «истиной» для данного рисунка
-                    # и не смешиваем его с RAG-хайлайтами от других рисунков.
                     rec["near_text"] = follow
                 elif not rec.get("near_text") and rec.get("caption"):
-                    # если вокруг рисунка нет отдельных абзацев,
-                    # используем хотя бы подпись как минимум текста
                     rec["near_text"] = [rec["caption"]]
             except Exception:
                 pass
 
-            # 4.d) фолбэк по таблице: только для числовых фигур и только при запросе чисел
             if not rec.get("raw_values"):
                 try:
                     textual_kinds = {
-                        "org_chart",
-                        "orgchart",
-                        "flowchart",
-                        "text_blocks",
-                        "schema",
-                        "scheme",
-                        "block_diagram",
-                        "structure",
+                        "org_chart", "orgchart", "flowchart", "text_blocks",
+                        "schema", "scheme", "block_diagram", "structure",
                     }
                     fig_kind = (rec.get("figure_kind") or "").strip().lower()
                     is_textual_figure = fig_kind in textual_kinds
-
                     if not is_textual_figure and need_values:
                         _attach_table_values_from_near_text(uid, doc_id, rec)
                 except Exception:
                     logging.exception("figure->table fallback failed")
 
-        if not rec["display"]:
-            rec["display"] = f"Рисунок {norm}"
-
-        # --- 5) VISION fallback ---
+        # --- 5) vision fallback ---
         if not rec.get("vision_desc") and va_analyze_figure and rec.get("images"):
             try:
                 vis = va_analyze_figure(rec["images"][0], lang="ru")
@@ -4278,57 +4373,49 @@ def _build_figure_records(
                     desc = (vis.get("description") or "").strip()
                     raw_text = (vis.get("raw_text") or vis.get("text") or "").strip()
                     vis_clean = " ".join([p for p in (desc, raw_text) if p]).strip()
-
                     low = vis_clean.lower()
                     if vis_clean and "описание не распознано" not in low and "содержимое изображения" not in low:
                         rec["vision_desc"] = vis_clean
-                        logging.info("FIGURE %s vision_fallback=%r", rec["num"], vis_clean[:300])
-                    else:
-                        logging.info("FIGURE %s vision_fallback discarded=%r", rec["num"], vis_clean[:300])
             except Exception as e:
                 logging.exception("vision fallback failed for figure %s: %s", rec["num"], e)
 
-                # --- 6) Санитарная очистка near_text ---
-        # Удаляем куски, которые явно относятся к ДРУГИМ рисункам
+        # санитарная очистка near_text
         clean_near: list[str] = []
         for t in rec.get("near_text") or []:
             txt = (t or "").strip()
             if not txt:
                 continue
-            m = re.search(r"(?:Рис\.?|Рисунок)\s+([\d.]+)", txt, flags=re.IGNORECASE)
-            if m:
-                other = _num_norm_fig(m.group(1))
-                # если в тексте упомянут другой номер рисунка — выкидываем такой абзац
+            m3 = re.search(r"(?:Рис\.?|Рисунок)\s+([\d.]+)", txt, flags=re.IGNORECASE)
+            if m3:
+                other = _num_norm_fig(m3.group(1))
                 if other and other != norm:
                     continue
             clean_near.append(txt)
-
         rec["near_text"] = clean_near
 
-        # --- 7) Фолбэк по подписи в обычном тексте (SmartArt и «невидимые» рисунки) ---
-        # Если после всех шагов по-прежнему нет ни подписи, ни внятного текста рядом,
-        # пробуем достать их из обычного текстового абзаца вида «Рис. 1.2 ...».
-        if (not rec.get("caption")) or not rec.get("near_text"):
-            try:
-                cap_fb, near_fb = _figure_fallback_from_caption_text(uid, doc_id, norm)
-            except Exception:
-                cap_fb, near_fb = None, []
-
-            if cap_fb and not rec.get("caption"):
-                rec["caption"] = cap_fb
-            if near_fb and not rec.get("near_text"):
-                rec["near_text"] = near_fb
-
-        # если после всех фолбэков вокруг рисунка всё ещё нет текста —
-        # используем хотя бы подпись как минимальный контекст
+        # минимальный контекст
         if not rec.get("near_text") and rec.get("caption"):
             rec["near_text"] = [rec["caption"]]
 
+        if not rec["display"]:
+            rec["display"] = f"Рисунок {norm}"
+
+        # ✅ КЛЮЧЕВОЕ: если нет ни одного доказательства существования рисунка — пропускаем
+        has_any_evidence = bool(
+            row
+            or rec.get("caption")
+            or rec.get("near_text")
+            or rec.get("images")
+            or (card is not None)
+            or (idx_oox is not None and rec.get("caption"))
+            or (fig_idx is not None and rec.get("images"))
+        )
+        if not has_any_evidence:
+            continue
+
         records_by_num[norm] = rec
 
-
     return list(records_by_num.values())
-
 
 
 def _clean_caption_for_figure(caption: str, expected_num: str) -> str:
@@ -4716,8 +4803,81 @@ def _fig_values_text_from_records(
             except Exception:
                 pass
 
+        # 3) ЕЩЁ ФОЛБЭК: values_str (то, что ты уже кладёшь в rec при сборе records)
+        if not values_text:
+            values_text = (rec.get("values_str") or "").strip()
+            if values_text:
+                rec["values_text"] = values_text
+                rec["values"] = values_text
+                # источник условный — это уже извлечённый текст/values, не OOXML-таблица
+                rec["values_source"] = rec.get("values_source") or "rag"
+
         if not values_text:
             continue
+
+        # --- CLEANUP: убираем пустые/плейсхолдеры, но сохраняем строки с числами ---
+        def _clean_values_text(v: str) -> str:
+            raw_lines = [ln.rstrip() for ln in (v or "").splitlines()]
+            kept: list[str] = []
+
+            # 1) первичная фильтрация: оставить только заголовки и строки с числами
+            for ln in raw_lines:
+                s = (ln or "").strip()
+                if not s:
+                    continue
+
+                # выкидываем плейсхолдеры типа ": %" или "— %"
+                if re.search(r"(:\s*%|—\s*%)(\s|$)", s):
+                    continue
+
+                # строки вида "— авторитетный:" / "— либеральный:" (без чисел) — выкидываем
+                if re.match(r"^[—\-]\s*[^:]+:\s*$", s):
+                    continue
+
+                # оставляем строки с цифрами (в т.ч. проценты)
+                if re.search(r"\d", s):
+                    kept.append(s)
+                    continue
+
+                # заголовки групп типа "адекватная:" — пока оставляем, потом подчистим
+                if s.endswith(":") and not s.startswith(("—", "-")):
+                    kept.append(s)
+                    continue
+
+                # остальное (текст без чисел) — обычно не нужно в блоке "значения"
+                # но можно оставить, если тебе это важно
+                # kept.append(s)
+
+            # 2) вторичный проход: убрать "висячие" заголовки, под которыми нет чисел
+            final_lines: list[str] = []
+            i = 0
+            while i < len(kept):
+                s = kept[i]
+                if s.endswith(":") and not re.search(r"\d", s):
+                    # ищем, есть ли дальше до следующего заголовка хоть одна строка с цифрами
+                    j = i + 1
+                    has_num = False
+                    while j < len(kept) and not (kept[j].endswith(":") and not re.search(r"\d", kept[j])):
+                        if re.search(r"\d", kept[j]):
+                            has_num = True
+                            break
+                        j += 1
+                    if has_num:
+                        final_lines.append(s)
+                    i += 1
+                    continue
+
+                final_lines.append(s)
+                i += 1
+
+            return "\n".join(final_lines).strip()
+
+        values_text = _clean_values_text(values_text)
+
+        # если после очистки ничего не осталось — пропускаем блок
+        if not values_text:
+            continue
+        # --- /CLEANUP ---
 
         disp = rec.get("display") or f"Рисунок {rec.get('num') or ''}".strip()
         src = (rec.get("values_source") or "").lower()
@@ -4930,23 +5090,21 @@ async def _answer_figure_query(
     m: types.Message, uid: int, doc_id: int, text: str, *, verbosity: str = "normal"
 ) -> bool:
     """
-    Новый единый сценарий:
-    1) всегда вытаскиваем максимум по рисункам (_build_figure_records);
-    2) собираем блоки с точными значениями по КАЖДОМУ рисунку (если есть);
-    3) даём по каждому рисунку пояснение через GPT + добавляем его блок значений.
-
-    ВАЖНО: теперь мы разделяем:
-    - user_asked_values: пользователь ЯВНО просил числа;
-    - need_values_for_search: внутренняя эвристика, чтобы агрессивнее искать таблицы/OOXML.
+    Строгий сценарий:
+    - если рисунка нет в работе -> честно "нет в работе" и НЕ вызываем LLM.
     """
+    t_low = (text or "").lower()
 
-    # 0) по тексту запроса — есть ли ЯВНЫЙ намёк на числа
-    user_asked_values = bool(_VALUES_HINT.search(text or ""))
+    user_asked_values = bool(_VALUES_HINT.search(text or "")) or bool(
+        re.search(r"\b(что\s+показывает|что\s+на\s+рисунк|опиши\s+рисунк|какие\s+значения|процент|доля)\b", t_low)
+    )
 
-    # этот флаг будем передавать в _build_figure_records, его можно форсить эвристикой
+    # если человек просит "строго по данным/подписи" — это почти всегда про значения тоже
+    if "строго" in t_low and ("данн" in t_low or "подпис" in t_low):
+        user_asked_values = True
+
     need_values_for_search = user_asked_values
 
-    # 1) вытаскиваем номера рисунков из текста
     raw_list = _extract_fig_nums(text or "")
     seen: set[str] = set()
     nums: list[str] = []
@@ -4954,67 +5112,98 @@ async def _answer_figure_query(
         n = _num_norm_fig(token)
         if n and n not in seen:
             seen.add(n)
-            # ⬇️ ВАЖНО: работаем дальше с нормализованным номером
             nums.append(n)
-
 
     if not nums:
         return False
 
-    # 🎯 ЭВРИСТИКА ТОЛЬКО ДЛЯ ПОИСКА ЧИСЕЛ, НЕ ДЛЯ СООБЩЕНИЙ ПОЛЬЗОВАТЕЛЮ
-    # если пользователь просто «опиши рисунок 2.2», но по OOXML нет сырых чисел —
-    # можно форснуть need_values_for_search=True, чтобы агрессивнее искать таблицы.
+    # ✅ ЖЁСТКИЙ фильтр существования
+    existing: list[str] = []
+    missing: list[str] = []
+    for n in nums:
+        try:
+            if _real_figure_exists(uid, doc_id, n):
+                existing.append(n)
+            else:
+                missing.append(n)
+        except Exception:
+            existing.append(n)
+
+    if missing:
+        if not existing:
+            if len(missing) == 1:
+                await _send(m, f"Рисунок {missing[0]}: данного рисунка нет в работе.")
+            else:
+                await _send(m, "\n".join([f"- Рисунок {x}: данного рисунка нет в работе." for x in missing]))
+            return True
+
+        await _send(m, "\n".join([f"- Рисунок {x}: данного рисунка нет в работе." for x in missing]))
+
+    # эвристика поиска чисел — только по существующим
     if not need_values_for_search:
         try:
-            for token in nums:
-                n = _num_norm_fig(token)
-                if not n:
-                    continue
+            for n in existing:
                 rec_row = _fetch_figure_row_by_num(uid, doc_id, n)
                 if not rec_row:
                     continue
                 attrs_json = rec_row["attrs"] if ("attrs" in rec_row.keys()) else None
                 raw = _extract_raw_values_from_attrs(attrs_json)
-                # если сырых чисел нет — лучше включить поиск таблиц
                 if not raw:
                     need_values_for_search = True
                     break
         except Exception:
-            # не считаем падение эвристики фатальным
             pass
 
-    # 2) собираем единую структуру по всем рисункам (сюда передаём ВНУТРЕННИЙ флаг)
-    records = _build_figure_records(uid, doc_id, nums, need_values=need_values_for_search)
+    records = _build_figure_records(uid, doc_id, existing, need_values=need_values_for_search)
     if not records:
+        await _send(m, "Не удалось извлечь данные по запрошенному рисунку из документа.")
+        return True
+
+    def _has_any_extracted_fig_data(rec: dict) -> bool:
+        imgs = rec.get("images") or []
+        if isinstance(imgs, (list, tuple)) and len(imgs) > 0:
+            return True
+        if (rec.get("text") or "").strip():
+            return True
+        if (rec.get("values_str") or "").strip():
+            return True
+        vision = rec.get("vision") or {}
+        if isinstance(vision, dict) and (vision.get("description") or "").strip():
+            return True
+        # иногда полезные куски лежат в highlights/attrs
+        if rec.get("highlights"):
+            return True
+        if (rec.get("attrs_json") or rec.get("attrs") or "").strip():
+            return True
         return False
 
-    # 3) по каждому рисунку отдельно: пояснение + его блок значений
-        # 3) по каждому рисунку отдельно: пояснение + его блок значений
     for rec in records:
         num = rec.get("num")
         if not num:
             continue
 
-        try:
-            # ⬇️ Передаём rec внутрь, чтобы GPT-описание жёстко опиралось
-            # на уже найденную карточку, а не на заново собранные данные.
-            explanation = await _describe_figure_for_multi(
-                uid,
-                doc_id,
-                num,
-                text,
-                verbosity,
-                rec=rec,
+        # ✅ В строгом режиме: если данных по рисунку нет — НЕ вызываем LLM,
+        # чтобы она не “дорисовала” проценты/числа.
+        if FIG_STRICT and not _has_any_extracted_fig_data(rec):
+            display = (rec.get("display") or "").strip() or f"Рисунок {num}"
+            # “только по подписи/данным”: данных нет => честно сообщаем
+            await _send(
+                m,
+                f"{display}.\n\n"
+                "Числовые данные/содержимое рисунка не извлечены из документа, "
+                "поэтому могу опираться только на подпись. Дополнительных выводов без данных не делаю."
             )
+            continue
+
+        try:
+            explanation = await _describe_figure_for_multi(uid, doc_id, num, text, verbosity, rec=rec)
         except Exception as e:
             logging.exception("describe_figure_for_multi failed in _answer_figure_query: %s", e)
             explanation = ""
 
-
         if not explanation:
             continue
 
-        # определяем тип рисунка
         fig_kind = (rec.get("figure_kind") or "").strip().lower()
         textual_kinds = {
             "org_chart",
@@ -5027,31 +5216,21 @@ async def _answer_figure_query(
             "structure",
         }
 
-        # 👉 ВАЖНО:
-        # user_asked_values — "пользователь реально просил числа",
-        # а не "мы внутри хотим поискать таблицу".
-        # Для схем/оргструктур не просим числовые значения даже если пользователь их хотел.
         need_values_for_message = user_asked_values and (fig_kind not in textual_kinds)
 
-        # 🔢 Для этого конкретного рисунка собираем его "Точные значения"
-        per_values_block = _fig_values_text_from_records(
-            [rec],
-            need_values=need_values_for_message,
-        )
-
+        per_values_block = _fig_values_text_from_records([rec], need_values=need_values_for_message)
         if per_values_block:
             explanation = explanation.rstrip() + "\n\n" + per_values_block.strip()
 
-        await m.answer(explanation)
+        # ✅ вместо m.answer — общий отправщик (и тесты не падают)
+        await _send(m, explanation)
 
-    # 6) обновляем «последний упомянутый рисунок» для анафорических вопросов
     try:
-        LAST_REF.setdefault(uid, {})["figure_nums"] = [r["num"] for r in records]
+        LAST_REF.setdefault(uid, {})["figure_nums"] = [r["num"] for r in records if r.get("num")]
     except Exception:
         pass
 
     return True
-
 
 
 def _ooxml_table_block(uid: int, doc_id: int, num: str) -> str | None:
@@ -5730,7 +5909,6 @@ def _reindex_with_sections(uid: int, doc_id: int, sections: list[dict]) -> None:
 async def _ensure_modalities_indexed(m: types.Message, uid: int, doc_id: int, intents: dict):
     """Если документ старый и нет reference/figure — тихо перепарсим новым парсером и переиндексируем."""
     need_refs = bool(intents.get("sources", {}).get("want"))
-
     need_figs = bool(intents.get("figures", {}).get("want"))
     if not (need_refs or need_figs):
         return
@@ -5739,6 +5917,7 @@ async def _ensure_modalities_indexed(m: types.Message, uid: int, doc_id: int, in
     if not should:
         return
 
+    # (опционально) DB тоже можно вынести в thread — но тут запрос короткий.
     con = get_conn()
     cur = con.cursor()
     cur.execute("SELECT path FROM documents WHERE id=? AND owner_id=?", (doc_id, uid))
@@ -5748,9 +5927,14 @@ async def _ensure_modalities_indexed(m: types.Message, uid: int, doc_id: int, in
         return
 
     path = row["path"]
+
+    # ТЯЖЁЛОЕ: парсинг + enrich — в отдельный поток
     try:
-        sections = _parse_by_ext(path)
-        sections = enrich_sections(sections, doc_kind=os.path.splitext(path)[1].lower().strip("."))
+        def _parse_and_enrich() -> list[dict]:
+            secs = _parse_by_ext(path)
+            return enrich_sections(secs, doc_kind=os.path.splitext(path)[1].lower().strip("."))
+
+        sections = await asyncio.to_thread(_parse_and_enrich)
     except Exception as e:
         logging.exception("re-parse/enrich failed: %s", e)
         return
@@ -5766,11 +5950,14 @@ async def _ensure_modalities_indexed(m: types.Message, uid: int, doc_id: int, in
 
     if do_reindex:
         try:
-            _reindex_with_sections(uid, doc_id, sections)
-            await _send(m, "Обновил индекс документа: добавлены распознанные рисунки/источники (включая OOXML-диаграммы).")
+            # ТЯЖЁЛОЕ: переиндексация (БД + эмбеддинги + запись чанков) — в поток
+            await asyncio.to_thread(_reindex_with_sections, uid, doc_id, sections)
+            await _send(
+                m,
+                "Обновил индекс документа: добавлены распознанные рисунки/источники (включая OOXML-диаграммы)."
+            )
         except Exception as e:
             logging.exception("self-heal reindex failed: %s", e)
-
 
 # -------------------------- Сбор фактов --------------------------
 
@@ -5790,7 +5977,6 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
     if intents.get("tables", {}).get("describe"):
         exact = True
     facts["exact_numbers"] = exact
-
 
     # ----- Таблицы -----
     if intents["tables"]["want"]:
@@ -5847,12 +6033,10 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
         # Авто-описание для общего запроса про таблицы
         desc_cards = []
         if not intents.get("tables", {}).get("describe"):
-            # возьмём первые 3–5 таблиц из списка
             bases = _distinct_table_basenames(uid, doc_id)[:min(5, t_limit)]
             con = get_conn()
             cur = con.cursor()
             for base in bases:
-                # attrs + первые 1–2 строки
                 cur.execute("""
                     SELECT page, section_path, attrs FROM chunks
                     WHERE owner_id=? AND doc_id=? AND element_type IN ('table','table_row')
@@ -5880,7 +6064,6 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
                 display = _compose_display_from_attrs(attrs_json, row["section_path"], highlights[0] if highlights else None)
                 display = _strip_table_prefix(display)
 
-                # попробуем вытащить номер для stats
                 num, _ = _parse_table_title(display)
                 stats = None
                 if num:
@@ -5898,10 +6081,8 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
                 })
             con.close()
 
-        # Общий список таблиц с кратким описанием
         facts["tables"]["describe"] = desc_cards
 
-        # describe по конкретным номерам + точные расчеты (перезаписываем describe, если запрос конкретный)
         if intents.get("tables", {}).get("describe"):
             desc_cards = []
             con = get_conn()
@@ -5937,7 +6118,6 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
                     continue
 
                 attrs_json = row["attrs"] if row else None
-                # 1–2 первых строки как highlights
                 cur.execute(
                     """
                     SELECT text FROM chunks
@@ -5959,7 +6139,6 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
                 display = _compose_display_from_attrs(attrs_json, base, first_row_text)
                 display = _strip_table_prefix(display)
 
-                # НОВОЕ: точная аналитика по таблице
                 stats = None
                 try:
                     stats = analyze_table_by_num(uid, doc_id, num, max_series=6)
@@ -5977,7 +6156,6 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
 
             facts["tables"]["describe"] = desc_cards
 
-            # запомним эти номера таблиц как «последние упомянутые»
             try:
                 LAST_REF.setdefault(uid, {})["table_nums"] = [
                     str(c["num"]) for c in desc_cards if c.get("num")
@@ -5993,19 +6171,15 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
             "count": int(lst.get("count") or 0),
             "list": list(lst.get("list") or []),
             "more": int(lst.get("more") or 0),
-            # ключи в формате, который ждёт answer_builder
             "describe": [],
             "describe_cards": [],
-            # на будущее: флаг фокуса на конкретных номерах рисунков
             "single_only": False,
             "describe_nums": [],
         }
 
-
         nums = list(intents.get("figures", {}).get("describe") or [])
         if nums:
             try:
-                # ⚙️ Берём карточки ТОЛЬКО по указанным номерам (5 и 6 → только 5 и 6)
                 cards = describe_figures_by_numbers(
                     uid,
                     doc_id,
@@ -6025,28 +6199,21 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
                     figs_block["describe"] = ["Данного рисунка нет в работе."]
                     figs_block["describe_cards"] = []
                 else:
-                    # Основное для answer_builder: полный набор describe_cards
                     figs_block["describe_cards"] = cards
-
-                    # Чтобы в [Figures]/list не попадали лишние рисунки,
-                    # если запрос был только про конкретные номера.
                     figs_block["list"] = [
-                        (c.get("display")
-                        or f"Рисунок {c.get('num') or ''}".strip())
+                        (c.get("display") or f"Рисунок {c.get('num') or ''}".strip())
                         for c in cards
                     ]
                     figs_block["count"] = len(figs_block["list"])
                     figs_block["more"] = 0
 
-                    # Для обратной совместимости — короткие текстовые описания
                     lines = []
                     for c in cards:
                         disp = c.get("display") or "Рисунок"
                         vis = (c.get("vision") or {}).get("description", "") or ""
                         vis_clean = vis.strip()
                         low_vis = vis_clean.lower()
-                        if ("описание не распознано" in low_vis
-                                or "содержимое изображения" in low_vis):
+                        if ("описание не распознано" in low_vis or "содержимое изображения" in low_vis):
                             vis_clean = ""
                         hint = "; ".join([h for h in (c.get("highlights") or []) if h])
                         if vis_clean:
@@ -6057,7 +6224,6 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
                             lines.append(disp)
                     figs_block["describe"] = lines[:25]
 
-                    # 💡 важное: помечаем, что нужно сфокусироваться только на этих номерах
                     figs_block["single_only"] = True
                     figs_block["describe_nums"] = list(nums)
             except Exception as e:
@@ -6120,21 +6286,33 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
             "more": max(0, len(items) - s_limit),
         }
 
-
     # ----- Практическая часть -----
     if intents.get("practical"):
         facts["practical_present"] = _has_practical_part(uid, doc_id)
 
     # ----- Summary -----
     if intents.get("summary"):
-        s = overview_context(uid, doc_id, max_chars=6000) or _first_chunks_context(uid, doc_id, n=12, max_chars=6000)
-        if s:
+        # В строгом режиме summary должен строиться только из реального найденного summary-контекста.
+        # Никаких фолбэков на "первые куски документа" — иначе модель начинает додумывать.
+        s = overview_context(uid, doc_id, max_chars=6000)
+        if s and str(s).strip():
             facts["summary_text"] = s
+        else:
+            # summary не найден — это нормально; помечаем, чтобы генератор мог отказаться/попросить уточнение
+            # (не ставим глобальный no_grounding, потому что summary — частный интент)
+            facts["summary_text"] = ""
+            facts["summary_not_found"] = True
+
 
     # ----- Общий контекст / цитаты -----
-    # app/bot.py (_gather_facts: общий контекст / цитаты)
     if intents.get("general_question"):
-        question_text = intents.get("general_question") or ""
+        question_text = (intents.get("question_text") or "")
+        if not isinstance(question_text, str):
+            question_text = str(question_text)
+        question_text = question_text.strip()
+
+
+        facts.setdefault("no_grounding", False)
 
         vb = verbatim_find(uid, doc_id, question_text, max_hits=3)
 
@@ -6143,94 +6321,159 @@ def _gather_facts(uid: int, doc_id: int, intents: dict) -> dict:
             doc_id=doc_id,
             question=question_text,
         )
-        ctx = ""
-        if cov and cov.get("snippets"):
-            ctx = build_context_coverage(
-                cov["snippets"],
-                items_count=len(cov.get("items") or []) or None,
-            )
 
+        min_score = float(getattr(Cfg, "RETRIEVE_MIN_SCORE", 0.24))
+        min_ctx_chars = int(getattr(Cfg, "MIN_GROUNDED_CTX_CHARS", 260))
+
+        # helper: посчитать max_score/strong_hits по сниппетам (если retrieve_coverage не вернул метрики)
+        def _snip_metrics(snips: list[dict]) -> tuple[float, int]:
+            mx = 0.0
+            strong = 0
+            for s in snips or []:
+                try:
+                    sc = float(s.get("score") or 0.0)
+                except Exception:
+                    sc = 0.0
+                if sc > mx:
+                    mx = sc
+                if sc >= min_score:
+                    strong += 1
+            return mx, strong
+
+        ctx = ""
+        ctx_source = None
+        cov_max = 0.0
+        cov_strong = 0
+
+        # 1) coverage — самый “доказательный” контекст
+        if cov and cov.get("snippets"):
+            snips = cov.get("snippets") or []
+            cov_max = float(cov.get("max_score") or 0.0)
+            cov_strong = int(cov.get("strong_hits") or 0)
+            if cov_max <= 0.0 and cov_strong <= 0:
+                cov_max, cov_strong = _snip_metrics(snips)
+
+            # собираем контекст только если есть хотя бы один сильный хит
+            if cov_strong > 0:
+                ctx = build_context_coverage(
+                    snips,
+                    items_count=len(cov.get("items") or []) or None,
+                )
+                if ctx and len(ctx.strip()) >= min_ctx_chars:
+                    ctx_source = "coverage"
+                else:
+                    ctx = ""
+                    ctx_source = None
+
+        # 2) лексический best_context
         if not ctx:
-            ctx = best_context(uid, doc_id, question_text, max_chars=6000)
+            tmp = best_context(uid, doc_id, question_text, max_chars=6000) or ""
+            # страховка по длине, чтобы не принимать “обрывок”
+            if tmp and len(tmp.strip()) >= min_ctx_chars:
+                ctx = tmp
+                ctx_source = "best_context"
+
+        # 3) векторный retrieve
+        hits = None
+        vec_max = 0.0
+        vec_strong = 0
         if not ctx:
             hits = retrieve(uid, doc_id, question_text, top_k=12)
             if hits:
-                ctx = build_context(hits)
-        if not ctx:
-            ctx = _first_chunks_context(uid, doc_id, n=12, max_chars=6000)
+                vec_max, vec_strong = _snip_metrics(hits)
+                if vec_strong > 0:
+                    tmp_ctx = build_context(hits)
+                    if tmp_ctx and len(tmp_ctx.strip()) >= min_ctx_chars:
+                        ctx = tmp_ctx
+                        ctx_source = "vector"
+
+        # ✅ Grounding: только реальные доказательства, а не “items-план”
+        grounded = False
+        if vb:
+            grounded = True
+        if ctx and ctx_source in ("coverage", "best_context", "vector"):
+            grounded = True
 
         if ctx:
             facts["general_ctx"] = ctx
+            facts["general_ctx_source"] = ctx_source
+            facts["general_ctx_metrics"] = {
+                "min_score": min_score,
+                "min_ctx_chars": min_ctx_chars,
+                "cov_max_score": cov_max,
+                "cov_strong_hits": cov_strong,
+                "vec_max_score": vec_max,
+                "vec_strong_hits": vec_strong,
+            }
+
         if vb:
             facts["verbatim_hits"] = vb
+
+        # items можно сохранять, но НЕ считать их “grounding”
         if cov and cov.get("items"):
-            # coverage в формате, который умеет facts_to_prompt
             facts["coverage"] = {"items": cov["items"]}
 
+        if not grounded:
+            facts["no_grounding"] = True
+            facts["no_grounding_reason"] = "no_strong_context_from_index"
 
-        # --- [VISION] второй проход: числа из диаграмм/картинок (подмешиваем в контекст) ---
-        try:
-            vision_block = ""
-            if getattr(Cfg, "vision_active", lambda: False)():
-                # 1) берём топ-хиты специально для картинок
-                hits_v = retrieve(uid, doc_id, question_text, top_k=10) or []
+        # --- [VISION] второй проход ---
+        # В строгом режиме НЕ тратим ресурсы на vision, если уже нет опоры по документу.
+        if not facts.get("no_grounding"):
+            try:
+                vision_block = ""
+                if getattr(Cfg, "vision_active", lambda: False)():
+                    hits_v = retrieve(uid, doc_id, question_text, top_k=10) or []
 
-                # 1а) если в хитах есть chart_data (DOCX-диаграммы) — используем точные числа, без vision
-                chart_lines: list[str] = []
-                for h in hits_v:
-                    attrs = (h.get("attrs") or {})
-                    cd = attrs.get("chart_data")
-                    if cd:
-                        # переиспользуем уже написанный парсер: упакуем в attrs-json
-                        try:
-                            cd_list, _, _ = _parse_chart_data(json.dumps({"chart_data": cd}))
-                        except Exception:
-                            cd_list = None
-                        if cd_list:
-                            chart_lines.append(_format_chart_values(cd_list))
-
-                if chart_lines:
-                    vision_block = "\n".join(chart_lines[:3])
-                else:
-                    # 2) иначе — отправляем 1–3 картинки в новый vision_analyzer
-                    img_paths = _pick_images_from_hits(
-                        hits_v,
-                        limit=getattr(Cfg, "VISION_MAX_IMAGES_PER_REQUEST", 3),
-                    )
-                    if img_paths and va_analyze_figure:
-                        chunks: list[str] = []
-                        hint = question_text[:300]
-                        for p in img_paths:
+                    chart_lines: list[str] = []
+                    for h in hits_v:
+                        attrs = (h.get("attrs") or {})
+                        cd = attrs.get("chart_data")
+                        if cd:
                             try:
-                                res = va_analyze_figure(p, caption_hint=hint, lang="ru")
+                                cd_list, _, _ = _parse_chart_data(json.dumps({"chart_data": cd}))
                             except Exception:
-                                continue
+                                cd_list = None
+                            if cd_list:
+                                chart_lines.append(_format_chart_values(cd_list))
 
-                            text_block = ""
-                            if isinstance(res, dict):
-                                pairs = res.get("data") or []
-                                text_block = (res.get("text") or "").strip() or _pairs_to_bullets(pairs)
-                            else:
-                                text_block = (str(res) or "").strip()
+                    if chart_lines:
+                        vision_block = "\n".join(chart_lines[:3])
+                    else:
+                        img_paths = _pick_images_from_hits(
+                            hits_v,
+                            limit=getattr(Cfg, "VISION_MAX_IMAGES_PER_REQUEST", 3),
+                        )
+                        if img_paths and va_analyze_figure:
+                            chunks: list[str] = []
+                            hint = question_text[:300]
+                            for p in img_paths:
+                                try:
+                                    res = va_analyze_figure(p, caption_hint=hint, lang="ru")
+                                except Exception:
+                                    continue
 
-                            if text_block:
-                                chunks.append("[Text on image]\n" + text_block)
+                                text_block = ""
+                                if isinstance(res, dict):
+                                    pairs = res.get("data") or []
+                                    text_block = (res.get("text") or "").strip() or _pairs_to_bullets(pairs)
+                                else:
+                                    text_block = (str(res) or "").strip()
 
-                        if chunks:
-                            vision_block = "\n\n".join(chunks)
-                        elif FIG_STRICT:
-                            vision_block = "[No precise data]"
+                                if text_block:
+                                    chunks.append("[Text on image]\n" + text_block)
 
-            if vision_block:
-                prev = facts.get("general_ctx") or ""
-                glue = ("\n\n" if prev else "")
-                facts["general_ctx"] = (prev + glue + vision_block)
-        except Exception:
-            # не ломаем основной ответ, если vision дал сбой
-            pass
+                            if chunks:
+                                vision_block = "\n\n".join(chunks)
+                            elif FIG_STRICT:
+                                vision_block = "[No precise data]"
 
-        # --- [/VISION] ---
-
+                if vision_block:
+                    prev = facts.get("general_ctx") or ""
+                    glue = ("\n\n" if prev else "")
+                    facts["general_ctx"] = (prev + glue + vision_block)
+            except Exception:
+                pass
 
     # логируем маленький срез фактов (без огромных текстов)
     log_snapshot = dict(facts)
@@ -6297,45 +6540,127 @@ def _full_document_text(owner_id: int, doc_id: int, *, limit_chars: int | None =
 
 def _real_table_exists(owner_id: int, doc_id: int, table_num: str) -> bool:
     """
-    Проверяем, что в ТЕКСТЕ документа реально есть упоминание
-    именно «таблица <table_num>».
+    Проверяем, что в тексте реально есть "таблица N" / "табл. N" и номер не является префиксом другого (2.2 != 2.20).
 
-    Нужен, чтобы не пытаться описывать несуществующие «таблицу 2.2»
-    и «2.3», если в файле только «таблица 2» и «таблица 3».
+    Важно:
+    - НЕ используем lower(text) в SQLite для кириллицы: он не гарантированно приводит русские буквы.
+    - Проверку "не префикс" делаем в Python через regex (?!\d).
+    - Поддерживаем кейс, когда "таблица N" стоит в конце строки (например "таблица 3").
     """
     if not table_num:
         return False
 
-    # Нормализуем номер: "2.2" → "2.2", "2,2" → "2.2"
-    num_norm = table_num.strip().replace(",", ".").lower()
+    num_norm = table_num.strip().replace(",", ".")
+    if not num_norm:
+        return False
 
-    like_patterns = [
-        f"%таблица {num_norm}%",     # таблица 2.2
-        f"%таблица №{num_norm}%",    # таблица №2.2
-        f"%таблица № {num_norm}%",   # таблица № 2.2
-    ]
+    # Python-regex:
+    #  - табл / таблица / табл.
+    #  - опционально "№"
+    #  - после номера: НЕ цифра (или конец строки), чтобы 2.2 не матчился на 2.20
+    #  - допускаем конец строки сразу после номера ("таблица 3")
+    import re
+
+    num_re = re.escape(num_norm)
+    rx = re.compile(
+        rf"(?iu)\bтабл(?:ица|\.)?\s*№?\s*{num_re}(?!\d)",
+        re.IGNORECASE,
+    )
 
     con = get_conn()
-    cur = con.cursor()
-    for pat in like_patterns:
+    try:
+        cur = con.cursor()
+
+        # Берём кандидатов (чтобы не тащить всю БД):
+        # достаточно строк, где есть "табл" или "таблица" и есть цифры.
         cur.execute(
             """
-            SELECT 1
+            SELECT text
             FROM chunks
             WHERE owner_id = ?
               AND doc_id = ?
-              AND lower(text) LIKE ?
-            LIMIT 1
+              AND text IS NOT NULL
+              AND (text LIKE '%табл%' OR text LIKE '%Табл%' OR text LIKE '%таблица%' OR text LIKE '%Таблица%')
             """,
-            (owner_id, doc_id, pat),
+            (owner_id, doc_id),
         )
-        row = cur.fetchone()
-        if row:
-            con.close()
-            return True
 
-    con.close()
-    return False
+        for (t,) in cur.fetchall() or []:
+            if not t:
+                continue
+            # нормализуем разделители в тексте (на всякий случай)
+            tt = str(t).replace(",", ".")
+            if rx.search(tt):
+                return True
+
+        return False
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+def _real_figure_exists(owner_id: int, doc_id: int, fig_num: str) -> bool:
+    """
+    Строгая проверка: есть ли в документе рисунок с таким номером.
+    """
+    if not fig_num:
+        return False
+
+    num_norm = fig_num.strip().replace(",", ".").lower()
+
+    glob_patterns = [
+        f"*рисунок {num_norm}[^0-9]*",
+        f"*рис. {num_norm}[^0-9]*",
+        f"*рис.{num_norm}[^0-9]*",
+    ]
+
+    con = get_conn()
+    try:
+        cur = con.cursor()
+        for gp in glob_patterns:
+            cur.execute(
+                """
+                SELECT 1
+                FROM chunks
+                WHERE owner_id = ?
+                  AND doc_id = ?
+                  AND text IS NOT NULL
+                  AND lower(text) GLOB ?
+                LIMIT 1
+                """,
+                (owner_id, doc_id, gp),
+            )
+            if cur.fetchone():
+                return True
+
+        # если у тебя есть element_type='figure' с caption_num в attrs — можно усилить:
+        try:
+            cur.execute(
+                """
+                SELECT 1
+                FROM chunks
+                WHERE owner_id = ?
+                  AND doc_id = ?
+                  AND element_type = 'figure'
+                  AND attrs IS NOT NULL
+                  AND lower(attrs) LIKE lower(?)
+                LIMIT 1
+                """,
+                (owner_id, doc_id, f'%\"caption_num\"%{num_norm}%'),
+            )
+            if cur.fetchone():
+                return True
+        except Exception:
+            pass
+
+        return False
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
 
 def _fullread_try_answer(uid: int, doc_id: int, q_text: str) -> str | None:
     """
@@ -6512,11 +6837,12 @@ def _iterative_fullread_build_messages(uid: int, doc_id: int, question: str) -> 
 
 @dp.message(F.document)
 async def handle_doc(m: types.Message):
-    uid = ensure_user(str(m.from_user.id))
+    # ensure_user / start_downloading часто трогают SQLite/диск → лучше вынести из event loop
+    uid = await asyncio.to_thread(ensure_user, str(m.from_user.id))
     doc = m.document
 
-    # 0) FSM: фиксируем, что начали скачивание
-    start_downloading(uid)
+    # 0) FSM: фиксируем, что начали скачивание (если это БД/файл — тоже в thread)
+    await asyncio.to_thread(start_downloading, uid)
     await _send(m, Cfg.MSG_ACK_DOWNLOADING)
 
     # 1) скачиваем файл целиком (без обрезки)
@@ -6526,22 +6852,25 @@ async def handle_doc(m: types.Message):
     buf = BytesIO()
     await bot.download_file(file.file_path, destination=buf)
     buf.seek(0)
-    data = buf.read()  # здесь все байты файла как есть
+    data = buf.read()  # bytes (быстро, в памяти)
 
     # 2) сохраняем на диск (единственный источник правды для оркестратора)
     filename = safe_filename(f"{m.from_user.id}_{doc.file_name}")
-    path = save_upload(data, filename, Cfg.UPLOAD_DIR)
+    path = await asyncio.to_thread(save_upload, data, filename, Cfg.UPLOAD_DIR)
     await _send(m, Cfg.MSG_ACK_INDEXING)
 
     # 3) обёртка индексатора под сигнатуру оркестратора (замыкаем uid)
     def _indexer_fn(doc_id: int, file_path: str, kind: str) -> dict:
+        # ВАЖНО: ingest_document выполняется в to_thread, значит _indexer_fn тоже будет вызван в этом же потоке.
         sections = _parse_by_ext(file_path)
         sections = enrich_sections(sections, doc_kind=os.path.splitext(file_path)[1].lower().strip("."))
+
         # sanity-check на «пустые» файлы
         if sum(len(s.get("text") or "") for s in sections) < 500 and not any(
             s.get("element_type") in ("table", "table_row", "figure") for s in sections
         ):
             raise RuntimeError("Похоже, файл не содержит «живого» текста/структур.")
+
         # индексация «как раньше»
         delete_document_chunks(doc_id, uid)
         index_document(uid, doc_id, sections)
@@ -6549,9 +6878,10 @@ async def handle_doc(m: types.Message):
         update_document_meta(doc_id, layout_profile=_current_embedding_profile())
         return {"sections_count": len(sections)}
 
-    # 4) запускаем оркестратор (он сам: идемпотентность, INDEXING, READY/IDLE, версия индексатора)
+    # 4) запускаем оркестратор В ОТДЕЛЬНОМ ПОТОКЕ (чтобы не блокировать event loop)
     try:
-        result = ingest_document(
+        result = await asyncio.to_thread(
+            ingest_document,
             user_id=uid,
             file_path=path,
             kind=infer_doc_kind(doc.file_name),
@@ -6566,31 +6896,33 @@ async def handle_doc(m: types.Message):
 
     doc_id = int(result["doc_id"])
     ACTIVE_DOC[uid] = doc_id
-    set_user_active_doc(uid, doc_id)
+    await asyncio.to_thread(set_user_active_doc, uid, doc_id)
 
-    # NEW: построить индекс рисунков из исходного файла и закэшировать (старый путь)
+    # NEW: построить индекс рисунков из исходного файла и закэшировать (старый путь) — тоже в thread
     try:
         if fig_index_document is not None:
-            FIG_INDEX[doc_id] = fig_index_document(path)
+            FIG_INDEX[doc_id] = await asyncio.to_thread(fig_index_document, path)
     except Exception as e:
         logging.exception("figures indexing failed: %s", e)
 
-
-        # NEW: построить ЕДИНЫЙ OOXML-индекс (главы/рисунки/таблицы/источники) без LibreOffice
-    # NEW: построить ЕДИНЫЙ OOXML-индекс (главы/рисунки/таблицы/источники) без LibreOffice
+    # NEW: построить ЕДИНЫЙ OOXML-индекс — тоже в thread
     try:
-        idx_oox = oox_build_index(path)
+        idx_oox = await asyncio.to_thread(oox_build_index, path)
         OOXML_INDEX[doc_id] = idx_oox
-        #persist под ID документа из БД — чтобы _ooxml_get_index работал после рестарта процесса
-        try:
+
+        # persist под ID документа из БД — json.dump + open могут блокировать → в thread
+        def _persist_oox_index(_doc_id: int, _idx: dict):
             os.makedirs(os.path.join("runtime", "indexes"), exist_ok=True)
-            with open(os.path.join("runtime", "indexes", f"{doc_id}.json"), "w", encoding="utf-8") as f:
-                json.dump(idx_oox, f, ensure_ascii=False, indent=2)
+            with open(os.path.join("runtime", "indexes", f"{_doc_id}.json"), "w", encoding="utf-8") as f:
+                json.dump(_idx, f, ensure_ascii=False, indent=2)
+
+        try:
+            await asyncio.to_thread(_persist_oox_index, doc_id, idx_oox)
         except Exception:
             pass
+
     except Exception as e:
         logging.exception("ooxml build_index failed: %s", e)
-
 
     # 5) READY: сообщаем и обрабатываем ...
     await _send(
@@ -6602,9 +6934,9 @@ async def handle_doc(m: types.Message):
     if caption:
         await respond_with_answer(m, uid, doc_id, caption)
 
-    # авто-дренаж очереди ожидания (без дублей одинаковых вопросов)
+    # авто-дренаж очереди ожидания (если это SQLite/файл — тоже в thread)
     try:
-        queued = dequeue_all_pending_queries(uid)
+        queued = await asyncio.to_thread(dequeue_all_pending_queries, uid)
         for item in queued:
             q = (item.get("text") or "").strip()
             if not q:
@@ -6617,143 +6949,15 @@ async def handle_doc(m: types.Message):
     except Exception as e:
         logging.exception("drain pending queue failed: %s", e)
 
-
-# ------------------------------ обработчик обычных текстовых сообщений ------------------------------
-
-# @dp.message(F.text & ~F.document)
-# async def handle_text_message(m: types.Message):
-#     uid = ensure_user(str(m.from_user.id))
-#     text = (m.text or m.caption or "").strip()
-
-#     if not text:
-#         await _send(m, "Сообщение пустое. Напиши, что именно тебя интересует по ВКР.")
-#         return
-
-#     # 1) Если ждём «да/нет» на предложение ответа от [модель] — обрабатываем в первую очередь
-#     pending = MODEL_EXTRA_PENDING.get(uid)
-#     if pending and (_is_yes_answer(text) or _is_no_answer(text)):
-#         if _is_yes_answer(text):
-#             kind = pending.get("kind") or "generic"
-#             try:
-#                 if kind == "table_more":
-#                     await _answer_with_model_extra_table(
-#                         m,
-#                         uid,
-#                         pending.get("doc_id"),
-#                         pending.get("question") or text,
-#                         pending.get("ctx_tables") or "",
-#                         pending.get("nums") or [],
-#                     )
-#                 else:
-#                     await _answer_with_model_extra(
-#                         m,
-#                         uid,
-#                         pending.get("question") or text,
-#                     )
-#             finally:
-#                 MODEL_EXTRA_PENDING.pop(uid, None)
-#         else:
-#             # пользователь отказался от дополнительного ответа
-#             MODEL_EXTRA_PENDING.pop(uid, None)
-#             await _send(
-#                 m,
-#                 "Ок, тогда буду опираться только на текст твоей работы. "
-#                 "Если есть другой вопрос — просто напиши его."
-#             )
-#         return
-
-#     # 2) Определяем активный документ и состояние обработки файла
-#     doc_id = ACTIVE_DOC.get(uid) or get_user_active_doc(uid)
-#     state = get_processing_state(uid)
-
-#     # 2а) Документ ещё в процессе скачивания/индексации — ставим вопрос в очередь
-#     if doc_id and state in (ProcessingState.DOWNLOADING, ProcessingState.INDEXING):
-#         enqueue_pending_query(uid, text)
-#         await _send(
-#             m,
-#             "Я ещё обрабатываю файл ВКР. Я запомнил этот вопрос и отвечу на него, "
-#             "как только закончу с документом. Можно пока писать ещё вопросы — их тоже сохраню."
-#         )
-#         return
-
-#     # 2б) Документа ещё нет — можем дать общий совет либо попросить прислать файл
-#     if not doc_id:
-#         hint = topical_check(text)
-#         if hint:
-#             await _send(m, hint + " Пока файла нет, могу дать только общий совет.")
-#         if chat_with_gpt:
-#             # общий ответ как [модель] без привязки к конкретной работе
-#             await _answer_with_model_extra(m, uid, text)
-#         else:
-#             await _send(
-#                 m,
-#                 "Сначала пришли файл ВКР в виде .doc или .docx. "
-#                 "Тогда я смогу отвечать прямо по тексту твоей работы."
-#             )
-#         return
-
-#     # 3) Нормальный случай: документ есть и он уже проиндексирован — отвечаем как раньше
-#     await respond_with_answer(m, uid, doc_id, text)
-
 # ------------------------------ основной ответчик ------------------------------
 
 async def _answer_with_model_extra(m: types.Message, uid: int, base_question: str) -> None:
-    """
-    Ответ без привязки к конкретному документу — общий совет от [модель].
-
-    Используется, когда в тексте работы не нашлось фактов по вопросу
-    и пользователь подтвердил, что хочет такой ответ.
-    """
-    if not (chat_with_gpt or chat_with_gpt_stream):
-        await _send(
-            m,
-            "Сейчас могу отвечать только по тексту документа, режим [модель] недоступен."
-        )
-        return
-
-    base_question = (base_question or "").strip()
-    if not base_question:
-        await _send(m, "Не удалось восстановить исходный вопрос. Сформулируй его ещё раз, пожалуйста.")
-        return
-
-    system_prompt = (
-        "Ты помощник по учёбе. В ЭТОМ ответе ты не опираешься на текст диплома пользователя, "
-        "а используешь только свои общие знания и здравый смысл. "
-        "Сразу в начале ответа укажи тег '[модель] ' и дальше отвечай простым, понятным языком."
+    await _send(
+        m,
+        "Я отвечаю только по содержимому загруженной ВКР. "
+        "Если в документе нет данных по вопросу — уточни раздел/пункт/главу или переформулируй запрос."
     )
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": base_question},
-    ]
-
-    try:
-        if STREAM_ENABLED and chat_with_gpt_stream is not None:
-            stream = chat_with_gpt_stream(messages, temperature=0.3, max_tokens=FINAL_MAX_TOKENS)  # type: ignore
-            await _stream_to_telegram(m, stream)
-            return
-
-        answer = chat_with_gpt(messages, temperature=0.3, max_tokens=FINAL_MAX_TOKENS)
-    except Exception as e:
-        logging.exception("model-extra answer failed: %s", e)
-        await _send(
-            m,
-            "Не получилось получить дополнительный ответ от [модель]. Попробуй переформулировать вопрос."
-        )
-        return
-
-    answer = (answer or "").strip()
-    if not answer:
-        await _send(
-            m,
-            "Не получилось получить дополнительный ответ от [модель]. Попробуй переформулировать вопрос."
-        )
-        return
-
-    if not answer.startswith("[модель]"):
-        answer = "[модель] " + answer
-
-    await _send(m, answer)
+    return
 
 async def _answer_with_model_extra_table(
     m: types.Message,
@@ -6875,24 +7079,48 @@ def _is_structural_intro_question(q: str) -> bool:
     if any(w in text for w in trigger_words):
         return True
 
+    import re
+
+    # Морфологические варианты: "объектом/предметом/целью/задачами ... исследования/работы"
+    # 1) быстрый флаг по корням (надёжно для домена ВКР)
+    if ("объект" in text and "исслед" in text) or ("предмет" in text and "исслед" in text):
+        return True
+    if ("цель" in text and ("исслед" in text or "работ" in text)):
+        return True
+    if ("задач" in text and ("исслед" in text or "работ" in text)):
+        return True
+    if ("гипотез" in text and ("исслед" in text or "работ" in text)):
+        return True
+    if ("объект" in text and "предмет" in text and "исслед" in text):
+        return True
+
+    # 2) точные регулярки (покрывают падежи и перестановки слов)
+    morph_patterns = [
+        r"\bобъект\w*\s+исслед\w*\b",
+        r"\bпредмет\w*\s+исслед\w*\b",
+        r"\bобъект\w*\s+(и|&)\s+предмет\w*\s+исслед\w*\b",
+        r"\bцель\w*\s+(исслед\w*|работ\w*)\b",
+        r"\bзадач\w*\s+(исслед\w*|работ\w*)\b",
+        r"\bгипотез\w*\s+(исслед\w*|работ\w*)\b",
+    ]
+    if any(re.search(p, text) for p in morph_patterns):
+        return True
+
     # Любое упоминание введения: "во введении", "из введения" и т.п.
     # ловим по корню "введени"
     if "введени" in text:
         return True
-
-    # Любые конструкции вида "в 1 главе", "во 2 главе", "в первой главе", "во второй главе"
-    # чтобы не перечислять все варианты строками
-    import re
 
     # в 1 главе / во 2 главе
     if re.search(r"\b(в|во)\s+\d+\s*главе?\b", text):
         return True
 
     # в первой/второй главе
-    if re.search(r"\b(в|во)\s+(первой|первую|первой|второй|вторую)\s+главе?\b", text):
+    if re.search(r"\b(в|во)\s+(первой|первую|второй|вторую)\s+главе?\b", text):
         return True
 
     return False
+
 
 def _extract_struct_meta_block(full_text: str) -> str:
     """
@@ -7254,11 +7482,25 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
         )
         return
 
-    # для коротких реплик вида «опиши подробнее», «расскажи про него»
+    # 1️⃣ сначала пробуем продолжить ТО ЖЕ САМОЕ по документу
+    q_text = _expand_followup_to_last_doc_query(uid, doc_id, q_text)
+
+    # 2️⃣ затем — старая логика (таблицы / рисунки / пункты)
     q_text = _expand_with_last_referent(uid, q_text)
 
-    # 👇 Строим семантический план вопроса
+    # ✅ интенты определяем один раз и как можно раньше (после всех подстановок q_text)
+    intents = detect_intents(q_text)
+
+    # запоминаем "основной" запрос (не follow-up)
+    if not _FOLLOWUP_MORE_RE.search((orig_q_text or "").strip()):
+        oq = (orig_q_text or "").strip()
+        if oq:
+            if re.search(r"\b(введение|глава|раздел|пункт|объект|предмет|вкр|диплом)\b", oq, re.IGNORECASE) or len(oq) >= 40:
+                LAST_DOC_QUERY[uid] = oq
+                logger.info("LAST_DOC_QUERY updated (uid=%s): %r", uid, oq)
+
     plan = build_semantic_plan(q_text)
+
     logger.info(
         "SEMANTIC_PLAN mode=%s, objects=%s, slots=%s",
         plan.mode,
@@ -7274,37 +7516,249 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
         },
     )
 
-    # 👇 Пытаемся ответить новой семантической логикой.
-    # Если она вернула None — дальше всё обрабатывает старый пайплайн.
+    # ✅ РАННИЙ ГЕЙТ: если вопрос смешанный (есть таблица/рисунок/раздел по номеру),
+    # семантика НЕ должна перехватывать ответ, иначе она видит только intro/ch1/ch2.
+    refs_early = extract_struct_refs(q_text) or []
+    has_struct_any = bool(refs_early)
+    has_table_or_fig = any((r.get("kind") in ("table", "figure")) for r in refs_early)
+
+    # ✅ РАНЬШЕ ВСЕГО: если это мультийнтент (таблица+рисунок+раздел и т.п.) — обрабатываем сразу
+    # НО: после structured-* НЕ выходим, чтобы ответить ещё и на "общую" часть вопроса.
+    structured_already_answered = False
+
+    def _strip_struct_clauses(src_q: str, refs: list[dict]) -> str:
+        """
+        Убираем из смешанного вопроса подпункты про конкретные таблицы/рисунки/разделы,
+        чтобы дальше пайплайн ответил на "общую" часть (например, объект/предмет исследования).
+        Делим по ?, !, ., ; — этого достаточно для твоих кейсов.
+        """
+        if not src_q:
+            return src_q
+
+        clauses = re.split(r"(?<=[\?\!\.;])\s+", src_q.strip())
+
+        def is_struct_clause(cl: str) -> bool:
+            c = (cl or "").strip()
+            if not c:
+                return False
+            for rr in refs or []:
+                kind = (rr.get("kind") or "").lower()
+                num = str(rr.get("num") or "").strip()
+                if not kind or not num:
+                    continue
+
+                num_re = re.escape(num)
+
+                if kind == "table":
+                    # ловим: "таблица 3", "в таблице 3", "по таблице №3", "табл. 3"
+                    if re.search(rf"(?i)\b(?:таблиц[а-я]*|табл\.?)\s*(?:№\s*)?{num_re}\b", c):
+                        return True
+
+                if kind in ("figure", "fig"):
+                    # ловим: "рисунок 8", "на рисунке 8", "рис. 8", "рисунок №8"
+                    if re.search(rf"(?i)\b(?:рисун\w*|рис\.)\s*(?:№\s*)?{num_re}\b", c):
+                        return True
+
+
+                if kind in ("chapter", "section", "area"):
+                    if re.search(rf"(?i)\b(глава|раздел|пункт|подраздел)\s*{num_re}\b", c):
+                        return True
+
+            return False
+
+        kept = [c.strip() for c in clauses if c.strip() and not is_struct_clause(c)]
+        return " ".join(kept).strip()
+
+    if refs_early:
+        kinds = {r.get("kind") for r in refs_early if r.get("kind") and r.get("num")}
+        nums = {(r.get("kind"), r.get("num")) for r in refs_early if r.get("kind") and r.get("num")}
+        is_single_ref = len(nums) == 1
+
+        # мультийнтент: несколько объектов или разные типы (кроме случая "только несколько рисунков")
+        if (not is_single_ref or len(kinds) > 1) and kinds != {"figure"}:
+            if _is_comparative_struct_request(q_text, refs_early):
+                logger.info(
+                    "ANSWER: structured-comparative pipeline (uid=%s, doc_id=%s, refs=%r)",
+                    uid, doc_id, refs_early
+                )
+                handled = await _answer_structured_comparative(m, uid, doc_id, q_text, refs_early)
+                if handled:
+                    structured_already_answered = True
+
+            if not structured_already_answered:
+                logger.info(
+                    "ANSWER: structured-multi pipeline (uid=%s, doc_id=%s, refs=%r)",
+                    uid, doc_id, refs_early
+                )
+                handled = await _answer_structured_multi(m, uid, doc_id, q_text, refs_early)
+                if handled:
+                    structured_already_answered = True
+
+            # ✅ если структурную часть уже отдали — продолжаем пайплайн по "общему хвосту"
+            if structured_already_answered:
+                q_tail = _strip_struct_clauses(q_text, refs_early)
+                if not q_tail:
+                    return  # вопрос был полностью про структуру — больше отвечать нечего
+                q_text = q_tail
+                intents = detect_intents(q_text)
+     # ✅ РАННИЙ VERBATIM-ПЕРЕХВАТ (до FULLREAD/LLM):
+    # если после обрезки структурных подпунктов остался "объект исследования (дословно)",
+    # вытаскиваем строку из полного текста и не даём FULLREAD(auto) схлопнуть ответ.
+    def _is_verbatim_object_request(q: str) -> bool:
+        ql = (q or "").lower()
+        return (
+            re.search(r"\b(дословно|цитат(ой|у)?|прямая\s+цитата)\b", ql)
+            and re.search(r"\bобъект\b", ql)
+            and re.search(r"\bисслед", ql)
+        )
+
+    def _pick_object_lines_from_text(src: str) -> list[str]:
+        """
+        Возвращает 1–2 коротких "цитатных" предложения про объект исследования.
+        Приоритет: ВВЕДЕНИЕ (если найдено), иначе весь текст.
+        Вытаскиваем именно предложение, а не целую строку/абзац.
+        """
+        if not src:
+            return []
+
+        obj_re = re.compile(r"(?i)\b(?:в\s+качестве\s+)?объект\w*\s+исслед\w*\b")
+        # типичные границы предложений (и переносы)
+        sent_split = re.compile(r"(?<=[\.\!\?])\s+|\n+")
+
+        def _slice_intro(text: str) -> str:
+            low = text.lower()
+            i = low.find("введение")
+            if i < 0:
+                return text
+            # пытаемся отрезать до "Глава 1" (если есть)
+            m = re.search(r"(?i)\bглава\s+1\b", text[i:])
+            if m:
+                return text[i : i + m.start()]
+            return text[i:]
+
+        def _sentences(text: str) -> list[str]:
+            # схлопываем только пробельные хвосты, чтобы не "ломать" формулировку,
+            # но убираем мусорные множественные пробелы
+            text = re.sub(r"[ \t]+", " ", text)
+            return [s.strip() for s in sent_split.split(text) if s and s.strip()]
+
+        # 1) сначала ищем в введении
+        intro = _slice_intro(src)
+        picked: list[str] = []
+        for s in _sentences(intro):
+            if obj_re.search(s):
+                picked.append(s)
+                break
+
+        # 2) если во введении не нашли — ищем по всему тексту
+        if not picked:
+            for s in _sentences(src):
+                if obj_re.search(s):
+                    picked.append(s)
+                    break
+
+        # 3) чистим дубли/пустое
+        out: list[str] = []
+        seen = set()
+        for p in picked:
+            key = re.sub(r"\s+", " ", p).strip().lower()
+            if key and key not in seen:
+                seen.add(key)
+                out.append(p.strip())
+        return out
+
+
+    verbatim_obj = bool(_is_verbatim_object_request(q_text))
+    if verbatim_obj:
+        try:
+            full_text = (_full_document_text(uid, doc_id, limit_chars=999999) or "").strip()
+        except TypeError:
+            full_text = (_full_document_text(uid, doc_id) or "").strip()
+
+        picked = _pick_object_lines_from_text(full_text)
+        if picked:
+            await _send(m, picked[0].strip())
+            return
+        # если вдруг не нашли — просто идём дальше по пайплайну (без return)
+
     semantic_answer = None
     try:
-        semantic_answer = await answer_semantic_query(uid, doc_id, q_text, plan)
+        # семантика только для вопросов без структурных ссылок
+        if not has_struct_any:
+            semantic_answer = await answer_semantic_query(uid, doc_id, q_text, plan)
     except Exception:
         logger.exception("answer_semantic_query failed, fallback to old pipeline")
+
+
 
     if semantic_answer:
         cleaned = _strip_unwanted_sections(semantic_answer).strip()
 
-        # ✅ если ответ слишком короткий / явно неструктурный — считаем, что семантика провалилась
-        too_short = len(cleaned) < 400
-        has_any_block = any(h in cleaned for h in ("Введение", "Глава 1", "Глава 2"))
+        # Паспортный/точечный вопрос: допускаем короткий ответ (обычно только "## Введение")
+        passport_only = (
+            plan.slots.any_slot_requested()
+            and not plan.slots.chapter_conclusions
+            and not any(p in (q_text or "").lower() for p in ("глава 1", "глава 2", "первая глава", "вторая глава"))
+        )
 
-        # можно жёстче: требовать хотя бы 2 блока
-        blocks = sum(h in cleaned for h in ("Введение", "Глава 1", "Глава 2"))
-
-        if too_short or blocks < 2:
-            logger.info("semantic_answer rejected (len=%s, blocks=%s) -> fallback to legacy", len(cleaned), blocks)
+        if passport_only:
+            # достаточно, чтобы был хотя бы один из паспортных полей
+            has_any_field = any(k in cleaned for k in ("**Объект:**", "**Предмет:**", "**Цель:**", "**Задачи:**", "**Гипотеза:**", "**Актуальность:**"))
+            if has_any_field and len(cleaned) >= 120:
+                await _send(m, cleaned)
+                LAST_DOC_QUERY[uid] = orig_q_text
+                return
+            logger.info("semantic_answer rejected (passport_only weak) -> fallback to legacy")
         else:
-            await _send(m, cleaned)
-            return
+            too_short = len(cleaned) < 400
+            blocks = sum(h in cleaned for h in ("Введение", "Глава 1", "Глава 2"))
+
+            if too_short or blocks < 2:
+                logger.info("semantic_answer rejected (len=%s, blocks=%s) -> fallback to legacy", len(cleaned), blocks)
+            else:
+                await _send(m, cleaned)
+                LAST_DOC_QUERY[uid] = orig_q_text
+                return
+
+
+    def _looks_like_big_intro_summary(q: str) -> bool:
+        q = (q or "").strip().lower()
+        if not q:
+            return False
+
+        # одиночные "дословно/цитатой" — НЕ должны уходить в fulltext shortcut
+        if re.search(r"\b(дословно|цитат(ой|у)|прямая\s+цитата)\b", q, re.IGNORECASE):
+            # если при этом просят один пункт (объект/предмет/цель и т.п.) — это точечный вопрос
+            single_slot = bool(re.search(r"\b(объект|предмет|цель|задач[аи]|гипотез[аы])\b", q, re.IGNORECASE))
+            multi_delims = len(re.findall(r"[?;]", q)) >= 1
+            # если вопрос явно многопунктовый (через ?/;) — оставим шанс shortcut,
+            # иначе точечный — пусть идёт в обычный RAG/generate_answer.
+            if single_slot and not multi_delims:
+                return False
+
+        # явные маркеры “сделай введение/структуру/описание работы”
+        if re.search(r"\b(введение|структур[ауеы]|опиши\s+работу|по\s+работе\s+в\s+целом)\b", q, re.IGNORECASE):
+            return True
+
+        # если перечисляют несколько сущностей введения — тоже “большой” запрос
+        hits = 0
+        for kw in ("актуаль", "объект", "предмет", "цель", "задач", "гипотез", "метод", "новизн", "практическ", "структур"):
+            if kw in q:
+                hits += 1
+        if hits >= 2:
+            return True
+
+        # или просто длинная формулировка (обычно это “сделай введение”)
+        return len(q) >= 120
 
     # =============================================
     # 🔥 СУПЕР-РАННИЙ ПЕРЕХВАТ СТРУКТУРНЫХ ВОПРОСОВ
     # =============================================
-    if _is_structural_intro_question(q_text):
+    if _is_structural_intro_question(q_text) and _looks_like_big_intro_summary(q_text):
         handled = await _answer_fulltext_simple(m, uid, doc_id, q_text)
         if handled:
             return
+
 
 
         # Примеры: "опиши таблицу 4", "что показывает таблица 2.3", "сделай выводы по таблице 4"
@@ -7475,73 +7929,6 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
             await _send(m, "Не удалось описать рисунки." + suffix)
         return
 
-        # NEW: мультинумерная ветка — как только увидели номера таблиц/рисунков/глав,
-    # проходимся по ним циклом и, если это действительно мультийнтент,
-    # даём один собранный ответ и НЕ идём в generic-ветки ниже.
-    refs = extract_struct_refs(q_text)
-    logger.info(
-        "ANSWER: struct refs for %r -> %r",
-        q_text,
-        refs,
-    )
-    if refs:
-        kinds = {r["kind"] for r in refs}
-        nums = {(r["kind"], r["num"]) for r in refs}
-
-        # Один объект одного типа (например, «таблица 2.1») по-прежнему
-        # обрабатывают pure-ветки выше/ниже.
-        is_single_ref = len(nums) == 1
-
-        # Если несколько номеров или смешанные типы (таблицы + рисунки + главы),
-        # считаем это мультийнтентом и обрабатываем централизованно.
-        # ❗ ВАЖНО: запросы, где есть только несколько рисунков (kinds == {"figure"}),
-        # больше НЕ отдаём в _answer_structured_multi — их обработаем ниже
-        # через RAG + специальную "only_figures"-ветку.
-        if (not is_single_ref or len(kinds) > 1) and kinds != {"figure"}:
-            # 🔍 Дополнительно проверяем: это именно СРАВНИТЕЛЬНЫЙ/АНАЛИТИЧЕСКИЙ запрос?
-            if _is_comparative_struct_request(q_text, refs):
-                logger.info(
-                    "ANSWER: structured-comparative pipeline (uid=%s, doc_id=%s, refs=%r)",
-                    uid,
-                    doc_id,
-                    refs,
-                )
-                handled = await _answer_structured_comparative(
-                    m, uid, doc_id, q_text, refs
-                )
-                if handled:
-                    # ответ уже отправлен, дальше не идём
-                    return
-                else:
-                    logger.info(
-                        "ANSWER: structured-comparative not handled, "
-                        "falling back to structured-multi (uid=%s, doc_id=%s)",
-                        uid,
-                        doc_id,
-                    )
-
-            # если это не сравнительный запрос ИЛИ сравнительная ветка не справилась —
-            # используем старый structured-multi как раньше
-            logger.info(
-                "ANSWER: structured-multi pipeline (uid=%s, doc_id=%s, refs=%r)",
-                uid,
-                doc_id,
-                refs,
-            )
-            handled = await _answer_structured_multi(m, uid, doc_id, q_text, refs)
-            if handled:
-                # раз уж увидели явные номера и отработали их,
-                # НИ FULLREAD, НИ generic-ответы внизу НЕ вызываем.
-                return
-            else:
-                logger.info(
-                    "ANSWER: structured-multi not handled, falling back to regular pipeline "
-                    "(uid=%s, doc_id=%s)",
-                    uid,
-                    doc_id,
-                )
-        # если is_single_ref и один kind — просто идём дальше:
-        # чистые таблицы/рисунки/главы разрулятся существующими спец-ветками.
 
     # NEW: если в вопросе явно указан раздел/пункт — запоминаем его как последний
     m_area = _SECTION_NUM_RE.search(q_text)
@@ -7551,16 +7938,6 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
             LAST_REF.setdefault(uid, {})["area"] = area
         except Exception:
             pass
-
-    # --- Определяем интенты заранее
-        # --- Определяем интенты заранее
-        # --- Определяем интенты заранее
-    intents = detect_intents(q_text)
-    # Без FULLREAD-итераций и без RAG, чтобы ничего не обрезалось и не терялось.
-    if _is_structural_intro_question(q_text):
-        handled = await _answer_fulltext_simple(m, uid, doc_id, q_text)
-        if handled:
-            return
 
 
     # 🚫 НЕ считаем вопрос "чисто теоретическим", если в нём явно просят разобрать
@@ -7572,53 +7949,9 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
     )
     mentions_structure = bool(structural_re.search(q_text))
 
-    # ✅ Чисто теоретический вопрос (без ссылок на главы/таблицы/рисунки/структуру ВКР) —
-    # отвечаем просто как репетитор, вообще не трогая RAG.
-    if intents.get("general_question") and not (
-        intents["tables"]["want"]
-        or intents["figures"]["want"]
-        or intents["sources"]["want"]
-        or _SECTION_NUM_RE.search(q_text)
-        or mentions_structure           # ← добавили этот фильтр
-    ):
-        system_prompt = (
-            "Ты репетитор по ВКР. Отвечай ТОЛЬКО на русском языке, простым понятным студенту "
-            "языком. Можно опираться на общую теорию и учебники, но не выдумывай факты про "
-            "конкретную работу, если их нет в вопросе."
-        )
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": q_text},
-        ]
-
-        if STREAM_ENABLED and chat_with_gpt_stream is not None:
-            try:
-                stream = chat_with_gpt_stream(
-                    messages,
-                    temperature=0.2,
-                    max_tokens=FINAL_MAX_TOKENS,
-                )
-                await _stream_to_telegram(m, stream)
-                return
-            except Exception as e:
-                logging.exception("general theory stream failed: %s", e)
-
-        try:
-            ans = chat_with_gpt(
-                messages,
-                temperature=0.2,
-                max_tokens=FINAL_MAX_TOKENS,
-            )
-        except Exception as e:
-            logging.exception("general theory non-stream failed: %s", e)
-            ans = ""
-
-        ans = (ans or "").strip()
-        if not ans:
-            ans = "Не удалось получить ответ. Попробуй переформулировать вопрос."
-        await _send(m, ans)
-        return
-
+    # ✅ Строгий режим: даже "теоретические" вопросы отвечаем только по тексту ВКР.
+    # Никаких ответов "по учебникам" без опоры на документ — иначе будут галлюцинации.
+    # Просто продолжаем пайплайн (FULLREAD/RAG ниже).
 
     # Чистый запрос про конкретные рисунки (нет секций/таблиц/источников/общего вопроса)
     pure_figs = intents["figures"]["want"] and not (
@@ -7712,7 +8045,8 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
         and not intents["tables"]["want"]
         and not intents["figures"]["want"]
         and not intents["sources"]["want"]
-        and not _is_structural_intro_question(q_text)   # 👈 добавили фильтр
+        and not _is_structural_intro_question(q_text)
+        and not verbatim_obj
     ):
 
         logger.info(
@@ -7848,6 +8182,7 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
 
     # ====== Стандартный мульти-интент пайплайн (RAG) ======
     await _ensure_modalities_indexed(m, uid, doc_id, intents)
+    intents["question_text"] = q_text
     facts = _gather_facts(uid, doc_id, intents)
     logger.info(
         "ANSWER: RAG facts gathered (uid=%s, doc_id=%s, keys=%s)",
@@ -7855,6 +8190,49 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
         doc_id,
         list(facts.keys()) if isinstance(facts, dict) else type(facts),
     )
+
+    # --- VERBATIM: объект исследования дословно -> сначала из RAG-контекста, иначе из полного текста
+    try:
+        q_low = (q_text or "").lower()
+
+        is_verbatim_obj = (
+            re.search(r"\b(дословно|цитат(ой|у)?|прямая\s+цитата)\b", q_low)
+            and re.search(r"\bобъект\b", q_low)
+            and re.search(r"\bисслед", q_low)
+        )
+
+        if is_verbatim_obj and isinstance(facts, dict):
+            # 1) пробуем вытащить из RAG-контекста
+            ctx = (facts.get("general_ctx") or "").strip()
+            picked: list[str] = []
+
+            obj_re = re.compile(r"(?i)\bобъект\w*\s+исслед\w*")
+
+            if ctx:
+                for ln in ctx.splitlines():
+                    lnl = (ln or "").strip().lower()
+                    if not lnl:
+                        continue
+                    if lnl.startswith("цитата_"):
+                        picked.append(ln.strip())
+                    elif obj_re.search(lnl):
+                        picked.append(ln.strip())
+
+            # 2) если RAG пустой/не попал — читаем полный текст и берём КОРОТКОЕ предложение про объект
+            if not picked:
+                full_text = (_full_document_text(uid, doc_id, limit_chars=200000) or "").strip()
+                if full_text:
+                    picked = _pick_object_lines_from_text(full_text)  # <- тот же экстрактор
+
+            picked = [p for p in picked if p]
+            if picked:
+                await _send(m, picked[0].strip())
+                return
+
+    except Exception:
+        pass
+    # --- /VERBATIM
+
 
     # ✅ НОВОЕ: если по вопросу почти нет фактов из RAG, а речь явно про
     # введение/главы/разделы, делаем прямое чтение всего документа,
@@ -7986,19 +8364,16 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
         logging.exception("only_figures fast path failed, fallback to generic: %s", e)
 
     # NEW: если по общему вопросу ничего не нашлось именно в тексте работы —
-    # сначала спрашиваем, можно ли ответить в общем виде как [модель].
+    # ✅ Строго по ВКР: если фактов нет — честно сообщаем и просим уточнение.
     if intents.get("general_question") and not facts.get("general_ctx") and not facts.get("summary_text"):
-        MODEL_EXTRA_PENDING[uid] = {
-            "kind": "generic",
-            "question": intents["general_question"] or q_text,
-        }
         await _send(
             m,
-            "По этому вопросу я не нашёл явной информации в самом тексте работы. "
-            "Могу ответить в общем виде как [модель] (это уже не будет опираться на документ). "
-            "Напиши «да» или «нет».",
+            "В тексте ВКР не найдено информации для ответа строго по документу. "
+            "Уточни формулировку или укажи раздел/пункт/главу (например: «в разделе 2.3…»), "
+            "где это должно быть описано."
         )
         return
+
 
     # ↓ НОВОЕ: если есть план подпунктов — включаем многошаговую подачу,
     # но только когда это реально оправдано (есть подпункты и вопрос не слишком короткий).
@@ -8042,54 +8417,55 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
     if figs_in_q:
         LAST_REF.setdefault(uid, {})["figure_nums"] = figs_in_q
 
-    # NEW: прямой мультимодальный ответ, если есть релевантные картинки из документа
-    # (не ломает старую логику: если не получилось/нет картинок — идём в generate_answer)
+    # а финальный ответ строим через generate_answer по facts (ниже).
     try:
-        if intents.get("general_question") and getattr(Cfg, "vision_active", lambda: False)():
-            # подтянем релевантные чанк-хиты и выберем 1–3 файла-изображения
-            hits_v = retrieve(uid, doc_id, intents["general_question"], top_k=10) or []
-            img_paths = _pick_images_from_hits(
-                hits_v, limit=getattr(Cfg, "VISION_MAX_IMAGES_PER_REQUEST", 3)
-            )
-            if img_paths and (chat_with_gpt_stream_multimodal or chat_with_gpt_multimodal):
-                # контекст из RAG, если он есть
-                ctx = (facts.get("general_ctx") or "").strip() if isinstance(facts, dict) else ""
-                mm_system = (
-                    "Ты репетитор по ВКР. У тебя есть вопрос, краткий текстовый контекст и сами изображения "
-                    "(фото/сканы/диаграммы) из документа. Отвечай по делу, используя изображения напрямую. "
-                    "Не придумывай значения и номера, пиши только то, что видно или есть в тексте. "
-                    "Не придумывай также предметную область и термины (например, продажи, клиенты, выручка, "
-                    "маркетинг и т.п.), если они не указаны в тексте или подписях к изображениям."
+        if isinstance(facts, dict) and getattr(Cfg, "vision_active", lambda: False)():
+            # берём релевантные изображения из документа даже для "обычных" вопросов
+            # intents["general_question"] у тебя bool, strip() на bool ломается
+            query_for_imgs = (q_text or "").strip()
+
+            if query_for_imgs:
+                hits_v = retrieve(uid, doc_id, query_for_imgs, top_k=10) or []
+                img_paths = _pick_images_from_hits(
+                    hits_v, limit=getattr(Cfg, "VISION_MAX_IMAGES_PER_REQUEST", 3)
                 )
 
-                mm_prompt = (
-                    f"{q_text}\n\nКонтекст из документа:\n{ctx}" if ctx else q_text
-                )
+                if img_paths and chat_with_gpt_multimodal is not None:
+                    ctx = (facts.get("general_ctx") or "").strip()
 
-                if STREAM_ENABLED and chat_with_gpt_stream_multimodal is not None:
-                    stream = chat_with_gpt_stream_multimodal(
+                    mm_system = (
+                        "Ты извлекаешь ФАКТЫ из изображений, которые являются частью ВКР.\n"
+                        "Верни только то, что явно видно на изображениях или написано на них.\n"
+                        "Запрещено: догадки, интерпретации вне изображения, внешние знания.\n"
+                        "Формат:\n"
+                        "- FACT: ...\n"
+                        "- FACT: ...\n"
+                        "Если на изображениях нет данных по вопросу — напиши: NO_DATA."
+                    )
+
+                    mm_prompt = (
+                        f"Вопрос: {q_text}\n\n"
+                        f"Текстовый контекст (если есть):\n{ctx}\n\n"
+                        "Извлеки факты из изображений, которые помогут ответить на вопрос."
+                    )
+
+                    extracted = chat_with_gpt_multimodal(
                         mm_prompt,
                         image_paths=img_paths,
                         system=mm_system,
-                        temperature=0.2,
-                        max_tokens=FINAL_MAX_TOKENS,
+                        temperature=0.0,
+                        max_tokens=min(FINAL_MAX_TOKENS, 800),
                     )
-                    await _stream_to_telegram(m, stream)
-                    return
-                elif chat_with_gpt_multimodal is not None:
-                    ans_mm = chat_with_gpt_multimodal(
-                        mm_prompt,
-                        image_paths=img_paths,
-                        system=mm_system,
-                        temperature=0.2,
-                        max_tokens=FINAL_MAX_TOKENS,
-                    )
-                    ans_mm = (ans_mm or "").strip()
-                    if ans_mm:
-                        await _send(m, _strip_unwanted_sections(ans_mm))
-                        return
+                    extracted = (extracted or "").strip()
+
+                    if extracted and extracted.upper() != "NO_DATA":
+                        # добавляем как ещё один источник фактов в общий контекст
+                        prev = (facts.get("general_ctx") or "").strip()
+                        add = "[ФАКТЫ ИЗ ИЗОБРАЖЕНИЙ ДОКУМЕНТА]\n" + extracted
+                        facts["general_ctx"] = (prev + "\n\n" + add).strip() if prev else add
     except Exception as e:
-        logging.exception("multimodal answer path failed, falling back: %s", e)
+        logging.exception("multimodal facts-extraction failed, continue without it: %s", e)
+
 
     # --- старый путь RAG → генерация ответа по фактам (answer_builder) ---
 
@@ -8125,7 +8501,52 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
             "Попробуй переформулировать вопрос или уточнить, какой раздел, таблицу или рисунок тебя интересует."
         )
 
+    # --- VERBATIM GUARD: "объект исследования (дословно)" ---
+    try:
+        q_low = (q_text or "").lower()
+
+        is_verbatim_obj = (
+            ("дословно" in q_low or "цитат" in q_low)
+            and ("объект" in q_low)
+            and ("исслед" in q_low)
+        )
+
+        # если модель схлопнула до "родителей"/"родители"/коротыша — подменяем на цитаты из контекста
+        if is_verbatim_obj and isinstance(facts, dict):
+            a_low = (answer or "").lower()
+
+            looks_collapsed = (
+                len((answer or "").strip()) < 60
+                or a_low.strip() in {"«родителей»", "родителей", "родители"}
+                or "объект исследования: родители" in a_low
+                or "объект исследования (дословно): «родителей»" in a_low
+            )
+
+            has_quotes_marker = ("цитата_" in a_low)  # твой удобный маркер из RAG
+            if looks_collapsed and not has_quotes_marker:
+                ctx = (facts.get("general_ctx") or "").strip()
+                if ctx:
+                    # берём строки-цитаты и/или строки, где явно есть "объект исследования"
+                    picked = []
+                    for ln in ctx.splitlines():
+                        lnl = ln.lower()
+                        if lnl.startswith("цитата_"):
+                            picked.append(ln.strip())
+                        elif "объект исслед" in lnl:
+                            picked.append(ln.strip())
+
+                    picked = [p for p in picked if p]
+                    if picked:
+                        answer = "\n".join(picked[:6]).strip()
+                    else:
+                        # fallback — хоть что-то дословное из контекста
+                        answer = ctx.splitlines()[0].strip()
+    except Exception:
+        pass
+    # --- /VERBATIM GUARD ---
+
     await _send(m, _strip_unwanted_sections(answer))
+
 
 def _is_comparative_struct_request(q_text: str, refs: list[dict]) -> bool:
     """
@@ -8468,44 +8889,10 @@ async def qa(m: types.Message):
 
     text = (m.text or "").strip()
 
-    # NEW: если ждём от пользователя ответа «да/нет» про [модель] — обрабатываем его отдельно
-    pending = MODEL_EXTRA_PENDING.get(uid)
-    if pending:
-        low = text.lower()
-        if low in ("да", "д", "ага", "ок", "хорошо", "yes", "y"):
-            info = MODEL_EXTRA_PENDING.pop(uid, None) or {}
-            kind = (info.get("kind") or "generic").lower()
-
-            if kind == "table_more":
-                # doc_id могли сохранить в момент вопроса «опиши подробнее»
-                doc_id_for_pending = info.get("doc_id") or doc_id
-
-                # если почему-то doc_id не удалось восстановить — падаем в общий [модель]
-                if not doc_id_for_pending:
-                    await _answer_with_model_extra(
-                        m,
-                        uid,
-                        info.get("question") or "",
-                    )
-                    return
-
-                await _answer_with_model_extra_table(
-                    m,
-                    uid,
-                    doc_id_for_pending,
-                    info.get("question") or "",
-                    info.get("ctx_tables") or "",
-                    info.get("nums") or [],
-                )
-            else:
-                await _answer_with_model_extra(
-                    m,
-                    uid,
-                    info.get("question") or "",
-                )
-            return
-        # любая другая реплика сбрасывает ожидание и идёт по обычному пути
+    # ✅ Строго по ВКР: режим [модель] отключён, ожидания "да/нет" сбрасываем.
+    if MODEL_EXTRA_PENDING.get(uid):
         MODEL_EXTRA_PENDING.pop(uid, None)
+
 
     # 👋 РАННИЙ ответ на приветствие, без постановки в очередь
     if _is_greeting(text):

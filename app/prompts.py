@@ -1,5 +1,6 @@
 # app/bot.py
 from __future__ import annotations
+from config import Cfg
 
 from typing import Any, Dict, List, Optional, Callable
 
@@ -163,18 +164,12 @@ def build_rag_context_with_figures(
     backfill_k: int = 4,
 ) -> Dict[str, Any]:
     """
-    Строит RAG-контекст для вопроса пользователя, а также доклеивает
-    дополнительные табличные данные по рисункам (если пользователь
-    явно просит «рисунок N»).
-
-    Возвращает:
-      {
-        "context": <строка для system/user-контекста>,
-        "raw": <полная структура из retrieval (snippets/coverage)>,
-        "fig_block": <дополнительный блок по рисункам или "" >
-      }
+    Строит RAG-контекст. Если ничего не найдено — context будет пустым.
     """
     question_norm = (question or "").strip()
+
+    base_ctx = ""
+    raw: Dict[str, Any] = {}
 
     if use_coverage:
         cov = retrieve_coverage(
@@ -183,27 +178,27 @@ def build_rag_context_with_figures(
             question_norm,
             per_item_k=per_item_k,
             backfill_k=backfill_k,
-        )
+        ) or {}
         snippets = cov.get("snippets") or []
         base_ctx = build_context_coverage(
             snippets,
             items_count=len(cov.get("items") or []) or None,
-        )
+        ) if snippets else ""
         raw = cov
     else:
-        snips = retrieve(owner_id, doc_id, question_norm, top_k=max(10, backfill_k * 2))
-        base_ctx = build_context(snips)
+        snips = retrieve(owner_id, doc_id, question_norm, top_k=max(10, backfill_k * 2)) or []
+        base_ctx = build_context(snips) if snips else ""
         raw = {"snippets": snips}
 
-    fig_block = _figures_tables_block_from_query(owner_id, doc_id, question_norm)
+    fig_block = _figures_tables_block_from_query(owner_id, doc_id, question_norm) or ""
 
-    if fig_block:
+    if fig_block.strip():
         full_ctx = f"{base_ctx}\n\n---\n{fig_block}" if base_ctx.strip() else fig_block
     else:
         full_ctx = base_ctx
 
     return {
-        "context": full_ctx.strip(),
+        "context": (full_ctx or "").strip(),
         "raw": raw,
         "fig_block": fig_block,
     }
@@ -246,14 +241,8 @@ def answer_question(
     lang: str = "ru",
 ) -> str:
     """
-    Главная точка входа для «бота»:
-
-    1) Строит RAG-контекст (coverage/обычный).
-    2) Подмешивает табличные данные диаграмм (chart_matrix/values_str) для запросов
-       вида «опиши рисунок N», «что показывает рис. 2.3» и т.п.
-    3) Вызывает LLM с системной подсказкой + правилами.
-
-    Возвращает текст ответа модели.
+    Строгий режим: отвечаем ТОЛЬКО по RAG-контексту из документа.
+    Если контекст не найден/пустой/слишком слабый — не вызываем LLM, возвращаем "не найдено".
     """
     rag = build_rag_context_with_figures(
         owner_id,
@@ -262,12 +251,67 @@ def answer_question(
         use_coverage=use_coverage,
     )
 
-    context = rag["context"]
+    context = (rag.get("context") or "").strip()
 
-    # Системный промпт: общие правила + работа с таблицами/диаграммами.
-    system_prompt = SYS_ANSWER + "\n\n" + PROMPT_RULES_MD
+    # пороги (настройки можно хранить в Cfg, чтобы синхронизировать с bot.py)
+    min_ctx_chars = int(getattr(Cfg, "MIN_GROUNDED_CTX_CHARS", 260))
+    min_score = float(getattr(Cfg, "RETRIEVE_MIN_SCORE", 0.24))
 
-    # Здесь вызываем конкретный LLM-клиент
+    # вытащим метрики, если build_rag_context_with_figures их уже кладёт (не обязательно)
+    max_score = None
+    strong_hits = None
+    try:
+        # варианты ключей на будущее: rag["quality"] или rag["raw"]
+        quality = rag.get("quality") or {}
+        if isinstance(quality, dict):
+            if quality.get("max_score") is not None:
+                max_score = float(quality.get("max_score"))
+            if quality.get("strong_hits") is not None:
+                strong_hits = int(quality.get("strong_hits"))
+        if max_score is None:
+            raw = rag.get("raw") or {}
+            if isinstance(raw, dict) and raw.get("max_score") is not None:
+                max_score = float(raw.get("max_score"))
+            if isinstance(raw, dict) and raw.get("strong_hits") is not None:
+                strong_hits = int(raw.get("strong_hits"))
+    except Exception:
+        max_score = None
+        strong_hits = None
+
+    def _refusal(reason: str) -> str:
+        base = (
+            "В загруженном документе не найдено фрагментов, которые позволяют ответить на этот вопрос.\n"
+            "Похоже, нужный текст не распарсился/не проиндексировался или сформулирован иначе.\n"
+            "Уточните запрос (глава/раздел/страница) или пришлите фрагмент текста."
+        )
+        if bool(getattr(Cfg, "DEBUG", False)):
+            return base + f"\n(debug: {reason})"
+        return base
+
+    # ✅ ГЛАВНЫЙ ГАРД: нет контекста
+    if not context:
+        return _refusal("empty_context")
+
+    # ✅ ГАРД ПО ИНФОРМАТИВНОСТИ: слишком короткий контекст часто = нерелевантный обрывок
+    if len(context) < min_ctx_chars:
+        return _refusal(f"context_too_short<{min_ctx_chars}")
+
+    # ✅ (опционально) ГАРД ПО КАЧЕСТВУ: если метрики есть и они слабые — не зовём LLM
+    # strong_hits = 0 или max_score ниже порога → считаем, что опоры нет
+    if strong_hits is not None and int(strong_hits) <= 0:
+        return _refusal("no_strong_hits")
+    if max_score is not None and float(max_score) < min_score:
+        return _refusal(f"max_score<{min_score}")
+
+    # Системный промпт: строгая приставка + ваши правила.
+    strict_prefix = (
+        "ВАЖНО: Отвечай ТОЛЬКО на основе переданного CONTEXT из документа.\n"
+        "Запрещено использовать общие знания, догадки или типовые определения.\n"
+        "Если в CONTEXT нет ответа — выдай отказ: «В документе не найдено. Уточните запрос/пришлите фрагмент».\n"
+        "Не приписывай документу того, чего в нём нет.\n"
+    )
+    system_prompt = strict_prefix + SYS_ANSWER + "\n\n" + PROMPT_RULES_MD
+
     answer = call_llm_default(
         llm_client=llm_client,
         system_prompt=system_prompt,

@@ -1,6 +1,7 @@
 # app/db.py
 import sqlite3
 import json
+import asyncio
 from pathlib import Path
 from typing import Optional, Iterable, Any, Dict, List, Tuple
 from datetime import datetime, timedelta
@@ -238,7 +239,7 @@ def _ensure_indexes(con: sqlite3.Connection) -> None:
     if "section_path" in ccols:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_section_path ON chunks(section_path)")
 
-        # Индексы для document_sections
+    # Индексы для document_sections
     cur.execute(
         "CREATE INDEX IF NOT EXISTS idx_sections_doc_ord ON document_sections(doc_id, ord)"
     )
@@ -362,6 +363,8 @@ def ensure_user(tg_id: str) -> int:
     finally:
         con.close()
 
+async def ensure_user_async(tg_id: str) -> int:
+    return await asyncio.to_thread(ensure_user, tg_id)
 
 # ----------------------------- public API: documents -----------------------------
 
@@ -513,48 +516,53 @@ def update_document_meta(doc_id: int,
 
 # ---------- NEW: helpers для выбора / списка документов пользователя ----------
 
-def get_document_meta(doc_id: int) -> Optional[Dict[str, Any]]:
+def get_document_base_meta(doc_id: int) -> Optional[Dict[str, Any]]:
     """
-    Возвращает базовую мета-информацию по документу:
-    owner_id, kind, путь, время создания и служебные поля индексатора.
-    Удобно, когда пользователь выбрал документ по номеру, а нужно показать имя файла и т.п.
+    Базовая мета по документу (documents).
     """
     con = get_conn()
-    cur = con.cursor()
-    cur.execute(
-        """
-        SELECT
-            id,
-            owner_id,
-            kind,
-            path,
-            created_at,
-            content_sha256,
-            file_uid,
-            indexer_version,
-            layout_profile
-        FROM documents
-        WHERE id = ?
-        LIMIT 1
-        """,
-        (doc_id,),
-    )
-    row = cur.fetchone()
-    con.close()
-    if not row:
-        return None
-    return {
-        "id": row["id"],
-        "owner_id": row["owner_id"],
-        "kind": row["kind"],
-        "path": row["path"],
-        "created_at": row["created_at"],
-        "content_sha256": row["content_sha256"],
-        "file_uid": row["file_uid"],
-        "indexer_version": row["indexer_version"],
-        "layout_profile": row["layout_profile"],
-    }
+    try:
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT
+                id,
+                owner_id,
+                kind,
+                path,
+                created_at,
+                content_sha256,
+                file_uid,
+                indexer_version,
+                layout_profile
+            FROM documents
+            WHERE id = ?
+            LIMIT 1
+            """,
+            (doc_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
 
+        # sqlite3.Row (dict-like) — оставляем доступ по ключам
+        return {
+            "id": row["id"],
+            "owner_id": row["owner_id"],
+            "kind": row["kind"],
+            "path": row["path"],
+            "created_at": row["created_at"],
+            "content_sha256": row["content_sha256"],
+            "file_uid": row["file_uid"],
+            "indexer_version": row["indexer_version"],
+            "layout_profile": row["layout_profile"],
+        }
+    finally:
+        con.close()
+
+
+async def aget_document_base_meta(doc_id: int) -> Optional[Dict[str, Any]]:
+    return await asyncio.to_thread(get_document_base_meta, doc_id)
 
 def list_user_documents(owner_id: int, limit: int = 10) -> List[Dict[str, Any]]:
     """
@@ -664,151 +672,11 @@ def _table_has_columns(con: sqlite3.Connection, table: str, cols: List[str]) -> 
 
 
 def get_document_sections(doc_id: int) -> List[Dict[str, Any]]:
-    """
-    Возвращает "структурный список секций" документа на основе таблицы chunks.
-
-    Идея:
-      - у нас нет отдельной таблицы sections, поэтому строим "список секций"
-        как уникальные section_path в порядке появления в chunks (по id).
-      - attrs.role/chapter_num берём из attrs (если колонка есть).
-      - title/level мы тут честно не восстановим надёжно → возвращаем то, что есть:
-        section_path + attrs (+ page как min page).
-
-    Формат элемента:
-      {
-        "section_path": str,
-        "page": Optional[int],
-        "attrs": dict,
-        "first_chunk_id": int
-      }
-    """
     con = get_conn()
     cur = con.cursor()
 
-    has_attrs = _table_has_columns(con, "chunks", ["attrs"])
-    has_id = _table_has_columns(con, "chunks", ["id"])
-    has_page = _table_has_columns(con, "chunks", ["page"])
-    has_sp = _table_has_columns(con, "chunks", ["section_path"])
-
-    if not (has_id and has_sp):
-        con.close()
-        return []
-
-    # Забираем минимальный набор. ВАЖНО: сортировка по id, чтобы сохранить порядок документа.
-    if has_attrs and has_page:
-        cur.execute(
-            "SELECT id, section_path, page, attrs FROM chunks WHERE doc_id=? ORDER BY id ASC",
-            (doc_id,),
-        )
-    elif has_attrs:
-        cur.execute(
-            "SELECT id, section_path, NULL as page, attrs FROM chunks WHERE doc_id=? ORDER BY id ASC",
-            (doc_id,),
-        )
-    elif has_page:
-        cur.execute(
-            "SELECT id, section_path, page, NULL as attrs FROM chunks WHERE doc_id=? ORDER BY id ASC",
-            (doc_id,),
-        )
-    else:
-        cur.execute(
-            "SELECT id, section_path, NULL as page, NULL as attrs FROM chunks WHERE doc_id=? ORDER BY id ASC",
-            (doc_id,),
-        )
-
-    rows = cur.fetchall()
-    con.close()
-
-    # Группируем по section_path: берём самый первый id, min page, и первый attrs с role если найдём.
-    seen: Dict[str, Dict[str, Any]] = {}
-
-    for r in rows:
-        sp = (r["section_path"] if isinstance(r, dict) or hasattr(r, "__getitem__") else None)  # перестраховка
-        try:
-            sp = r["section_path"]
-        except Exception:
-            continue
-
-        sp = (sp or "").strip()
-        if not sp:
-            continue
-
-        try:
-            cid = int(r["id"])
-        except Exception:
-            continue
-
-        try:
-            page = r["page"]
-        except Exception:
-            page = None
-
-        # attrs может быть JSON-строкой
-        a: Dict[str, Any] = {}
-        if has_attrs:
-            raw = None
-            try:
-                raw = r["attrs"]
-            except Exception:
-                raw = None
-
-            if isinstance(raw, dict):
-                a = raw
-            elif isinstance(raw, str) and raw.strip():
-                try:
-                    a = json.loads(raw)
-                except Exception:
-                    a = {}
-
-        if sp not in seen:
-            seen[sp] = {
-                "section_path": sp,
-                "page": page,
-                "attrs": a or {},
-                "first_chunk_id": cid,
-            }
-        else:
-            # обновим min page
-            if page is not None:
-                cur_page = seen[sp].get("page")
-                if cur_page is None or (isinstance(cur_page, int) and page < cur_page):
-                    seen[sp]["page"] = page
-
-            # если раньше attrs были пустые/без role, а тут нашли role — подменим
-            if a:
-                old = seen[sp].get("attrs") or {}
-                if (not old) or (not old.get("role") and a.get("role")):
-                    seen[sp]["attrs"] = a
-
-    # сортируем по first_chunk_id (порядок появления)
-    out = list(seen.values())
-    out.sort(key=lambda x: int(x.get("first_chunk_id") or 0))
-    return out
-
-def get_document_sections(doc_id: int) -> List[Dict[str, Any]]:
-    """
-    Возвращает "структурный список секций" документа на основе таблицы chunks.
-
-    Важно:
-      - отдельной таблицы sections нет → строим список как уникальные section_path
-        в порядке появления по id.
-      - attrs.role/chapter_num берём из chunks.attrs (если колонка есть).
-      - page берём как минимальную page внутри section_path (если есть).
-
-    Формат элемента:
-      {
-        "section_path": str,
-        "page": Optional[int],
-        "attrs": dict,
-        "first_chunk_id": int
-      }
-    """
-    con = get_conn()
-    cur = con.cursor()
-
-    # проверим колонки через PRAGMA (надёжнее, чем гадать)
     cur.execute("PRAGMA table_info(chunks)")
-    cols = {row[1] for row in cur.fetchall()}  # row[1] = name
+    cols = {row[1] for row in cur.fetchall()}
 
     if "id" not in cols or "section_path" not in cols:
         con.close()
@@ -818,14 +686,8 @@ def get_document_sections(doc_id: int) -> List[Dict[str, Any]]:
     has_page = "page" in cols
 
     select_cols = ["id", "section_path"]
-    if has_page:
-        select_cols.append("page")
-    else:
-        select_cols.append("NULL as page")
-    if has_attrs:
-        select_cols.append("attrs")
-    else:
-        select_cols.append("NULL as attrs")
+    select_cols.append("page" if has_page else "NULL as page")
+    select_cols.append("attrs" if has_attrs else "NULL as attrs")
 
     cur.execute(
         f"SELECT {', '.join(select_cols)} FROM chunks WHERE doc_id=? ORDER BY id ASC",
@@ -835,7 +697,6 @@ def get_document_sections(doc_id: int) -> List[Dict[str, Any]]:
     con.close()
 
     seen: Dict[str, Dict[str, Any]] = {}
-
     for r in rows:
         sp = (r["section_path"] or "").strip()
         if not sp:
@@ -866,13 +727,11 @@ def get_document_sections(doc_id: int) -> List[Dict[str, Any]]:
                 "first_chunk_id": cid,
             }
         else:
-            # min page
             if page is not None:
                 cur_page = seen[sp].get("page")
                 if cur_page is None or (isinstance(cur_page, int) and page < cur_page):
                     seen[sp]["page"] = page
 
-            # attrs: если раньше пусто/без role, а тут нашли role → обновим
             if attrs:
                 old = seen[sp].get("attrs") or {}
                 if (not old) or (not old.get("role") and attrs.get("role")):
@@ -882,15 +741,22 @@ def get_document_sections(doc_id: int) -> List[Dict[str, Any]]:
     out.sort(key=lambda x: int(x.get("first_chunk_id") or 0))
     return out
 
+
+async def get_document_sections_async(doc_id: int) -> List[Dict[str, Any]]:
+    return await asyncio.to_thread(get_document_sections, doc_id)
+
+
 def delete_document_sections(doc_id: int) -> int:
-    """Удаляет все секции структурированного индекса документа. Возвращает число удалённых строк."""
     con = get_conn()
-    cur = con.cursor()
-    cur.execute("SELECT COUNT(1) AS c FROM document_sections WHERE doc_id=?", (doc_id,))
-    cnt = int(cur.fetchone()["c"])
-    cur.execute("DELETE FROM document_sections WHERE doc_id=?", (doc_id,))
-    con.close()
-    return cnt
+    try:
+        cur = con.cursor()
+        cur.execute("SELECT COUNT(1) AS c FROM document_sections WHERE doc_id=?", (doc_id,))
+        cnt = int(cur.fetchone()["c"])
+        cur.execute("DELETE FROM document_sections WHERE doc_id=?", (doc_id,))
+        con.commit()
+        return cnt
+    finally:
+        con.close()
 
 
 def count_document_sections(doc_id: int) -> int:
@@ -1165,7 +1031,7 @@ def get_figure_analysis_by_label(doc_id: int, figure_label: str) -> Optional[Dic
     cur = con.cursor()
     cur.execute(
         """
-        SELECT a.id, a.figure_id, a.kind, a.data_json, a.exact_numbers, a_exact_text,
+        SELECT a.id, a.figure_id, a.kind, a.data_json, a.exact_numbers, a.exact_text,
                a.confidence, a.created_at, a.updated_at
           FROM figures f
           JOIN figure_analysis a ON a.figure_id = f.id
@@ -1195,6 +1061,10 @@ def get_figure_analysis_by_label(doc_id: int, figure_label: str) -> Optional[Dic
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
+
+
+async def get_figure_analysis_by_label_async(doc_id: int, figure_label: str) -> Optional[Dict[str, Any]]:
+    return await asyncio.to_thread(get_figure_analysis_by_label, doc_id, figure_label)
 
 
 def find_nearest_table_above(doc_id: int, chunk_id: int) -> Optional[Dict[str, Any]]:
@@ -1304,34 +1174,58 @@ def set_document_meta(doc_id: int, meta: Dict[str, Any]) -> None:
     con.close()
 
 
-def get_document_meta(doc_id: int) -> Optional[Dict[str, Any]]:
+def get_document_ai_meta(doc_id: int) -> Optional[Dict[str, Any]]:
     con = get_conn()
-    cur = con.cursor()
-
-    cur.execute(
-        "SELECT relevance, object, subject, goal, tasks_json, hypothesis FROM document_meta WHERE doc_id = ?",
-        (doc_id,),
-    )
-    row = cur.fetchone()
-    con.close()
-    if not row:
-        return None
-
-    relevance, obj, subj, goal, tasks_json, hypothesis = row
     try:
-        tasks = json.loads(tasks_json) if tasks_json else []
-    except Exception:
-        tasks = []
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT
+                relevance,
+                object,
+                subject,
+                goal,
+                tasks_json,
+                hypothesis
+            FROM document_meta
+            WHERE doc_id = ?
+            """,
+            (doc_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
 
-    return {
-        "relevance": relevance,
-        "object": obj,
-        "subject": subj,
-        "goal": goal,
-        "tasks": tasks,
-        "hypothesis": hypothesis,
-    }
+        # На sqlite3.Row безопаснее читать по ключам,
+        # чтобы не зависеть от row_factory и порядка колонок.
+        tasks_json = row["tasks_json"]
+        if isinstance(tasks_json, (bytes, bytearray)):
+            try:
+                tasks_json = tasks_json.decode("utf-8")
+            except Exception:
+                tasks_json = None
 
+        try:
+            tasks = json.loads(tasks_json) if tasks_json else []
+            if not isinstance(tasks, list):
+                tasks = []
+        except Exception:
+            tasks = []
+
+        return {
+            "relevance": row["relevance"],
+            "object": row["object"],
+            "subject": row["subject"],
+            "goal": row["goal"],
+            "tasks": tasks,
+            "hypothesis": row["hypothesis"],
+        }
+    finally:
+        con.close()
+
+
+async def aget_document_ai_meta(doc_id: int) -> Optional[Dict[str, Any]]:
+    return await asyncio.to_thread(get_document_ai_meta, doc_id)
 
 # ----------------------------- public API: chunks -----------------------------
 
@@ -1402,36 +1296,43 @@ def get_user_active_doc(user_id: int) -> Optional[int]:
 def get_user_state(user_id: int) -> Dict[str, Any]:
     con = get_conn()
     cur = con.cursor()
+
+    # берём ВСЁ, что потом читаешь (иначе last_context/context_mode никогда не будут доступны)
     cur.execute("""
         SELECT processing_state, ingest_job_id, ingest_started_at, last_ready_at, last_error,
-               active_doc_id, pending_queue
+               active_doc_id, pending_queue, last_context, context_mode
         FROM users WHERE id=?
     """, (user_id,))
     row = cur.fetchone()
     con.close()
-    if not row:
-        try:
-            last_ctx = json.loads(row["last_context"]) if row["last_context"] else None
-        except Exception:
-            last_ctx = None
 
+    if not row:
         return {
-            "processing_state": row["processing_state"] or ProcessingState.IDLE.value,
-            "ingest_job_id": row["ingest_job_id"],
-            "ingest_started_at": row["ingest_started_at"],
-            "last_ready_at": row["last_ready_at"],
-            "last_error": row["last_error"],
-            "active_doc_id": row["active_doc_id"],
-            "pending_queue": q,
-            "last_context": last_ctx,
-            "context_mode": row.get("context_mode") or "general",
+            "processing_state": ProcessingState.IDLE.value,
+            "ingest_job_id": None,
+            "ingest_started_at": None,
+            "last_ready_at": None,
+            "last_error": None,
+            "active_doc_id": None,
+            "pending_queue": [],
+            "last_context": None,
+            "context_mode": "general",
         }
+
+    # очередь
     queue_raw = row["pending_queue"]
     try:
         q = json.loads(queue_raw) if queue_raw else []
         q = _queue_prune_ttl(q)
     except Exception:
         q = []
+
+    # контекст
+    try:
+        last_ctx = json.loads(row["last_context"]) if row["last_context"] else None
+    except Exception:
+        last_ctx = None
+
     return {
         "processing_state": row["processing_state"] or ProcessingState.IDLE.value,
         "ingest_job_id": row["ingest_job_id"],
@@ -1440,7 +1341,13 @@ def get_user_state(user_id: int) -> Dict[str, Any]:
         "last_error": row["last_error"],
         "active_doc_id": row["active_doc_id"],
         "pending_queue": q,
+        "last_context": last_ctx,
+        "context_mode": (row["context_mode"] or "general"),
     }
+
+
+async def get_user_state_async(user_id: int) -> Dict[str, Any]:
+    return await asyncio.to_thread(get_user_state, user_id)
 
 
 def _set_user_fields_atomic(user_id: int, fields: Dict[str, Any]) -> None:
@@ -1469,7 +1376,12 @@ def _set_user_fields_atomic(user_id: int, fields: Dict[str, Any]) -> None:
         con.close()
 
 
-def transition_state(user_id: int, to_state: ProcessingState, *, allow_from: Optional[Iterable[ProcessingState]] = None) -> Tuple[str, str]:
+def transition_state(
+    user_id: int,
+    to_state: ProcessingState,
+    *,
+    allow_from: Optional[Iterable[ProcessingState]] = None
+) -> Tuple[str, str]:
     """
     Безопасный переход состояния. Можно задать допустимые начальные состояния.
     Возвращает (old_state, new_state).
@@ -1481,13 +1393,13 @@ def transition_state(user_id: int, to_state: ProcessingState, *, allow_from: Opt
         cur.execute("SELECT processing_state FROM users WHERE id=?", (user_id,))
         row = cur.fetchone()
         old_state = (row["processing_state"] if row and row["processing_state"] else ProcessingState.IDLE.value)
+
         if allow_from:
             allowed = {s.value if isinstance(s, ProcessingState) else str(s) for s in allow_from}
             if old_state not in allowed:
-                # не валидный переход — просто выходим без изменений
                 cur.execute("COMMIT;")
-                con.close()
                 return old_state, old_state
+
         cur.execute("UPDATE users SET processing_state=? WHERE id=?", (to_state.value, user_id))
         cur.execute("COMMIT;")
         return old_state, to_state.value
@@ -1496,6 +1408,16 @@ def transition_state(user_id: int, to_state: ProcessingState, *, allow_from: Opt
         raise
     finally:
         con.close()
+
+
+async def transition_state_async(
+    user_id: int,
+    to_state: ProcessingState,
+    *,
+    allow_from: Optional[Iterable[ProcessingState]] = None
+) -> Tuple[str, str]:
+    return await asyncio.to_thread(transition_state, user_id, to_state, allow_from=allow_from)
+
 
 
 def start_downloading(user_id: int) -> None:
@@ -1714,3 +1636,150 @@ def get_ready_status(user_id: int) -> Dict[str, Optional[str]]:
         "last_ready_at": row["last_ready_at"],
         "active_doc_id": row["active_doc_id"],
     }
+
+# ----------------------------- ASYNC wrappers (to_thread) -----------------------------
+
+async def set_user_active_doc_async(user_id: int, doc_id: Optional[int]) -> None:
+    await asyncio.to_thread(set_user_active_doc, user_id, doc_id)
+
+async def get_user_active_doc_async(user_id: int) -> Optional[int]:
+    return await asyncio.to_thread(get_user_active_doc, user_id)
+
+async def start_downloading_async(user_id: int) -> None:
+    await asyncio.to_thread(start_downloading, user_id)
+
+async def start_indexing_async(user_id: int, *, doc_id: Optional[int], ingest_job_id: Optional[str]) -> None:
+    await asyncio.to_thread(start_indexing, user_id, doc_id=doc_id, ingest_job_id=ingest_job_id)
+
+async def finish_indexing_success_async(user_id: int, *, doc_id: Optional[int]) -> None:
+    await asyncio.to_thread(finish_indexing_success, user_id, doc_id=doc_id)
+
+async def finish_indexing_error_async(user_id: int, *, error_message: str) -> None:
+    await asyncio.to_thread(finish_indexing_error, user_id, error_message=error_message)
+
+async def enqueue_pending_query_async(user_id: int, text: str, *, meta: Optional[Dict[str, Any]] = None) -> int:
+    return await asyncio.to_thread(enqueue_pending_query, user_id, text, meta=meta)
+
+async def dequeue_all_pending_queries_async(user_id: int) -> List[Dict[str, Any]]:
+    return await asyncio.to_thread(dequeue_all_pending_queries, user_id)
+
+async def clear_pending_queue_async(user_id: int) -> None:
+    await asyncio.to_thread(clear_pending_queue, user_id)
+
+async def get_processing_state_async(user_id: int) -> str:
+    return await asyncio.to_thread(get_processing_state, user_id)
+
+async def get_last_error_async(user_id: int) -> Optional[str]:
+    return await asyncio.to_thread(get_last_error, user_id)
+
+async def get_ready_status_async(user_id: int) -> Dict[str, Optional[str]]:
+    return await asyncio.to_thread(get_ready_status, user_id)
+
+# documents
+async def find_reusable_document_async(
+    owner_id: int,
+    content_sha256: Optional[str],
+    file_uid: Optional[str],
+    *,
+    required_indexer_version: int = CURRENT_INDEXER_VERSION
+) -> Optional[int]:
+    return await asyncio.to_thread(
+        find_reusable_document,
+        owner_id,
+        content_sha256,
+        file_uid,
+        required_indexer_version=required_indexer_version,
+    )
+
+async def insert_document_async(
+    owner_id: int,
+    kind: str,
+    path: str,
+    *,
+    content_sha256: Optional[str] = None,
+    file_uid: Optional[str] = None
+) -> int:
+    return await asyncio.to_thread(
+        insert_document,
+        owner_id,
+        kind,
+        path,
+        content_sha256=content_sha256,
+        file_uid=file_uid,
+    )
+
+async def update_document_meta_async(
+    doc_id: int,
+    *,
+    path: Optional[str] = None,
+    content_sha256: Optional[str] = None,
+    file_uid: Optional[str] = None,
+    layout_profile: Optional[str] = None
+) -> None:
+    await asyncio.to_thread(
+        update_document_meta,
+        doc_id,
+        path=path,
+        content_sha256=content_sha256,
+        file_uid=file_uid,
+        layout_profile=layout_profile,
+    )
+
+async def upsert_document_sections_async(doc_id: int, sections: List[Dict[str, Any]]) -> int:
+    return await asyncio.to_thread(upsert_document_sections, doc_id, sections)
+
+async def delete_document_chunks_async(doc_id: int, owner_id: int) -> int:
+    return await asyncio.to_thread(delete_document_chunks, doc_id, owner_id)
+
+async def count_document_chunks_async(doc_id: int, owner_id: int) -> int:
+    return await asyncio.to_thread(count_document_chunks, doc_id, owner_id)
+
+# figures
+async def upsert_figure_async(
+    doc_id: int,
+    figure_label: Optional[str],
+    page: Optional[int],
+    image_path: Optional[str],
+    caption: Optional[str],
+    *,
+    kind: Optional[str] = None,
+    attrs: Optional[Dict[str, Any]] = None,
+) -> int:
+    return await asyncio.to_thread(
+        upsert_figure,
+        doc_id,
+        figure_label,
+        page,
+        image_path,
+        caption,
+        kind=kind,
+        attrs=attrs,
+    )
+
+async def get_figures_for_doc_async(doc_id: int) -> List[Dict[str, Any]]:
+    return await asyncio.to_thread(get_figures_for_doc, doc_id)
+
+async def upsert_figure_analysis_async(
+    figure_id: int,
+    *,
+    kind: Optional[str],
+    data: Optional[Any],
+    exact_numbers: Optional[bool],
+    exact_text: Optional[bool],
+    confidence: Optional[float],
+) -> int:
+    return await asyncio.to_thread(
+        upsert_figure_analysis,
+        figure_id,
+        kind=kind,
+        data=data,
+        exact_numbers=exact_numbers,
+        exact_text=exact_text,
+        confidence=confidence,
+    )
+
+async def get_figure_analysis_async(figure_id: int) -> Optional[Dict[str, Any]]:
+    return await asyncio.to_thread(get_figure_analysis, figure_id)
+
+async def find_nearest_table_above_async(doc_id: int, chunk_id: int) -> Optional[Dict[str, Any]]:
+    return await asyncio.to_thread(find_nearest_table_above, doc_id, chunk_id)

@@ -1293,6 +1293,8 @@ def _render_chart_png(chart_info: Dict[str, Any], out_path: Path) -> Optional[st
     if not chart_info or not (chart_info.get("series") or []):
         return None
     try:
+        import matplotlib
+        matplotlib.use("Agg", force=True)  # <<< КЛЮЧЕВО
         import matplotlib.pyplot as plt  # локальный импорт
     except Exception as e:
         log.info("matplotlib недоступен, пропускаю рендер chart→PNG: %s", e)

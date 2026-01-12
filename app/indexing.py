@@ -91,12 +91,39 @@ def _batched(items: List[str], n: int) -> Iterable[List[str]]:
 
 
 def _limit_table_row_columns(row: str, max_cols: int) -> str:
+    """
+    Ограничивает число колонок в строке таблицы, но:
+      - НЕ удаляет пустые ячейки (иначе сдвигаются колонки и "теряются" значения)
+      - если колонок больше max_cols — не отрезает хвост, а склеивает хвост в последнюю колонку
+        (так данные не пропадают, просто "сжимаются")
+    """
+    row = row or ""
     if max_cols <= 0:
-        return row
-    parts = [p.strip() for p in (row or "").split(" | ")]
+        return row.strip()
+
+    # split сохраняет пустые ячейки между разделителями, если не делать .strip() по всему списку
+    raw_parts = row.split(" | ")
+
+    # нормализуем пробелы внутри ячеек, но НЕ выкидываем пустые
+    parts = [(p or "").strip() for p in raw_parts]
+
+    # если колонок меньше/равно лимиту — возвращаем как есть (сохраняя пустые позиции)
     if len(parts) <= max_cols:
-        return " | ".join([p for p in parts if p])
-    return " | ".join([p for p in parts[:max_cols] if p])
+        return " | ".join(parts).strip()
+
+    # если колонок больше лимита — хвост складываем в последнюю колонку
+    head = parts[: max_cols - 1]
+    tail = parts[max_cols - 1 :]
+
+    # склеим tail обратно, но без потери структуры: внутри последней ячейки разделим " / "
+    # (можно выбрать другой разделитель, главное — чтобы не " | ", иначе снова распарсится как колонки)
+    last = " / ".join([t for t in tail if t != ""])
+    # если все хвостовые пустые — оставим пустую строку, чтобы не менять количество колонок
+    if last == "" and any(t == "" for t in tail):
+        last = ""
+
+    out = head + [last]
+    return " | ".join(out).strip()
 
 
 def _json_safe(obj: Any) -> Any:

@@ -741,9 +741,32 @@ def best_context(owner_id: int, doc_id: int, query: str, max_chars: int = 6000) 
     """
     ID-aware: если в запросе указан рисунок/таблица/область — отдаём локальный контекст.
     Иначе — гибридный контекст по всему документу.
+
+    Строгий режим: если контекст слишком слабый/короткий — возвращаем пустую строку,
+    чтобы верхний слой мог корректно отказаться (no_grounding), а не звать LLM.
     """
-    res = id_aware_search(owner_id, doc_id, query, max_ctx_chars=max_chars)
-    return res["context"] or ""
+    res = id_aware_search(owner_id, doc_id, query, max_ctx_chars=max_chars) or {}
+    ctx = (res.get("context") or "").strip()
+
+    # ✅ Отсекаем "пустые" или почти пустые ответы retrieval,
+    # чтобы не подсовывать модели мусор и не провоцировать галлюцинации.
+    # Порог можно потом подстроить по логам.
+    if not ctx:
+        return ""
+
+    # минимальная эвристика информативности
+    # (временная мера, пока id_aware_search не отдаёт score)
+    words = [w for w in re.split(r"\s+", ctx) if w]
+    if len(ctx) < 200 or len(words) < 30:
+        return ""
+
+    # если контекст состоит в основном из очень коротких строк/обрывков — тоже отсекаем
+    lines = [ln.strip() for ln in ctx.splitlines() if ln.strip()]
+    if lines and sum(1 for ln in lines if len(ln) < 25) / max(1, len(lines)) > 0.6:
+        return ""
+
+    return ctx[:max_chars]
+
 
 def quick_find(owner_id: int, doc_id: int, query: str, limit: int = 5) -> List[Dict[str, Any]]:
     """

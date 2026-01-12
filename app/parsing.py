@@ -404,20 +404,28 @@ def _table_row_strings(tbl: Table) -> List[str]:
     lines: List[str] = []
     try:
         for row in tbl.rows:
-            cells = []
+            cells: List[str] = []
             for c in row.cells:
                 cells.append(_clean(c.text))
-            # убираем повторы смежных ячеек (merge-эффект)
-            dedup = []
-            for i, x in enumerate(cells):
-                if i == 0 or x != cells[i - 1]:
-                    dedup.append(x)
-            line = " | ".join([x for x in dedup if x]).strip(" |")
+
+            # Важно: НЕ удаляем соседние дубликаты — это ломает реальные данные
+            # (например, 35% и 35% в соседних столбцах).
+            # Убираем только хвостовые пустые ячейки.
+            while cells and not (cells[-1] or "").strip():
+                cells.pop()
+
+            # если строка полностью пустая — пропускаем
+            if not any((x or "").strip() for x in cells):
+                continue
+
+            # Склеиваем с сохранением порядка (пустые внутри не выкидываем)
+            line = " | ".join(cells).strip(" |")
             if line:
                 lines.append(line)
     except Exception:
         pass
     return lines
+
 
 def _table_to_text(tbl: Table) -> str:
     lines = _table_row_strings(tbl)
@@ -1018,6 +1026,10 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
     аккуратной обработкой подписей к таблицам/рисункам.
     Также извлекаем изображения и привязываем к секциям element_type='figure'.
     ДОБАВЛЕНО: нумерация разделов (ID вида 1, 1.1, 1.2...) и передача scope_id/path.
+
+    NEW:
+      - Детект номерных псевдо-заголовков вида "2.1 Название" (часто не heading-стиль)
+      - Для таблиц сохраняем полный grid/TSV (все колонки), чтобы downstream не терял значения
     """
     # Пытаемся заранее построить OOXML-индекс (если модуль доступен).
     oox_index: Optional[Dict[str, Any]] = None
@@ -1069,6 +1081,107 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
         cur_level = level
         return sid
 
+    # NEW: номерной заголовок вида "2.1 Название", "3.2.1 ..." (чтобы секции не терялись)
+    NUM_HEADING_RE = re.compile(r"^\s*(\d+(?:[.,]\d+){0,6})\s+(.+?)\s*$")
+
+    def _is_numbered_heading(text: str, attrs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Пытаемся отличить заголовок "2.1 ..." от нумерованных списков "1) ..." и обычного текста.
+        Возвращает dict {num, title, level} или None.
+        """
+        t = (text or "").strip()
+        if not t:
+            return None
+
+        m = NUM_HEADING_RE.match(t)
+        if not m:
+            return None
+
+        num_raw = (m.group(1) or "").strip()
+        title = (m.group(2) or "").strip()
+        if not title:
+            return None
+
+        # Нормализуем номер
+        num = num_raw.replace(",", ".").strip().strip(".")
+        if not num:
+            return None
+
+        # Против нумерованных списков "1) ..."
+        if re.match(r"^\d+\)\s+", t):
+            return None
+
+        # Заголовки обычно короче
+        if len(title) > 140:
+            return None
+
+        looks_like_title = _is_title_candidate(t, attrs)
+        if not looks_like_title:
+            # всё равно встречается "2.1 ..." как обычный абзац без форматирования —
+            # но тогда строка должна быть короткая и "не похожа на обычный текст"
+            if len(t) > 80:
+                return None
+            # слишком много точек (кроме номера) — похоже на обычный текст
+            if t.count(".") > num.count(".") + 1:
+                return None
+
+        level = 1 + num.count(".")
+        level = max(1, min(level, 8))
+        return {"num": num, "title": title, "level": level}
+
+    def _enter_numbered_heading(level: int, title: str, num_id: str) -> str:
+        """
+        Входим в заголовок, но ID секции делаем равным реальному номеру ("2.1"),
+        чтобы потом легко матчить по sec/section_path.
+        """
+        nonlocal outline_counters, heading_stack_titles, heading_stack_ids, cur_title, cur_level
+
+        if level < 1:
+            level = 1
+
+        # синхронизируем outline_counters с реальным номером (если он "чисто числовой")
+        parts = [p for p in (num_id or "").split(".") if p.strip()]
+        parsed: List[int] = []
+        ok = True
+        for p in parts:
+            if p.isdigit():
+                parsed.append(int(p))
+            else:
+                ok = False
+                break
+
+        if ok and parsed:
+            outline_counters = parsed[:]  # теперь _current_scope_id будет совпадать с "2.1"
+        else:
+            # fallback на старую логику
+            while len(outline_counters) < level:
+                outline_counters.append(0)
+            outline_counters = outline_counters[:level]
+            outline_counters[level - 1] += 1
+
+        # растягиваем стеки
+        if len(heading_stack_titles) < level:
+            heading_stack_titles += [""] * (level - len(heading_stack_titles))
+        if len(heading_stack_ids) < level:
+            heading_stack_ids += [""] * (level - len(heading_stack_ids))
+
+        heading_stack_titles[:] = heading_stack_titles[:level]
+        heading_stack_ids[:] = heading_stack_ids[:level]
+
+        # проставляем id текущего уровня = реальный номер
+        heading_stack_titles[level - 1] = (title or "Без названия")
+        heading_stack_ids[level - 1] = num_id
+
+        # если у родителя пусто — заполним префиксами "2", "2.1"…
+        if ok and parsed:
+            for i in range(level - 1):
+                if not heading_stack_ids[i]:
+                    heading_stack_ids[i] = ".".join(str(x) for x in parsed[: i + 1])
+
+        cur_title = title or "Без названия"
+        cur_level = level
+        return num_id
+
     def _ooxml_chart_by_caption(num: Optional[str]) -> Optional[Dict[str, Any]]:
         """
         Ищем в OOXML-индексе фигуру с таким же номером подписи и вытаскиваем оттуда chart_data.
@@ -1117,7 +1230,6 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
     table_counter = 0
     figure_counter = 0
 
-
     def flush_text_section():
         nonlocal buf, cur_title, cur_level, last_para_attrs
         if buf:
@@ -1153,10 +1265,22 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
             last_title_candidate = None
             last_title_candidate_age = 999
 
+    # NEW: helper to keep full table grid (all columns)
+    def _table_to_grid(tbl: Table) -> List[List[str]]:
+        grid: List[List[str]] = []
+        try:
+            for row in tbl.rows:
+                r: List[str] = []
+                for cell in row.cells:
+                    r.append(_clean(cell.text or ""))
+                grid.append(r)
+        except Exception:
+            return []
+        return grid
+
     for block in _iter_block_items(doc):
         last_title_candidate_age = last_title_candidate_age + 1
         last_table_ref_age = last_table_ref_age + 1
-
 
         if isinstance(block, Paragraph):
             p_text = _clean(block.text)
@@ -1191,6 +1315,36 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                 continue
 
             attrs_here = _paragraph_attrs(block)
+
+            # НОВОЕ: псевдо-заголовки введения/заключения/литературы,
+            # даже если они не в Heading-стиле (иначе intro теряется).
+            if _is_title_candidate(p_text, attrs_here):
+                is_intro = re.search(r"(?i)\b(введение|вступление)\b", p_text or "")
+                is_concl = re.search(r"(?i)\b(заключение|выводы\s+и\s+рекомендации|общие\s+выводы)\b", p_text or "")
+                is_refs = re.search(r"(?i)\b(список\s+литературы|библиограф(ия|ический)\s+список|источники|литература)\b", p_text or "")
+
+                if is_intro or is_concl or is_refs:
+                    consider_flush_stale_candidate()
+                    flush_text_section()
+
+                    title = p_text.strip()
+                    lvl = 1
+                    sec_id = _enter_heading(lvl, title)
+
+                    in_sources = bool(is_refs)
+                    if _is_appendix_title(title):
+                        in_sources = False
+
+                    sections.append({
+                        "title": title,
+                        "level": lvl,
+                        "text": "",
+                        "page": None,
+                        "section_path": _current_scope_path(),
+                        "element_type": "heading",
+                        "attrs": {"style": "pseudo-heading-special", "section_id": sec_id, **attrs_here}
+                    })
+                    continue
 
             # НОВОЕ: текстовый псевдо-заголовок главы/раздела («ГЛАВА 1 ...», «Раздел 2.3 ...»)
             if CHAPTER_TITLE_RE.match(p_text) and _is_title_candidate(p_text, attrs_here):
@@ -1232,6 +1386,38 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                     "section_path": _current_scope_path(),
                     "element_type": "heading",
                     "attrs": {"style": "pseudo-heading-appendix", "section_id": sec_id, **attrs_here}
+                })
+                continue
+
+            # NEW: номерной псевдо-заголовок типа "2.1 Организация исследования"
+            nh = _is_numbered_heading(p_text, attrs_here)
+            if nh:
+                consider_flush_stale_candidate()
+                flush_text_section()
+
+                num = nh["num"]
+                title = p_text or nh["title"]
+                lvl = nh["level"]
+
+                sec_id = _enter_numbered_heading(lvl, title, num)
+
+                in_sources = _is_sources_title(title)
+                if _is_appendix_title(title):
+                    in_sources = False
+
+                sections.append({
+                    "title": title,
+                    "level": lvl,
+                    "text": "",
+                    "page": None,
+                    "section_path": _current_scope_path(),
+                    "element_type": "heading",
+                    "attrs": {
+                        "style": "pseudo-heading-numbered",
+                        "section_id": sec_id,
+                        "section_num": num,
+                        **attrs_here
+                    }
                 })
                 continue
 
@@ -1434,7 +1620,6 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
 
             continue
 
-
         # Таблица
         if isinstance(block, Table):
             consider_flush_stale_candidate()
@@ -1469,10 +1654,30 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
             norm_num: Optional[str] = _norm_caption_num(num_final) if num_final else None
 
             t_text = _table_to_text(block) or "(пустая таблица)"
+
+            # NEW: сохраняем "сырой" grid таблицы (все колонки), чтобы дальше нигде не отрезалось
+            grid = _table_to_grid(block)
+            if grid:
+                # уберём полностью пустые хвостовые колонки одинаково для всех строк (часто артефакты)
+                max_cols = max(len(r) for r in grid)
+                norm = [r + [""] * (max_cols - len(r)) for r in grid]
+                while max_cols > 0 and all((nr[max_cols - 1] or "").strip() == "" for nr in norm):
+                    max_cols -= 1
+                if max_cols > 0:
+                    norm = [nr[:max_cols] for nr in norm]
+                grid = norm
+
             attrs_tbl = _table_attrs(block) | {"numbers": _extract_numbers(t_text)}
 
             # NEW: порядковый номер таблицы в документе (для fallback-поиска)
             attrs_tbl["order_index"] = table_counter
+
+            # NEW: кладём полный вид в attrs (для TablesRaw/LLM)
+            if grid:
+                attrs_tbl["table_grid"] = grid
+                attrs_tbl["table_rows"] = len(grid)
+                attrs_tbl["table_cols"] = max((len(r) for r in grid), default=0)
+                attrs_tbl["table_tsv"] = "\n".join("\t".join(r) for r in grid)
 
             if not tail_final and attrs_tbl.get("header_preview"):
                 tail_final = attrs_tbl["header_preview"]
@@ -1492,7 +1697,6 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
             attrs_tbl["section_scope_id"] = _current_scope_id()
             attrs_tbl["anchor"] = f"tbl-{(norm_num or table_counter)}"
 
-
             # Явно помечаем происхождение таблицы
             attrs_tbl["origin"] = "docx"
             attrs_tbl["source"] = "docx_table"
@@ -1503,7 +1707,10 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                 "level": max(1, cur_level + 1),
                 "text": t_text,
                 "page": None,
-                "section_path": _hpath(heading_stack_ids, heading_stack_titles + [t_title or f"Таблица {table_counter}"]),
+                "section_path": _hpath(
+                    heading_stack_ids,
+                    heading_stack_titles + [t_title or f"Таблица {table_counter}"]
+                ),
                 "element_type": "table",
                 "attrs": attrs_tbl
             })
@@ -1529,7 +1736,6 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
                 })
 
             # встроенная диаграмма в таблице → отдельный figure
-                        # встроенная диаграмма в таблице → отдельный figure
             chart_type_t, chart_rows_t, chart_matrix_t = _extract_chart_data_from_table(doc, block)
             if chart_rows_t or chart_matrix_t is not None:
                 figure_counter += 1
@@ -1570,7 +1776,6 @@ def parse_docx(path: str) -> List[Dict[str, Any]]:
             last_table_ref_age = 999
 
             continue
-
 
     if last_title_candidate:
         buf.append(last_title_candidate)
