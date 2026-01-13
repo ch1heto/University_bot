@@ -24,6 +24,7 @@ from .retrieval import (
     get_section_context_for_hints,
     build_context as build_rag_context,
 )
+from app.document_calc_agent import answer_calc_question
 from .ooxml_lite import (
     build_index as oox_build_index,
     figure_lookup as oox_fig_lookup,
@@ -7719,7 +7720,29 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
                 await _send(m, cleaned)
                 LAST_DOC_QUERY[uid] = orig_q_text
                 return
+    
+    # --- CALC AGENT: проверка расчетов/формул/итогов (ранний перехват) ---
+    # Важно: ставим ДО FULLREAD и ДО общего RAG, иначе ответы будут “общие”.
+    try:
+        # не мешаем чистым запросам про таблицу/рисунок/пункт — их уже обслуживают спец-ветки
+        if not _is_pure_table_request(q_text) and not _is_pure_figure_request(q_text):
+            m_sec2 = _SECTION_NUM_RE.search(q_text or "")
+            is_pure_section2 = bool(m_sec2) and _is_pure_section_request(q_text, intents)
 
+            if not is_pure_section2:
+                calc_ans = await answer_calc_question(
+                    uid,
+                    doc_id,
+                    q_text,
+                    chat_with_gpt=chat_with_gpt,  # используем тот же LLM-клиент
+                )
+                if calc_ans:
+                    await _send(m, _strip_unwanted_sections(calc_ans))
+                    LAST_DOC_QUERY[uid] = orig_q_text
+                    return
+    except Exception:
+        logger.exception("calc agent failed, fallback to normal pipeline")
+    # --- /CALC AGENT ---
 
     def _looks_like_big_intro_summary(q: str) -> bool:
         q = (q or "").strip().lower()
