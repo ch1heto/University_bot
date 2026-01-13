@@ -18,6 +18,7 @@ from app.planner import is_big_complex_query, plan_tasks_from_user_query, batch_
 from aiogram.enums import ChatAction
 from aiogram.types import FSInputFile, InputMediaPhoto
 from .document_semantic_planner import build_semantic_plan, answer_semantic_query
+from app.document_calc_agent import is_calc_question
 from .retrieval import (
     get_table_context_for_numbers,
     get_figure_context_for_numbers,
@@ -7521,7 +7522,6 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
     # семантика НЕ должна перехватывать ответ, иначе она видит только intro/ch1/ch2.
     refs_early = extract_struct_refs(q_text) or []
     has_struct_any = bool(refs_early)
-    has_table_or_fig = any((r.get("kind") in ("table", "figure")) for r in refs_early)
 
     # ✅ РАНЬШЕ ВСЕГО: если это мультийнтент (таблица+рисунок+раздел и т.п.) — обрабатываем сразу
     # НО: после structured-* НЕ выходим, чтобы ответить ещё и на "общую" часть вопроса.
@@ -7603,8 +7603,6 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
                 q_text = q_tail
                 intents = detect_intents(q_text)
      # ✅ РАННИЙ VERBATIM-ПЕРЕХВАТ (до FULLREAD/LLM):
-    # если после обрезки структурных подпунктов остался "объект исследования (дословно)",
-    # вытаскиваем строку из полного текста и не даём FULLREAD(auto) схлопнуть ответ.
     def _is_verbatim_object_request(q: str) -> bool:
         ql = (q or "").lower()
         return (
@@ -7668,7 +7666,6 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
                 out.append(p.strip())
         return out
 
-
     verbatim_obj = bool(_is_verbatim_object_request(q_text))
     if verbatim_obj:
         try:
@@ -7682,6 +7679,60 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
             return
         # если вдруг не нашли — просто идём дальше по пайплайну (без return)
 
+    # --- CALC AGENT: проверка расчетов/формул/итогов (ранний перехват ДО семантики/FULLREAD/RAG) ---
+    def _strip_chunk_ids(text: str) -> str:
+        if not text:
+            return text
+
+        # chunk_id=123 / chunkid=123 / chunk id: 123 и т.п.
+        text = re.sub(r"(?i)\bchunk[_\s-]*id\s*[:=]\s*\d+\b", "", text)
+        # диапазоны вида chunk_id=97–111
+        text = re.sub(r"(?i)\bchunk[_\s-]*id\s*[:=]\s*\d+\s*[–-]\s*\d+\b", "", text)
+        # "(см. chunkid=40, ...)" – подчистим хвостовые скобки, если они опустели
+        text = re.sub(r"\(\s*[,;\s]*\)", "", text)
+        # двойные пробелы/пробелы перед знаками
+        text = re.sub(r"[ \t]{2,}", " ", text)
+        text = re.sub(r"\s+([,.;:])", r"\1", text)
+        return text.strip()
+
+    try:
+        # calc-agent запускаем только для "расчетных" вопросов
+        is_calc = is_calc_question(q_text)
+
+        is_pure_fig = _is_pure_figure_request(q_text)
+        m_sec2 = _SECTION_NUM_RE.search(q_text or "")
+        is_pure_section2 = bool(m_sec2) and _is_pure_section_request(q_text, intents)
+
+        # Не мешаем чистым figure/section запросам и не лезем без calc-интента
+        if is_calc and not is_pure_fig and not is_pure_section2:
+            calc_ans = await answer_calc_question(
+                uid,
+                doc_id,
+                q_text,
+                chat_with_gpt=chat_with_gpt,
+            )
+            calc_ans = (calc_ans or "").strip()
+            if calc_ans:
+                calc_ans = _strip_chunk_ids(calc_ans)
+
+                # Если calc-agent фактически "ничего не смог" — НЕ перехватываем ответ,
+                # а даём отработать обычному RAG/semantic/fullread ниже.
+                low = calc_ans.lower()
+                is_no_result = (
+                    "автоматические проверки не дали результата" in low
+                    or "не удалось сформировать ответ" in low
+                )
+                if not is_no_result:
+                    await _send(m, _strip_unwanted_sections(calc_ans))
+                    LAST_DOC_QUERY[uid] = orig_q_text
+                    return
+                logger.info("CALC: no deterministic result, continue normal pipeline (uid=%s, doc_id=%s)", uid, doc_id)
+
+    except Exception:
+        logger.exception("calc agent failed, fallback to normal pipeline")
+
+    # --- /CALC AGENT ---
+
     semantic_answer = None
     try:
         # семантика только для вопросов без структурных ссылок
@@ -7689,7 +7740,6 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
             semantic_answer = await answer_semantic_query(uid, doc_id, q_text, plan)
     except Exception:
         logger.exception("answer_semantic_query failed, fallback to old pipeline")
-
 
 
     if semantic_answer:
@@ -7720,29 +7770,7 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
                 await _send(m, cleaned)
                 LAST_DOC_QUERY[uid] = orig_q_text
                 return
-    
-    # --- CALC AGENT: проверка расчетов/формул/итогов (ранний перехват) ---
-    # Важно: ставим ДО FULLREAD и ДО общего RAG, иначе ответы будут “общие”.
-    try:
-        # не мешаем чистым запросам про таблицу/рисунок/пункт — их уже обслуживают спец-ветки
-        if not _is_pure_table_request(q_text) and not _is_pure_figure_request(q_text):
-            m_sec2 = _SECTION_NUM_RE.search(q_text or "")
-            is_pure_section2 = bool(m_sec2) and _is_pure_section_request(q_text, intents)
 
-            if not is_pure_section2:
-                calc_ans = await answer_calc_question(
-                    uid,
-                    doc_id,
-                    q_text,
-                    chat_with_gpt=chat_with_gpt,  # используем тот же LLM-клиент
-                )
-                if calc_ans:
-                    await _send(m, _strip_unwanted_sections(calc_ans))
-                    LAST_DOC_QUERY[uid] = orig_q_text
-                    return
-    except Exception:
-        logger.exception("calc agent failed, fallback to normal pipeline")
-    # --- /CALC AGENT ---
 
     def _looks_like_big_intro_summary(q: str) -> bool:
         q = (q or "").strip().lower()

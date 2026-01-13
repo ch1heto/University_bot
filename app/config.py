@@ -4,12 +4,22 @@ from pathlib import Path
 from enum import Enum
 
 # Загружаем .env, если есть
+# Загружаем .env детерминированно (рядом с корнем проекта), чтобы не зависеть от cwd/UNC/VSCode
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+
+    # app/config.py -> app/ -> корень проекта
+    _ROOT = Path(__file__).resolve().parent.parent
+    _ENV_PATH = _ROOT / ".env"
+
+    # если .env есть — грузим его явно
+    if _ENV_PATH.exists():
+        load_dotenv(_ENV_PATH)
+    else:
+        # фоллбэк: как раньше (на случай нестандартной структуры)
+        load_dotenv()
 except Exception:
     pass
-
 
 # ----------------------------- env helpers -----------------------------
 
@@ -69,7 +79,11 @@ class Cfg:
     if not BASE_POLZA.endswith("/v1"):
         BASE_POLZA = BASE_POLZA + "/v1"
 
-    POLZA_KEY: str | None = os.getenv("POLZA_API_KEY")
+    POLZA_KEY: str | None = (
+        os.getenv("POLZA_API_KEY")
+        or os.getenv("OPENAI_API_KEY")
+        or os.getenv("POLZA_KEY")
+    )
 
     # Фоллбэки имён переменных окружения для совместимости:
     #   POLZA_CHAT_MODEL | POLZA_MODEL | MODEL_CHAT
@@ -420,7 +434,7 @@ class Cfg:
     def validate(cls) -> None:
         missing = []
         if not cls.POLZA_KEY:
-            missing.append("POLZA_API_KEY")
+            missing.append("POLZA_API_KEY/OPENAI_API_KEY")
         if not cls.TG_TOKEN:
             missing.append("TG_BOT_TOKEN")
         if missing:
