@@ -110,8 +110,6 @@ except Exception:
         )
 
 
-
-
 # НОВОЕ: оркестратор приёма/обогащения (OCR таблиц-картинок, нормализация чисел)
 from .ingest_orchestrator import enrich_sections, ingest_document
 # НОВОЕ: аналитика таблиц
@@ -123,16 +121,14 @@ from .utils import safe_filename, sha256_bytes, split_for_telegram, infer_doc_ki
 # гибридный контекст: семантика + FTS/LIKE
 from .lexsearch import best_context
 
-# сразу под текущими import’ами
-from .paywall_stub import setup_paywall
-
 # где у вас создаются объекты бота и диспетчера:
 bot = Bot(Cfg.TG_TOKEN)
 dp = Dispatcher()
-# добавьте эту строку (один раз):
-setup_paywall(dp, bot)
 
 register_docs_handlers(dp)
+
+from .promo_access import setup_promo_access
+setup_promo_access(dp, bot)
 
 # --------------------- ПАРАМЕТРЫ СТРИМИНГА (с дефолтами) ---------------------
 
