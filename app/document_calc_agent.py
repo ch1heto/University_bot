@@ -1432,7 +1432,31 @@ def _check_table_totals(chunks: Sequence[EvidenceChunk], max_tables: int = 10) -
 
         ti = total_rows_idx[-1]
         total_row = grid[ti]
-        data_rows = grid[:ti]
+        def _looks_like_header_row(row: List[str]) -> bool:
+            cells = [str(x or "").strip().lower() for x in row]
+            joined = " ".join(cells)
+
+            # явные маркеры шапки
+            if any(k in joined for k in ("год", "показател", "наименован", "ед.", "единиц", "тыс.", "руб", "%")):
+                return True
+
+            # если почти все "числа" похожи на годы 1900..2100 — это тоже шапка
+            nums = []
+            for c in cells:
+                m = re.fullmatch(r"\d{4}", c)
+                if m:
+                    nums.append(int(m.group(0)))
+            if nums and all(1900 <= n <= 2100 for n in nums):
+                return True
+
+            return False
+
+        hi = 0
+        while hi < ti and _looks_like_header_row(grid[hi]):
+            hi += 1
+
+        data_rows = grid[hi:ti]
+
         if len(data_rows) < 2:
             continue
 
