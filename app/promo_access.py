@@ -537,14 +537,14 @@ async def promo_revoke_handler(message: types.Message):
         await message.answer("Не удалось отозвать: код не найден или уже использован.")
 
 async def promo_create_count_input_handler(message: types.Message):
-    # Срабатывает только для админов, у кого есть pending create
     if PROMO_DISABLED:
         return
-
     if not message.from_user:
         return
+
     user_id = int(message.from_user.id)
 
+    # Только админ и только если реально ждём число
     if not _is_admin(user_id):
         return
     if user_id not in _PENDING_PROMO_CREATE:
@@ -552,7 +552,7 @@ async def promo_create_count_input_handler(message: types.Message):
 
     text = (message.text or "").strip()
 
-    # Если вдруг прислали команду — игнорируем (пусть обработают другие handlers)
+    # Команды не обрабатываем здесь
     if text.startswith("/"):
         return
 
@@ -567,7 +567,10 @@ async def promo_create_count_input_handler(message: types.Message):
 
     _PENDING_PROMO_CREATE.pop(user_id, None)
 
-    codes = [create_promo_code(admin_id=user_id, duration_sec=PROMO_DURATION_SEC, max_redemptions=1) for _ in range(n)]
+    codes = [
+        create_promo_code(admin_id=user_id, duration_sec=PROMO_DURATION_SEC, max_redemptions=1)
+        for _ in range(n)
+    ]
     await message.answer(
         f"Сгенерировано {n} промокодов (одноразовые, {PROMO_DURATION_HOURS} ч):\n" + "\n".join(codes)
     )
@@ -696,7 +699,16 @@ def setup_promo_access(dp: Dispatcher, bot: Bot) -> None:
     dp.message.register(promo_info_handler, Command("promo_info"))
     dp.message.register(cancel_handler, Command("cancel"))
 
-    dp.message.register(promo_create_count_input_handler, lambda m: bool(getattr(m, "text", None)))
+    def _promo_pending_filter(m: types.Message) -> bool:
+        if not getattr(m, "text", None):
+            return False
+        if not m.from_user:
+            return False
+        uid = int(m.from_user.id)
+        # ВАЖНО: матчим только админа и только когда ждём число
+        return _is_admin(uid) and (uid in _PENDING_PROMO_CREATE) and not (m.text or "").strip().startswith("/")
+
+    dp.message.register(promo_create_count_input_handler, _promo_pending_filter)
 
     stop_event = asyncio.Event()
     task_holder: dict[str, asyncio.Task] = {}
