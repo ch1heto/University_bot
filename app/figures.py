@@ -1424,3 +1424,141 @@ def _extract_docx_charts_to_png(
 
 
     return records
+
+# ДОБАВЬТЕ ЭТУ ФУНКЦИЮ В КОНЕЦ app/figures.py (после строки 1427)
+
+def analyze_figure_with_vision(
+    owner_id: int,
+    doc_id: int,
+    figure_num: str,
+    question: str
+) -> str:
+    """
+    Анализирует рисунок через Vision API.
+    
+    Args:
+        owner_id: ID пользователя
+        doc_id: ID документа
+        figure_num: Номер рисунка (например, "1", "2.1")
+        question: Вопрос пользователя
+        
+    Returns:
+        Текстовое описание содержимого рисунка
+    """
+    try:
+        import base64
+        from pathlib import Path
+        
+        # Импорт polza_client
+        try:
+            from .polza_client import chat_with_gpt
+        except:
+            log.warning("polza_client не импортирован")
+            return ""
+        
+        # Находим рисунок в БД
+        with db_mod.get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT image_path, caption, num
+                FROM figures 
+                WHERE owner_id = ? AND doc_id = ? AND num = ?
+                LIMIT 1
+            """, (owner_id, doc_id, str(figure_num)))
+            
+            row = cursor.fetchone()
+            if not row:
+                log.info(f"Рисунок {figure_num} не найден в БД")
+                return ""
+            
+            image_path = row['image_path']
+            caption = row['caption'] or f"Рисунок {figure_num}"
+        
+        # Проверяем существование файла
+        if not image_path or not Path(image_path).exists():
+            log.warning(f"Файл рисунка не найден: {image_path}")
+            return ""
+        
+        log.info(f"Анализируем рисунок: {image_path}")
+        
+        # Загружаем и кодируем изображение
+        with open(image_path, 'rb') as f:
+            image_data = f.read()
+        
+        image_base64 = base64.b64encode(image_data).decode('utf-8')
+        
+        # Определяем MIME тип
+        ext = Path(image_path).suffix.lower()
+        mime_types = {
+            '.png': 'image/png',
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.gif': 'image/gif',
+        }
+        mime_type = mime_types.get(ext, 'image/png')
+        
+        # Формируем промпт для Vision API
+        prompt = f"""Опиши подробно, что изображено на этом рисунке.
+
+ОБЯЗАТЕЛЬНО укажи:
+1. Тип визуализации (гистограмма, круговая диаграмма, линейный график, таблица, фото и т.д.)
+2. Что показано на осях X и Y (если это график)
+3. КОНКРЕТНЫЕ ЗНАЧЕНИЯ и числа, которые видны на рисунке
+4. Легенду (если есть)
+5. Основные выводы, которые можно сделать из графика
+
+Подпись рисунка: {caption}
+Вопрос пользователя: {question}
+
+Отвечай КОНКРЕТНО, указывая точные числа и значения."""
+        
+        # Вызываем Vision API через polza_client
+        response = chat_with_gpt(
+            prompt,
+            max_tokens=800,
+            temperature=0.3,
+            images=[{
+                'type': 'base64',
+                'data': image_base64,
+                'mime_type': mime_type,
+            }]
+        )
+        
+        log.info(f"Vision API ответ получен, длина: {len(response)}")
+        return response
+        
+    except Exception as e:
+        log.error(f"Ошибка анализа рисунка через Vision API: {e}", exc_info=True)
+        return ""
+
+
+# ===================================================================
+# ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ: Поиск рисунка по номеру
+# ===================================================================
+
+def find_figure_by_number(owner_id: int, doc_id: int, figure_num: str) -> Optional[Dict[str, Any]]:
+    """
+    Находит рисунок в БД по номеру.
+    
+    Returns:
+        Словарь с полями: id, num, caption, image_path, etc.
+        Или None, если не найдено.
+    """
+    try:
+        with db_mod.get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT id, doc_id, owner_id, num, caption, image_path, 
+                       chart_data, created_at
+                FROM figures 
+                WHERE owner_id = ? AND doc_id = ? AND num = ?
+                LIMIT 1
+            """, (owner_id, doc_id, str(figure_num)))
+            
+            row = cursor.fetchone()
+            if row:
+                return dict(row)
+            return None
+    except Exception as e:
+        log.error(f"Ошибка поиска рисунка: {e}")
+        return None

@@ -26,7 +26,7 @@ from .retrieval import (
     build_context as build_rag_context,
 )
 from app.document_calc_agent import answer_calc_question
-from .ooxml_lite import (
+from .parsing_new import (
     build_index as oox_build_index,
     figure_lookup as oox_fig_lookup,
     table_lookup as oox_tbl_lookup,
@@ -51,7 +51,7 @@ from .db import (
     get_processing_state, start_downloading,
     find_nearest_table_above
 )
-from .parsing import parse_docx, parse_doc, save_upload
+from .parsing_new import parse_docx, parse_doc, save_upload
 from .indexing import index_document
 from .retrieval import (
     retrieve, build_context, invalidate_cache,
@@ -59,7 +59,7 @@ from .retrieval import (
     describe_figures_by_numbers,
 )
 from .intents import detect_intents
-
+from .unified_pipeline import answer_question
 # ---------- polza client: пробуем стрим, фолбэк на обычный чат ----------
 try:
     from .polza_client import (
@@ -212,11 +212,23 @@ _GREET_RE = re.compile(
 )
 
 def _is_greeting(text: str) -> bool:
-    t = (text or "").strip()
-    if not t:
-        return False
-    # короткие приветствия или фразы, где встречается ключевое слово
-    return bool(_GREET_RE.search(t))
+    """Проверяет, является ли сообщение приветствием"""
+    greetings = [
+        "привет", "здравствуй", "добрый день", "добрый вечер", "доброе утро",
+        "hi", "hello", "hey", "good morning", "good evening",
+        "салам", "хай", "дарова", "здаров"
+    ]
+    text_lower = text.lower().strip()
+    
+    # Точное совпадение или начинается с приветствия
+    if text_lower in greetings:
+        return True
+    
+    for g in greetings:
+        if text_lower.startswith(g):
+            return True
+    
+    return False
 
 # --- разбор ссылок вида "таблица 1.2", "рис. 3", "глава 2" в вопросе пользователя ---
 
@@ -2428,11 +2440,17 @@ async def _send_media_from_cards(m: types.Message, cards: list[dict]) -> bool:
 # ------------------------------ helpers ------------------------------
 
 def _parse_by_ext(path: str) -> list[dict]:
+    """Парсинг документа с извлечением секций"""
     fname = (os.path.basename(path) or "").lower()
+    
     if fname.endswith(".docx"):
-        return parse_docx(path)
+        result = parse_docx(path)
+        return result.get('sections', [])  # ✅ Только секции!
+    
     if fname.endswith(".doc"):
-        return parse_doc(path)
+        result = parse_doc(path)
+        return result.get('sections', [])  # ✅ Только секции!
+    
     raise RuntimeError("Поддерживаю только .doc и .docx.")
 
 def _first_chunks_context(owner_id: int, doc_id: int, n: int = 10, max_chars: int = 6000) -> str:
@@ -6831,122 +6849,6 @@ def _iterative_fullread_build_messages(uid: int, doc_id: int, question: str) -> 
     return messages, None
 
 
-# ------------------------------ загрузка файла ------------------------------
-
-@dp.message(F.document)
-async def handle_doc(m: types.Message):
-    # ensure_user / start_downloading часто трогают SQLite/диск → лучше вынести из event loop
-    uid = await asyncio.to_thread(ensure_user, str(m.from_user.id))
-    doc = m.document
-
-    # 0) FSM: фиксируем, что начали скачивание (если это БД/файл — тоже в thread)
-    await asyncio.to_thread(start_downloading, uid)
-    await _send(m, Cfg.MSG_ACK_DOWNLOADING)
-
-    # 1) скачиваем файл целиком (без обрезки)
-    from io import BytesIO
-
-    file = await bot.get_file(doc.file_id)
-    buf = BytesIO()
-    await bot.download_file(file.file_path, destination=buf)
-    buf.seek(0)
-    data = buf.read()  # bytes (быстро, в памяти)
-
-    # 2) сохраняем на диск (единственный источник правды для оркестратора)
-    filename = safe_filename(f"{m.from_user.id}_{doc.file_name}")
-    path = await asyncio.to_thread(save_upload, data, filename, Cfg.UPLOAD_DIR)
-    await _send(m, Cfg.MSG_ACK_INDEXING)
-
-    # 3) обёртка индексатора под сигнатуру оркестратора (замыкаем uid)
-    def _indexer_fn(doc_id: int, file_path: str, kind: str) -> dict:
-        # ВАЖНО: ingest_document выполняется в to_thread, значит _indexer_fn тоже будет вызван в этом же потоке.
-        sections = _parse_by_ext(file_path)
-        sections = enrich_sections(sections, doc_kind=os.path.splitext(file_path)[1].lower().strip("."))
-
-        # sanity-check на «пустые» файлы
-        if sum(len(s.get("text") or "") for s in sections) < 500 and not any(
-            s.get("element_type") in ("table", "table_row", "figure") for s in sections
-        ):
-            raise RuntimeError("Похоже, файл не содержит «живого» текста/структур.")
-
-        # индексация «как раньше»
-        delete_document_chunks(doc_id, uid)
-        index_document(uid, doc_id, sections)
-        invalidate_cache(uid, doc_id)
-        update_document_meta(doc_id, layout_profile=_current_embedding_profile())
-        return {"sections_count": len(sections)}
-
-    # 4) запускаем оркестратор В ОТДЕЛЬНОМ ПОТОКЕ (чтобы не блокировать event loop)
-    try:
-        result = await asyncio.to_thread(
-            ingest_document,
-            user_id=uid,
-            file_path=path,
-            kind=infer_doc_kind(doc.file_name),
-            file_uid=getattr(doc, "file_unique_id", None),
-            content_sha256=sha256_bytes(data),
-            indexer_fn=_indexer_fn,
-        )
-    except Exception as e:
-        logging.exception("ingest failed: %s", e)
-        await _send(m, Cfg.MSG_INDEX_FAILED + f" Подробности: {e}")
-        return
-
-    doc_id = int(result["doc_id"])
-    ACTIVE_DOC[uid] = doc_id
-    await asyncio.to_thread(set_user_active_doc, uid, doc_id)
-
-    # NEW: построить индекс рисунков из исходного файла и закэшировать (старый путь) — тоже в thread
-    try:
-        if fig_index_document is not None:
-            FIG_INDEX[doc_id] = await asyncio.to_thread(fig_index_document, path)
-    except Exception as e:
-        logging.exception("figures indexing failed: %s", e)
-
-    # NEW: построить ЕДИНЫЙ OOXML-индекс — тоже в thread
-    try:
-        idx_oox = await asyncio.to_thread(oox_build_index, path)
-        OOXML_INDEX[doc_id] = idx_oox
-
-        # persist под ID документа из БД — json.dump + open могут блокировать → в thread
-        def _persist_oox_index(_doc_id: int, _idx: dict):
-            os.makedirs(os.path.join("runtime", "indexes"), exist_ok=True)
-            with open(os.path.join("runtime", "indexes", f"{_doc_id}.json"), "w", encoding="utf-8") as f:
-                json.dump(_idx, f, ensure_ascii=False, indent=2)
-
-        try:
-            await asyncio.to_thread(_persist_oox_index, doc_id, idx_oox)
-        except Exception:
-            pass
-
-    except Exception as e:
-        logging.exception("ooxml build_index failed: %s", e)
-
-    # 5) READY: сообщаем и обрабатываем ...
-    await _send(
-        m,
-        (f"Этот файл уже был загружен как документ #{doc_id}. " if result.get("reused") else "") + Cfg.MSG_READY
-    )
-
-    caption = (m.caption or "").strip()
-    if caption:
-        await respond_with_answer(m, uid, doc_id, caption)
-
-    # авто-дренаж очереди ожидания (если это SQLite/файл — тоже в thread)
-    try:
-        queued = await asyncio.to_thread(dequeue_all_pending_queries, uid)
-        for item in queued:
-            q = (item.get("text") or "").strip()
-            if not q:
-                continue
-            # если вопрос из очереди совпадает с подписью к файлу — не отвечаем второй раз
-            if caption and q.strip() == caption:
-                continue
-            await respond_with_answer(m, uid, doc_id, q)
-            await asyncio.sleep(0)  # не блокируем цикл
-    except Exception as e:
-        logging.exception("drain pending queue failed: %s", e)
-
 # ------------------------------ основной ответчик ------------------------------
 
 async def _answer_with_model_extra(m: types.Message, uid: int, base_question: str) -> None:
@@ -7455,6 +7357,20 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
         )
         await _send(m, "Вопрос пустой. Напишите, что именно вас интересует по ВКР.")
         return
+
+    def _looks_like_no_grounding(ans: str) -> bool:
+        al = (ans or "").lower()
+        return any(p in al for p in (
+            "не указано",
+            "не привод",
+            "нет данных",
+            "не найден",
+            "не удалось найти",
+            "в представленн",
+            "в тексте не указ",
+            "информация отсутств",
+        ))
+
 
     viol = safety_check(q_text)
     if viol:
@@ -8540,59 +8456,62 @@ async def respond_with_answer(m: types.Message, uid: int, doc_id: int, q_text: s
         logging.exception("generate_answer failed: %s", e)
         answer = ""
 
-    # 3) страховка от пустого ответа: всегда что-то показываем
     answer = (answer or "").strip()
+
+    # ✅ NEW: единоразовый “факт-добор”, если ответ явно no-grounding
+    try:
+        can_retry = (
+            isinstance(facts, dict)
+            and not has_struct_any
+            and not _is_pure_table_request(q_text)
+            and not _is_pure_figure_request(q_text)
+            and not (_SECTION_NUM_RE.search(q_text or "") and _is_pure_section_request(q_text, intents))
+        )
+
+        if can_retry and answer and _looks_like_no_grounding(answer):
+            ctx_now = (facts.get("general_ctx") or "").strip()
+            # если контекста мало/нет — добираем
+            if len(ctx_now) < 400:
+                # 1) добор через semantic retrieve
+                hits = retrieve(uid, doc_id, q_text, top_k=12) or []
+                add_snips = []
+                for h in hits[:8]:
+                    t = (h.get("text") or "").strip()
+                    if t:
+                        add_snips.append(t)
+
+                # 2) добор через lexical best_context (короткие факты теперь не режутся)
+                lex = best_context(uid, doc_id, q_text, max_chars=2500) or ""
+                if lex:
+                    add_snips.append(lex.strip())
+
+                # склеиваем аккуратно
+                add_block = "\n\n".join([s for s in add_snips if s])[:6000].strip()
+                if add_block:
+                    prev = (facts.get("general_ctx") or "").strip()
+                    facts["general_ctx"] = (prev + "\n\n" + "[ДОБРАННЫЙ КОНТЕКСТ]\n" + add_block).strip() if prev else ("[ДОБРАННЫЙ КОНТЕКСТ]\n" + add_block)
+
+                    # повторная генерация 1 раз
+                    answer2 = generate_answer(
+                        enriched_q,
+                        facts,
+                        language=intents.get("language", "ru"),
+                    )
+                    answer2 = (answer2 or "").strip()
+                    if answer2:
+                        answer = answer2
+    except Exception:
+        logging.exception("fact-backfill retry failed, keep original answer")
+
+    # страховка от пустого ответа
     if not answer:
         answer = (
             "Не удалось получить содержательный ответ из текста работы. "
             "Попробуй переформулировать вопрос или уточнить, какой раздел, таблицу или рисунок тебя интересует."
         )
 
-    # --- VERBATIM GUARD: "объект исследования (дословно)" ---
-    try:
-        q_low = (q_text or "").lower()
-
-        is_verbatim_obj = (
-            ("дословно" in q_low or "цитат" in q_low)
-            and ("объект" in q_low)
-            and ("исслед" in q_low)
-        )
-
-        # если модель схлопнула до "родителей"/"родители"/коротыша — подменяем на цитаты из контекста
-        if is_verbatim_obj and isinstance(facts, dict):
-            a_low = (answer or "").lower()
-
-            looks_collapsed = (
-                len((answer or "").strip()) < 60
-                or a_low.strip() in {"«родителей»", "родителей", "родители"}
-                or "объект исследования: родители" in a_low
-                or "объект исследования (дословно): «родителей»" in a_low
-            )
-
-            has_quotes_marker = ("цитата_" in a_low)  # твой удобный маркер из RAG
-            if looks_collapsed and not has_quotes_marker:
-                ctx = (facts.get("general_ctx") or "").strip()
-                if ctx:
-                    # берём строки-цитаты и/или строки, где явно есть "объект исследования"
-                    picked = []
-                    for ln in ctx.splitlines():
-                        lnl = ln.lower()
-                        if lnl.startswith("цитата_"):
-                            picked.append(ln.strip())
-                        elif "объект исслед" in lnl:
-                            picked.append(ln.strip())
-
-                    picked = [p for p in picked if p]
-                    if picked:
-                        answer = "\n".join(picked[:6]).strip()
-                    else:
-                        # fallback — хоть что-то дословное из контекста
-                        answer = ctx.splitlines()[0].strip()
-    except Exception:
-        pass
-    # --- /VERBATIM GUARD ---
-
     await _send(m, _strip_unwanted_sections(answer))
+
 
 
 def _is_comparative_struct_request(q_text: str, refs: list[dict]) -> bool:
@@ -8924,10 +8843,15 @@ def _needs_reindex_by_embeddings(con, doc_id: int) -> bool:
 # ------------------------------ обычный текст ------------------------------
 
 @dp.message(F.text & ~F.via_bot & ~F.text.startswith("/"))
-async def qa(m: types.Message):
+async def handle_text_message_unified(m: types.Message):
+    """
+    Обработчик текстовых сообщений с unified_pipeline.
+    Сохраняет всю логику старого обработчика + использует новый пайплайн.
+    """
     uid = ensure_user(str(m.from_user.id))
     doc_id = ACTIVE_DOC.get(uid)
 
+    # Восстанавливаем активный документ из БД, если не в памяти
     if not doc_id:
         persisted = get_user_active_doc(uid)
         if persisted:
@@ -8940,7 +8864,6 @@ async def qa(m: types.Message):
     if MODEL_EXTRA_PENDING.get(uid):
         MODEL_EXTRA_PENDING.pop(uid, None)
 
-
     # 👋 РАННИЙ ответ на приветствие, без постановки в очередь
     if _is_greeting(text):
         greet = getattr(
@@ -8950,21 +8873,211 @@ async def qa(m: types.Message):
         await _send(m, greet)
         return
 
+    # Если нет активного документа — сохраняем вопрос в очередь
     if not doc_id:
-        # сохраняем вопрос, чтобы ответить после индексации первого файла
         if text:
             enqueue_pending_query(uid, text, meta={"source": "chat", "reason": "no_active_doc"})
         await _send(m, Cfg.MSG_NEED_FILE_QUEUED)
         return
 
-    # ⬇⬇⬇ НОВОЕ: вместо прямого await respond_with_answer
-
-    # при длинном вопросе даём быстрый квиток, чтобы пользователь видел, что работа началась
+    # Для длинных вопросов даём быстрое подтверждение
     if len(text) > 200:
         await _send(
             m,
             "Запрос большой, я готовлю подробный ответ. Это может занять немного времени 🙂"
         )
 
-    # запускаем тяжёлый пайплайн в фоне, не блокируя обработку апдейта
-    asyncio.create_task(_qa_worker(m, uid, doc_id, text))
+    # ✨ ГЛАВНОЕ ОТЛИЧИЕ: Используем unified_pipeline вместо старой логики!
+    await _answer_via_unified_pipeline(m, uid, doc_id, text)
+
+
+async def _answer_via_unified_pipeline(
+    m: types.Message,
+    uid: int,
+    doc_id: int,
+    question: str
+):
+    """
+    Отвечает на вопрос через unified_pipeline.
+    Обрабатывает ошибки и отправляет результат пользователю.
+    """
+    try:
+        # Показываем, что печатаем
+        await m.bot.send_chat_action(m.chat.id, ChatAction.TYPING)
+        
+        # ✅ ОДИН вызов unified_pipeline для ВСЕХ типов вопросов!
+        answer = await answer_question(
+            user_id=uid,
+            question=question,
+            stream=False,  # Пока без стрима (можно включить позже)
+        )
+        
+        # Отправляем ответ
+        if answer:
+            # Разбиваем длинные ответы на части
+            if len(answer) > TG_MAX_CHARS:
+                parts = list(split_for_telegram(answer, limit=TG_MAX_CHARS))
+                for i, part in enumerate(parts):
+                    await asyncio.sleep(0.2)  # Небольшая пауза между частями
+                    await _send(m, part)
+            else:
+                await _send(m, answer)
+        else:
+            # Если пустой ответ (не должно быть, но на всякий случай)
+            await _send(
+                m,
+                "Не удалось сформировать ответ. Попробуйте переформулировать вопрос."
+            )
+    
+    except Exception as e:
+        logger.error(f"Ошибка в unified_pipeline: {e}", exc_info=True)
+        
+        # Пытаемся понять, что пошло не так
+        error_msg = "Произошла ошибка при обработке вопроса."
+        
+        if "Context is empty" in str(e) or "not found" in str(e).lower():
+            error_msg = (
+                "В документе не найдено информации для ответа на этот вопрос.\n"
+                "Попробуйте:\n"
+                "- Уточнить формулировку\n"
+                "- Указать номер главы/раздела\n"
+                "- Спросить про другой аспект работы"
+            )
+        elif "timeout" in str(e).lower():
+            error_msg = "Запрос занял слишком много времени. Попробуйте упростить вопрос."
+        
+        
+        await _send(m, error_msg)
+
+# ============================================================================
+# ОБРАБОТЧИК ЗАГРУЗКИ ДОКУМЕНТОВ
+# ============================================================================
+
+@dp.message(F.document)
+async def handle_document_upload(m: types.Message):
+    """Обработчик загрузки новых документов (.doc, .docx)"""
+    uid = ensure_user(str(m.from_user.id))
+    doc = m.document
+
+    # Проверка формата
+    filename = doc.file_name or ""
+    if not (filename.lower().endswith('.docx') or filename.lower().endswith('.doc')):
+        await _send(m, "⚠️ Поддерживаются только .doc и .docx")
+        return
+
+    # FSM
+    await asyncio.to_thread(start_downloading, uid)
+    await _send(m, Cfg.MSG_ACK_DOWNLOADING)
+
+    try:
+        # Скачивание
+        from io import BytesIO
+        file = await bot.get_file(doc.file_id)
+        buf = BytesIO()
+        await bot.download_file(file.file_path, destination=buf)
+        buf.seek(0)
+        data = buf.read()
+
+        # Сохранение
+        filename_safe = safe_filename(f"{m.from_user.id}_{doc.file_name}")
+        path = await asyncio.to_thread(save_upload, data, filename_safe, Cfg.UPLOAD_DIR)
+        await _send(m, Cfg.MSG_ACK_INDEXING)
+
+        # Индексация
+        def _indexer_fn(doc_id: int, file_path: str, kind: str) -> dict:
+            """Функция индексации для оркестратора"""
+            
+            # Парсим документ
+            sections = _parse_by_ext(file_path)
+            logger.info(f"Parsed {len(sections)} sections from document")
+            
+            # Отладка: смотрим первую секцию
+            if sections:
+                first = sections[0]
+                logger.info(f"First section keys: {first.keys()}")
+                logger.info(f"First section text length: {len(first.get('text', ''))}")
+            
+            # Обогащаем секции
+            sections = enrich_sections(sections, doc_kind=os.path.splitext(file_path)[1].lower().strip("."))
+            logger.info(f"After enrichment: {len(sections)} sections")
+            
+            # Отладка: смотрим первую секцию после обогащения
+            if sections:
+                first = sections[0]
+                logger.info(f"After enrichment - first section keys: {first.keys()}")
+                text_field = first.get('text') or first.get('content') or first.get('body') or ''
+                logger.info(f"After enrichment - text length: {len(text_field)}")
+            
+            # УЛУЧШЕННАЯ ПРОВЕРКА НА ПУСТОТУ
+            # Проверяем разные поля, где может быть текст
+            total_chars = 0
+            for s in sections:
+                # Пробуем разные поля
+                text = (s.get("text") or 
+                        s.get("content") or 
+                        s.get("body") or 
+                        s.get("raw_text") or 
+                        "")
+                total_chars += len(text)
+            
+            logger.info(f"Total characters in document: {total_chars}")
+            
+            # Проверка: если меньше 100 символов И нет таблиц/рисунков
+            if total_chars < 100 and not any(
+                s.get("element_type") in ("table", "table_row", "figure") for s in sections
+            ):
+                raise RuntimeError(
+                    f"Похоже, файл не содержит текста. "
+                    f"Найдено: {len(sections)} секций, {total_chars} символов."
+                )
+            
+            # Индексация
+            delete_document_chunks(doc_id, uid)
+            index_document(uid, doc_id, sections)
+            invalidate_cache(uid, doc_id)
+            update_document_meta(doc_id, layout_profile=_current_embedding_profile())
+            
+            return {"sections_count": len(sections), "total_chars": total_chars}
+
+        # Оркестратор
+        result = await asyncio.to_thread(
+            ingest_document,
+            user_id=uid,
+            file_path=path,
+            kind=infer_doc_kind(doc.file_name),
+            file_uid=getattr(doc, "file_unique_id", None),
+            content_sha256=sha256_bytes(data),
+            indexer_fn=_indexer_fn,
+        )
+
+        doc_id = int(result["doc_id"])
+        ACTIVE_DOC[uid] = doc_id
+        await asyncio.to_thread(set_user_active_doc, uid, doc_id)
+
+        # Индексы
+        if fig_index_document:
+            try:
+                await asyncio.to_thread(fig_index_document, uid, doc_id, path)
+            except: pass
+
+        try:
+            await asyncio.to_thread(oox_build_index, path, Cfg.UPLOAD_DIR)
+        except: pass
+
+        # Отложенные вопросы
+        pending = await asyncio.to_thread(dequeue_all_pending_queries, uid)
+        if pending:
+            await _send(m, f"✅ Документ готов! Отвечаю на {len(pending)} вопросов...")
+            for pq in pending:
+                q_text = pq.get("text", "").strip()
+                if q_text:
+                    try:
+                        await _answer_via_unified_pipeline(m, uid, doc_id, q_text)
+                    except Exception as e:
+                        logger.exception(f"Ошибка: {e}")
+        else:
+            await _send(m, '✅ Документ готов к работе!')
+
+    except Exception as e:
+        logging.exception("Ошибка обработки документа: %s", e)
+        await _send(m, Cfg.MSG_INDEX_FAILED + f" {e}")

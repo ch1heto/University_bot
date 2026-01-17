@@ -40,7 +40,7 @@ except Exception:  # pragma: no cover
 
 # --- Мягкие зависимости для парсинга / OCR ---
 try:
-    from .parsing import parse_docx, parse_pdf, parse_doc
+    from .parsing_new import parse_docx, parse_doc, save_upload
 except Exception:
     parse_docx = parse_pdf = parse_doc = None  # будем валить осмысленной ошибкой
 

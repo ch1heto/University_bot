@@ -742,28 +742,52 @@ def best_context(owner_id: int, doc_id: int, query: str, max_chars: int = 6000) 
     ID-aware: если в запросе указан рисунок/таблица/область — отдаём локальный контекст.
     Иначе — гибридный контекст по всему документу.
 
-    Строгий режим: если контекст слишком слабый/короткий — возвращаем пустую строку,
-    чтобы верхний слой мог корректно отказаться (no_grounding), а не звать LLM.
+    Строгий режим: если контекст слишком слабый/шумный — возвращаем пустую строку.
+    ВАЖНО: короткие, но фактологичные фрагменты НЕ режем (это повышает универсальность).
     """
     res = id_aware_search(owner_id, doc_id, query, max_ctx_chars=max_chars) or {}
     ctx = (res.get("context") or "").strip()
 
-    # ✅ Отсекаем "пустые" или почти пустые ответы retrieval,
-    # чтобы не подсовывать модели мусор и не провоцировать галлюцинации.
-    # Порог можно потом подстроить по логам.
     if not ctx:
         return ""
 
-    # минимальная эвристика информативности
-    # (временная мера, пока id_aware_search не отдаёт score)
+    def _looks_facty(text: str) -> bool:
+        t = text or ""
+        tl = t.lower()
+
+        # цифры, проценты, годы, формулы, диапазоны
+        if re.search(r"\d", t):
+            return True
+        if "%" in t or "±" in t or "≤" in t or "≥" in t:
+            return True
+
+        # латиница/аббревиатуры/технологии/методики часто пишутся латиницей
+        if re.search(r"[A-Za-z]{2,}", t):
+            return True
+
+        # частые маркеры терминов/кратких фактов: двоеточия, перечисления, кавычки
+        if ":" in t or "—" in t or "–" in t:
+            return True
+
+        # “жирные” слова (универсально): методика/шкала/опросник/модель/алгоритм/фреймворк/платформа/ПО
+        if re.search(r"\b(методик|шкал|опросник|тест|модель|алгоритм|фреймворк|библиотек|платформ|программ|по\b)\b", tl):
+            return True
+
+        return False
+
     words = [w for w in re.split(r"\s+", ctx) if w]
-    if len(ctx) < 200 or len(words) < 30:
+
+    # было: <200 или <30 слов -> пусто
+    # стало: короткое разрешаем, если оно "фактологичное"
+    if (len(ctx) < 200 or len(words) < 30) and not _looks_facty(ctx):
         return ""
 
-    # если контекст состоит в основном из очень коротких строк/обрывков — тоже отсекаем
+    # фильтр “обрывки строк” смягчаем, иначе реально полезные списки/определения режутся
     lines = [ln.strip() for ln in ctx.splitlines() if ln.strip()]
-    if lines and sum(1 for ln in lines if len(ln) < 25) / max(1, len(lines)) > 0.6:
-        return ""
+    if lines and len(lines) >= 8:
+        short_ratio = sum(1 for ln in lines if len(ln) < 25) / max(1, len(lines))
+        if short_ratio > 0.75 and not _looks_facty(ctx):
+            return ""
 
     return ctx[:max_chars]
 
