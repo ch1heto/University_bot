@@ -1460,11 +1460,11 @@ def analyze_figure_with_vision(
         with db_mod.get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT image_path, caption, num
+                SELECT image_path, caption, num, figure_label
                 FROM figures 
-                WHERE owner_id = ? AND doc_id = ? AND num = ?
+                WHERE doc_id = ? AND (num = ? OR figure_label LIKE ?)
                 LIMIT 1
-            """, (owner_id, doc_id, str(figure_num)))
+            """, (doc_id, str(figure_num), f'%{figure_num}%'))
             
             row = cursor.fetchone()
             if not row:

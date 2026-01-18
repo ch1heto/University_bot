@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 import re
+import json
 import asyncio
 import logging
 from typing import Optional, Dict, Any, List
@@ -98,6 +99,7 @@ def detect_question_type(question: str) -> str:
 def extract_numbers_from_question(question: str, entity_type: str = "figure") -> List[str]:
     """
     Извлекает номера (рисунков/таблиц/разделов) из вопроса.
+    Поддерживает номера с точкой: 1.1, 2.3, 3.1
     
     entity_type: "figure", "table", "section"
     """
@@ -105,29 +107,47 @@ def extract_numbers_from_question(question: str, entity_type: str = "figure") ->
     numbers = []
     
     if entity_type == "figure":
-        # Паттерны: "рисунок 2.1", "рис. 3", "на графике 4"
+        # Паттерны для рисунков во ВСЕХ падежах и с номерами типа 1.1
         patterns = [
-            r'рис(?:унок|\.?)?\s*(?:№\s*)?(\d+(?:\.\d+)?)',
-            r'график[а-я]*\s*(?:№\s*)?(\d+(?:\.\d+)?)',
-            r'диаграмм[а-я]*\s*(?:№\s*)?(\d+(?:\.\d+)?)',
+            r'рисун[а-яё]*\s*(?:№\s*)?(\d+(?:\.\d+)?)',  # рисунок 1.1, рисунке 2.3
+            r'рис\.?\s*(?:№\s*)?(\d+(?:\.\d+)?)',         # рис. 1.1, рис 2
+            r'график[а-яё]*\s*(?:№\s*)?(\d+(?:\.\d+)?)',  # график 1.1
+            r'диаграмм[а-яё]*\s*(?:№\s*)?(\d+(?:\.\d+)?)',# диаграмма 2.1
+            r'figure\s*(?:№\s*)?(\d+(?:\.\d+)?)',         # figure 1.1
+            r'fig\.?\s*(?:№\s*)?(\d+(?:\.\d+)?)',         # fig. 1.1
         ]
     elif entity_type == "table":
-        # Паттерны: "таблица 3.1", "табл. 2"
+        # Паттерны для таблиц с номерами типа 2.1
         patterns = [
-            r'табл(?:ица|\.?)?\s*(?:№\s*)?(\d+(?:\.\d+)?)',
+            r'таблиц[а-яё]*\s*(?:№\s*)?(\d+(?:\.\d+)?)',  # таблица 2.1, таблице 3
+            r'табл\.?\s*(?:№\s*)?(\d+(?:\.\d+)?)',        # табл. 2.1
+            r'table\s*(?:№\s*)?(\d+(?:\.\d+)?)',          # table 2.1
         ]
     else:  # section
-        # Паттерны: "глава 2", "раздел 3.1"
         patterns = [
-            r'глав[а-я]*\s*(?:№\s*)?(\d+(?:\.\d+)?)',
-            r'раздел[а-я]*\s*(?:№\s*)?(\d+(?:\.\d+)?)',
+            r'глав[а-яё]*\s*(?:№\s*)?(\d+(?:\.\d+)?)',
+            r'раздел[а-яё]*\s*(?:№\s*)?(\d+(?:\.\d+)?)',
+            r'пункт[а-яё]*\s*(?:№\s*)?(\d+(?:\.\d+)?)',
         ]
     
     for pattern in patterns:
         matches = re.findall(pattern, q_lower)
         numbers.extend(matches)
     
-    return list(set(numbers))  # Убираем дубликаты
+    # Fallback: ищем номер после предлога
+    if not numbers:
+        fallback_patterns = {
+            "figure": r'(?:на|про|в|о|об)\s+рис\w*\s+(\d+(?:\.\d+)?)',
+            "table": r'(?:в|из|на|про)\s+табл\w*\s+(\d+(?:\.\d+)?)',
+        }
+        if entity_type in fallback_patterns:
+            fallback_match = re.search(fallback_patterns[entity_type], q_lower)
+            if fallback_match:
+                numbers.append(fallback_match.group(1))
+    
+    print(f"[DEBUG] extract_numbers('{question[:40]}...', '{entity_type}') -> {numbers}")
+    
+    return list(set(numbers))
 
 
 # ==================== ПОЛУЧЕНИЕ КОНТЕКСТА ====================
@@ -143,42 +163,95 @@ async def get_context_for_question(
     ОДИН вызов для каждого вопроса (не множественные!).
     """
     
-    # 1. Для вычислительных вопросов - нужны таблицы
-    if question_type == QuestionType.CALC:
-        # Ищем таблицы с числами
-        table_nums = extract_numbers_from_question(question, "table")
-        if table_nums:
-            return await asyncio.to_thread(
-                get_table_context_for_numbers,
-                owner_id, doc_id, table_nums
-            )
+    # 1. Для вопросов про таблицы ИЛИ вычислительных с упоминанием таблицы
+    # Объединяем логику, чтобы "В таблице 2.1..." всегда находило данные
+    is_table_question = (
+        question_type == QuestionType.TABLE or 
+        (question_type == QuestionType.CALC and any(w in question.lower() for w in ['таблиц', 'табл']))
+    )
     
-    # 2. Для вопросов про таблицы - контекст с таблицами
-    if question_type == QuestionType.TABLE:
+    if is_table_question:
         table_nums = extract_numbers_from_question(question, "table")
-        if table_nums:
-            return await asyncio.to_thread(
-                get_table_context_for_numbers,
-                owner_id, doc_id, table_nums
-            )
-    
-    try:
-        vision_result = await asyncio.to_thread(
-            analyze_figure_with_vision,
-            owner_id, doc_id, fig_nums[0], question
-        )
+        print(f"[DEBUG TABLE] is_table_question=True, table_nums={table_nums}, doc_id={doc_id}")
         
-        if vision_result:
-            combined_context = f"""
-    ОПИСАНИЕ ИЗ ДОКУМЕНТА: {text_context}
+        if table_nums:
+            # Получаем базовый контекст
+            text_context = await asyncio.to_thread(
+                get_table_context_for_numbers,
+                owner_id, doc_id, table_nums
+            )
+            
+            # Пытаемся найти точные данные таблицы в чанках
+            table_data_text = ""
+            try:
+                from .db import get_conn
+                con = get_conn()
+                cur = con.cursor()
+                
+                for table_num in table_nums:
+                    search_patterns = [
+                        f'%Таблица {table_num}%',
+                        f'%таблица {table_num}%',
+                        f'%Таблица{table_num}%',
+                    ]
+                    
+                    for pattern in search_patterns:
+                        cur.execute("""
+                            SELECT text, element_type, section_path FROM chunks 
+                            WHERE doc_id = ? AND (
+                                element_type = 'table' OR
+                                section_path LIKE ? OR 
+                                text LIKE ?
+                            )
+                            ORDER BY 
+                                CASE WHEN element_type = 'table' THEN 0 ELSE 1 END,
+                                LENGTH(text) DESC
+                            LIMIT 5
+                        """, (doc_id, pattern, pattern))
+                        
+                        rows = cur.fetchall()
+                        print(f"[DEBUG TABLE] Поиск '{pattern}': найдено {len(rows)} чанков")
+                        
+                        if rows:
+                            for row in rows:
+                                chunk_text = row['text']
+                                print(f"[DEBUG TABLE]   element_type={row['element_type']}, len={len(chunk_text)}")
+                                if len(chunk_text) > 100:
+                                    table_data_text += chunk_text + "\n\n"
+                            
+                            if table_data_text:
+                                print(f"[DEBUG TABLE] Итого данных таблицы {table_num}: {len(table_data_text)} символов")
+                                break
+                    
+                    if table_data_text:
+                        break
+                
+                con.close()
+            except Exception as e:
+                print(f"[DEBUG TABLE] Ошибка поиска таблицы: {e}")
+            
+            if table_data_text:
+                combined = f"""ДАННЫЕ ТАБЛИЦЫ:
+{table_data_text}
 
-    ВИЗУАЛЬНЫЙ АНАЛИЗ (Vision API): {vision_result}
-    """
-            return combined_context
-    except Exception as e:
-        logger.warning(f"Vision failed: {e}")
+КОНТЕКСТ ИЗ ДОКУМЕНТА:
+{text_context}
+
+ВАЖНО: Используй данные из таблицы для точного ответа!"""
+                return combined
+            
+            return text_context
     
-    # 3. Для вопросов про рисунки - VISION API + контекст
+    # 2. Для вычислительных вопросов БЕЗ явного указания таблицы
+    if question_type == QuestionType.CALC:
+        table_nums = extract_numbers_from_question(question, "table")
+        if table_nums:
+            return await asyncio.to_thread(
+                get_table_context_for_numbers,
+                owner_id, doc_id, table_nums
+            )
+    
+    # 3. Для вопросов про рисунки - сначала chart_data, потом Vision API
     if question_type == QuestionType.FIGURE:
         fig_nums = extract_numbers_from_question(question, "figure")
         if fig_nums:
@@ -188,27 +261,82 @@ async def get_context_for_question(
                 owner_id, doc_id, fig_nums
             )
             
-            # ДОБАВЛЯЕМ: Анализ изображения через Vision API
+            # НОВОЕ: Пытаемся получить chart_data из БД (точные данные диаграммы!)
+            chart_data_text = ""
+            try:
+                from .db import get_figures_for_doc
+                figures = await asyncio.to_thread(get_figures_for_doc, doc_id)
+                
+                logger.info(f"Найдено {len(figures)} рисунков в БД для doc_id={doc_id}")
+                
+                for fig in figures:
+                    fig_label = str(fig.get('label') or fig.get('figure_label') or '')
+                    fig_num_from_db = fig_label.strip()
+                    
+                    # Проверяем, совпадает ли номер
+                    for requested_num in fig_nums:
+                        if requested_num in fig_num_from_db or fig_num_from_db.endswith(requested_num) or fig_num_from_db == requested_num:
+                            logger.info(f"Проверяем рисунок {fig_label}")
+                            
+                            # chart_data хранится в ATTRS, а не в data!
+                            attrs = fig.get('attrs') or {}
+                            if isinstance(attrs, str):
+                                try:
+                                    attrs = json.loads(attrs)
+                                except:
+                                    attrs = {}
+                            
+                            chart_data = attrs.get('chart_data')
+                            logger.info(f"chart_data в attrs: {bool(chart_data)}")
+                            
+                            if chart_data:
+                                try:
+                                    from .chart_extractor import get_chart_data_as_text
+                                    chart_data_text = get_chart_data_as_text(chart_data)
+                                    logger.info(f"Извлечены данные диаграммы: {len(chart_data_text)} символов")
+                                except ImportError:
+                                    chart_data_text = _format_chart_data_simple(chart_data)
+                                break
+                    if chart_data_text:
+                        break
+                        
+            except Exception as e:
+                logger.warning(f"Не удалось получить chart_data из БД: {e}")
+            
+            # Если есть данные диаграммы - используем их (НЕ нужен Vision API!)
+            if chart_data_text:
+                combined_context = f"""
+ОПИСАНИЕ ИЗ ДОКУМЕНТА:
+{text_context}
+
+ТОЧНЫЕ ДАННЫЕ ДИАГРАММЫ (извлечены из DOCX):
+{chart_data_text}
+
+ВАЖНО: Используй ТОЛЬКО эти точные данные при ответе!
+"""
+                logger.info("Используем chart_data для ответа (Vision API не нужен)")
+                return combined_context
+            
+            # Fallback: Vision API (если нет chart_data)
             try:
                 vision_result = await asyncio.to_thread(
                     analyze_figure_with_vision,
-                    owner_id, doc_id, fig_nums[0], question  # Первый рисунок
+                    owner_id, doc_id, fig_nums[0], question
                 )
                 
                 if vision_result:
-                    # Комбинируем текстовый контекст + Vision анализ
                     combined_context = f"""
-    ОПИСАНИЕ ИЗ ДОКУМЕНТА:
-    {text_context}
+ОПИСАНИЕ ИЗ ДОКУМЕНТА:
+{text_context}
 
-    ВИЗУАЛЬНЫЙ АНАЛИЗ РИСУНКА (Vision API):
-    {vision_result}
-    """
+ВИЗУАЛЬНЫЙ АНАЛИЗ РИСУНКА (Vision API):
+{vision_result}
+"""
                     return combined_context
             except Exception as e:
                 logger.warning(f"Vision API failed: {e}, using text context only")
             
-            # Fallback: только текстовый контекст
+            # Последний fallback: только текстовый контекст
             return text_context
     
     # 4. Для остальных - обычный RAG поиск
@@ -246,6 +374,9 @@ def build_system_prompt(question_type: str) -> str:
         "Отвечай СТРОГО на основе предоставленного контекста из документа.\n"
         "Не используй общие знания, догадки или типовые определения.\n"
         "Если в контексте нет информации для ответа - честно скажи об этом.\n"
+        "\n"
+        "ВАЖНО: ВСЕГДА завершай ответ полностью. Не обрывай на полуслове.\n"
+        "Если ответ получается длинным - сократи его, но ОБЯЗАТЕЛЬНО напиши вывод.\n"
     )
     
     if question_type == QuestionType.CALC:
@@ -254,6 +385,7 @@ def build_system_prompt(question_type: str) -> str:
             "- Извлекай числа из таблиц и выполняй точные вычисления.\n"
             "- Показывай формулы и промежуточные результаты.\n"
             "- Не придумывай значения, которых нет в таблице.\n"
+            "- В конце ОБЯЗАТЕЛЬНО напиши краткий вывод.\n"
         )
     
     elif question_type == QuestionType.TABLE:
@@ -262,6 +394,7 @@ def build_system_prompt(question_type: str) -> str:
             "- Анализируй структуру и данные таблицы.\n"
             "- Ссылайся на конкретные строки и столбцы.\n"
             "- Выделяй ключевые значения и тренды.\n"
+            "- В конце ОБЯЗАТЕЛЬНО напиши краткий вывод.\n"
         )
     
     elif question_type == QuestionType.FIGURE:
@@ -270,6 +403,7 @@ def build_system_prompt(question_type: str) -> str:
             "- Описывай визуальные элементы графика.\n"
             "- Указывай тренды, максимумы, минимумы.\n"
             "- Ссылайся на подпись и легенду рисунка.\n"
+            "- В конце ОБЯЗАТЕЛЬНО напиши краткий вывод.\n"
         )
     
     elif question_type == QuestionType.GOST:
@@ -286,6 +420,7 @@ def build_system_prompt(question_type: str) -> str:
             "- Давай содержательные, развёрнутые ответы.\n"
             "- Используй цитаты из документа для подтверждения.\n"
             "- Структурируй ответ логично (введение, основная часть, вывод).\n"
+            "- В конце ОБЯЗАТЕЛЬНО напиши краткий вывод.\n"
         )
 
 
@@ -386,7 +521,7 @@ class UnifiedPipeline:
                 chat_with_gpt,
                 messages=messages,
                 temperature=0.3,  # Низкая температура для точности
-                max_tokens=2000,
+                max_tokens=4000,
             )
             
             return answer
@@ -406,7 +541,7 @@ class UnifiedPipeline:
             async for chunk in chat_with_gpt_stream(
                 messages=messages,
                 temperature=0.3,
-                max_tokens=2000,
+                max_tokens=4000,
             ):
                 yield chunk
         except Exception as e:
@@ -470,3 +605,32 @@ __all__ = [
     'detect_question_type',
     'QuestionType',
 ]
+
+def _format_chart_data_simple(chart_data: dict) -> str:
+    """Простое форматирование chart_data без chart_extractor"""
+    if not chart_data:
+        return ""
+    
+    lines = []
+    chart_type = chart_data.get('type', 'диаграмма')
+    lines.append(f"Тип: {chart_type}")
+    
+    if chart_data.get('title'):
+        lines.append(f"Заголовок: {chart_data['title']}")
+    
+    lines.append("\nДанные:")
+    
+    for series in chart_data.get('series', []):
+        if series.get('name'):
+            lines.append(f"\nСерия: {series['name']}")
+        
+        categories = series.get('categories') or chart_data.get('categories', [])
+        values = series.get('values', [])
+        
+        for cat, val in zip(categories, values):
+            if isinstance(val, float) and val < 1:
+                lines.append(f"  - {cat}: {val*100:.1f}%")
+            else:
+                lines.append(f"  - {cat}: {val}")
+    
+    return '\n'.join(lines)

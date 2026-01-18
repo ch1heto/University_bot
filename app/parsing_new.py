@@ -54,20 +54,23 @@ HEAD_STYLE_RE = re.compile(r"(heading|заголовок)\s*([1-6])", re.IGNOREC
 
 def parse_docx(file_path: str) -> Dict[str, Any]:
     """
-    Парсинг .docx файла через python-docx (более надёжный).
+    Парсинг .docx файла через python-docx.
     Возвращает словарь с секциями, таблицами, рисунками.
     """
     file_path = str(file_path)
-    
+    print(f"DEBUG: Начинаю парсинг файла: {file_path}")
+
+    # 1. ИМПОРТ БИБЛИОТЕКИ
     try:
         from docx import Document
         from docx.oxml.text.paragraph import CT_P
         from docx.oxml.table import CT_Tbl
         from docx.table import _Cell, Table
         from docx.text.paragraph import Paragraph
-    except ImportError:
+    except ImportError as e:
+        print(f"CRITICAL ERROR: Библиотека python-docx не установлена! {e}")
         return {
-            'sections': [{'text': 'Установите python-docx: pip install python-docx', 'level': 0}],
+            'sections': [{'text': 'ОШИБКА: Установите python-docx (pip install python-docx)', 'level': 0}],
             'tables': [],
             'figures': [],
             'metadata': {},
@@ -108,64 +111,194 @@ def parse_docx(file_path: str) -> Dict[str, Any]:
                 'title': title,
             })
         
-        # ===================================================================
-        # ИЗВЛЕЧЕНИЕ ТАБЛИЦ
-        # ===================================================================
+        print(f"DEBUG: Найдено секций (параграфов): {len(sections)}")
+
         tables = []
+        # ===================================================================
+        # СНАЧАЛА СОБИРАЕМ ПОДПИСИ ТАБЛИЦ ИЗ ПАРАГРАФОВ
+        # ===================================================================
+        table_captions_found = []
+        for para in doc.paragraphs:
+            text = para.text.strip()
+            # Ищем "Таблица X.X – Название" или "Таблица X - Название"
+            match = re.search(r'[Тт]аблица\s+(\d+(?:\.\d+)?)\s*[-–—:]?\s*(.*)', text)
+            if match:
+                num = match.group(1)
+                title = match.group(2).strip()
+                table_captions_found.append({
+                    'num': num,
+                    'title': title,
+                    'full_text': text
+                })
+        
+        print(f"DEBUG: Найдено подписей таблиц: {len(table_captions_found)}")
+        
+        # ===================================================================
+        # ИЗВЛЕЧЕНИЕ ТАБЛИЦ С УМНЫМ СВЯЗЫВАНИЕМ ПОДПИСЕЙ
+        # ===================================================================
+        # Служебные таблицы (титульный лист, план работы) не имеют подписей
+        # Определяем их по содержимому и пропускаем при связывании
+        
+        caption_index = 0  # Индекс в списке подписей
+        
         for table_idx, table in enumerate(doc.tables, start=1):
             rows_data = []
             for row in table.rows:
                 row_data = [cell.text.strip() for cell in row.cells]
                 rows_data.append(row_data)
             
-            if rows_data:
-                tables.append({
-                    'id': table_idx,
-                    'num': str(table_idx),
-                    'caption': f'Таблица {table_idx}',
-                    'data': rows_data,
-                    'rows': len(rows_data),
-                    'cols': len(rows_data[0]) if rows_data else 0,
-                })
+            if not rows_data:
+                continue
+            
+            # Определяем, является ли таблица служебной (без подписи)
+            # Признаки служебной таблицы:
+            # 1. Содержит "Исполнитель", "студент", "Научный руководитель"
+            # 2. Содержит "№ п/п", "Наименование глав", "Срок выполнения"
+            # 3. Первые ячейки пустые (титульная страница)
+            
+            first_row_text = ' '.join(str(cell) for cell in rows_data[0]).lower()
+            all_text = ' '.join(' '.join(str(cell) for cell in row) for row in rows_data[:3]).lower()
+            
+            is_service_table = (
+                'исполнитель' in all_text or
+                'научный руководитель' in all_text or
+                ('№ п/п' in first_row_text and 'наименование глав' in first_row_text) or
+                ('срок' in first_row_text and 'выполнен' in first_row_text) or
+                (rows_data[0].count('') > len(rows_data[0]) // 2)  # Больше половины пустых ячеек
+            )
+            
+            if is_service_table:
+                # Служебная таблица — не связываем с подписью
+                tbl_num = f"служебная_{table_idx}"
+                tbl_caption = f"Служебная таблица {table_idx}"
+                print(f"DEBUG: Таблица {table_idx} определена как служебная, пропускаем")
+            else:
+                # Обычная таблица — связываем с подписью
+                if caption_index < len(table_captions_found):
+                    cap = table_captions_found[caption_index]
+                    tbl_num = cap['num']
+                    tbl_caption = f"Таблица {cap['num']}"
+                    if cap['title']:
+                        tbl_caption += f" – {cap['title']}"
+                    caption_index += 1
+                else:
+                    # Fallback: генерируем номер
+                    tbl_num = f"доп_{table_idx}"
+                    tbl_caption = f'Таблица (дополнительная {table_idx})'
+            
+            tables.append({
+                'id': table_idx,
+                'num': tbl_num,
+                'caption': tbl_caption,
+                'data': rows_data,
+                'rows': len(rows_data),
+                'cols': len(rows_data[0]) if rows_data else 0,
+                'is_service': is_service_table,
+            })
+            
+            print(f"DEBUG: Таблица {tbl_num}: {len(rows_data)} строк, {len(rows_data[0]) if rows_data else 0} колонок")
         
+        print(f"DEBUG: Найдено таблиц: {len(tables)} (служебных: {sum(1 for t in tables if t.get('is_service'))})")
+
         # ===================================================================
-        # ИЗВЛЕЧЕНИЕ РИСУНКОВ (ИЗОБРАЖЕНИЙ)
+        # ИЗВЛЕЧЕНИЕ РИСУНКОВ (ДИАГРАММЫ + ИЗОБРАЖЕНИЯ)
         # ===================================================================
         figures = []
         figure_counter = 0
         
-        # Извлекаем все изображения из relationships
-        for rel in doc.part.rels.values():
-            if "image" in rel.target_ref:
+        print(f"DEBUG: Анализ структуры docx (rels count: {len(doc.part.rels)})")
+
+        # ===========================================
+        # 1. ИЗВЛЕЧЕНИЕ ДИАГРАММ (CHARTS) - ПРИОРИТЕТ!
+        # ===========================================
+        try:
+            # Импортируем chart_extractor
+            try:
+                from .chart_extractor import extract_charts_from_docx, get_chart_data_as_text
+            except ImportError:
+                from chart_extractor import extract_charts_from_docx, get_chart_data_as_text
+            
+            print(f"DEBUG: Запускаю извлечение диаграмм из {file_path}")
+            charts = extract_charts_from_docx(file_path, str(images_dir))
+            
+            if charts:
+                print(f"DEBUG: Найдено {len(charts)} диаграмм!")
+                
+                for chart in charts:
+                    figure_counter += 1
+                    
+                    # Берём подпись из chart или ищем в секциях
+                    caption = chart.get('caption')
+                    if not caption or caption.startswith('Рисунок '):
+                        found_caption = _find_figure_caption_in_sections(sections, figure_counter)
+                        if found_caption:
+                            caption = found_caption
+                    
+                    # Извлекаем номер из подписи
+                    fig_num = str(figure_counter)
+                    if caption:
+                        match = re.search(r'[Рр]ис(?:ун[а-яё]*)?\.?\s*(\d+(?:\.\d+)?)', caption)
+                        if match:
+                            fig_num = match.group(1)
+                    
+                    figures.append({
+                        'id': figure_counter,
+                        'num': fig_num,
+                        'caption': caption or f'Рисунок {figure_counter}',
+                        'image_path': chart.get('image_path'),
+                        'original_name': chart.get('original_name'),
+                        'kind': chart.get('kind', 'chart'),
+                        'chart_data': chart.get('chart_data'),  # ВАЖНО: данные диаграммы!
+                    })
+                    
+                    print(f"DEBUG: Добавлена диаграмма #{fig_num}: {caption[:50] if caption else 'без подписи'}...")
+            else:
+                print("DEBUG: Диаграммы не найдены в документе")
+                
+        except ImportError as e:
+            print(f"DEBUG: chart_extractor не найден: {e}")
+            print("DEBUG: Убедитесь что файл chart_extractor.py находится в папке app/")
+        except Exception as e:
+            print(f"DEBUG: Ошибка извлечения диаграмм: {e}")
+            import traceback
+            traceback.print_exc()
+
+        # ===========================================
+        # 2. ИЗВЛЕЧЕНИЕ ОБЫЧНЫХ ИЗОБРАЖЕНИЙ (если есть)
+        # ===========================================
+        for rel_id, rel in doc.part.rels.items():
+            target_ref = getattr(rel, 'target_ref', '') or ''
+            reltype = getattr(rel, 'reltype', '') or ''
+            
+            # Проверяем, является ли это изображением
+            is_image = (
+                'image' in reltype.lower() or
+                'image' in target_ref.lower() or
+                any(target_ref.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff', '.emf', '.wmf'])
+            )
+            
+            if is_image:
                 figure_counter += 1
                 
                 try:
-                    # Получаем бинарные данные изображения
                     image_part = rel.target_part
                     image_data = image_part.blob
                     
-                    # Определяем расширение
-                    ext = rel.target_ref.split('.')[-1]
-                    if not ext.startswith('.'):
-                        ext = '.' + ext
-                    
-                    # Генерируем имя файла
+                    ext = os.path.splitext(target_ref)[-1] or ".png"
                     img_hash = hashlib.sha256(image_data).hexdigest()[:8]
                     safe_name = f"fig_{figure_counter}_{img_hash}{ext}"
                     img_path = images_dir / safe_name
                     
-                    # Сохраняем изображение
                     with open(img_path, 'wb') as f:
                         f.write(image_data)
                     
-                    # Ищем подпись рисунка в тексте
+                    print(f"DEBUG: Сохранено изображение #{figure_counter}: {img_path}")
+
                     caption = _find_figure_caption_in_sections(sections, figure_counter)
                     
-                    # Извлекаем номер рисунка из подписи
                     fig_num = str(figure_counter)
                     if caption:
-                        import re
-                        match = re.search(r'[Рр]исунок\s+(\d+)', caption)
+                        match = re.search(r'[Рр]ис(?:ун[а-яё]*)?\.?\s*(\d+(?:\.\d+)?)', caption)
                         if match:
                             fig_num = match.group(1)
                     
@@ -174,15 +307,24 @@ def parse_docx(file_path: str) -> Dict[str, Any]:
                         'num': fig_num,
                         'caption': caption or f'Рисунок {figure_counter}',
                         'image_path': str(img_path.resolve()),
-                        'original_name': rel.target_ref,
+                        'original_name': target_ref,
                         'kind': 'image',
+                        'chart_data': None,
                     })
                     
                 except Exception as e:
-                    print(f"Ошибка извлечения рисунка {figure_counter}: {e}")
+                    print(f"DEBUG: Ошибка извлечения изображения {figure_counter}: {e}")
         
+        # Итоговый отчёт
+        if not figures:
+            print("DEBUG: Рисунков не найдено (ни диаграмм, ни изображений).")
+        else:
+            charts_count = sum(1 for f in figures if f.get('kind') == 'chart' or f.get('chart_data'))
+            images_count = len(figures) - charts_count
+            print(f"DEBUG: Всего рисунков: {len(figures)} (диаграмм: {charts_count}, изображений: {images_count})")
+
         # ===================================================================
-        # МЕТАДАННЫЕ
+        # МЕТАДАННЫЕ И ИТОГ
         # ===================================================================
         core_props = doc.core_properties
         metadata = {
@@ -190,12 +332,8 @@ def parse_docx(file_path: str) -> Dict[str, Any]:
             'title': core_props.title or '',
             'subject': core_props.subject or '',
             'created': str(core_props.created) if core_props.created else '',
-            'modified': str(core_props.modified) if core_props.modified else '',
         }
         
-        # ===================================================================
-        # ПОЛНЫЙ ТЕКСТ
-        # ===================================================================
         raw_text = '\n'.join([s['text'] for s in sections])
         
         return {
@@ -207,7 +345,7 @@ def parse_docx(file_path: str) -> Dict[str, Any]:
         }
     
     except Exception as e:
-        print(f"Ошибка парсинга DOCX: {e}")
+        print(f"CRITICAL ERROR в parse_docx: {e}")
         import traceback
         traceback.print_exc()
         
@@ -218,7 +356,6 @@ def parse_docx(file_path: str) -> Dict[str, Any]:
             'metadata': {},
             'raw_text': '',
         }
-
 
 def _find_figure_caption_in_sections(sections: list, figure_num: int) -> str:
     """Ищет подпись рисунка в секциях"""

@@ -67,6 +67,8 @@ CREATE TABLE IF NOT EXISTS document_sections (
 CREATE TABLE IF NOT EXISTS figures (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     doc_id        INTEGER NOT NULL,
+    owner_id      INTEGER,        -- ID владельца (пользователя)
+    num           TEXT,           -- нормализованный номер: '1', '2.1', '3'
     figure_label  TEXT,           -- '2.3', 'Рис. 2.3' и т.п.
     page          INTEGER,
     image_path    TEXT,           -- относительный путь к файлу png/jpg
@@ -177,7 +179,12 @@ def _ensure_columns(con: sqlite3.Connection) -> None:
     scols = _table_info(con, "document_sections")
     if "role" not in scols:
         cur.execute("ALTER TABLE document_sections ADD COLUMN role TEXT")
-
+    # figures: owner_id, num
+    fcols = _table_info(con, "figures")
+    if "owner_id" not in fcols:
+        cur.execute("ALTER TABLE figures ADD COLUMN owner_id INTEGER")
+    if "num" not in fcols:
+        cur.execute("ALTER TABLE figures ADD COLUMN num TEXT")
     con.commit()
 
 
@@ -777,18 +784,26 @@ def upsert_figure(
     image_path: Optional[str],
     caption: Optional[str],
     *,
+    owner_id: Optional[int] = None,
     kind: Optional[str] = None,
     attrs: Optional[Dict[str, Any]] = None,
 ) -> int:
     """
     Создаёт или обновляет запись о рисунке.
-    Пытается найти существующую запись по (doc_id, figure_label) если label задан,
-    иначе по (doc_id, image_path). Возвращает id строки в таблице figures.
     """
     con = get_conn()
     cur = con.cursor()
     cur.execute("BEGIN IMMEDIATE;")
     try:
+        # Нормализуем номер рисунка
+        num = None
+        if figure_label:
+            # Извлекаем только цифры и точки: "Рис. 2.1" -> "2.1"
+            import re
+            match = re.search(r'(\d+(?:\.\d+)?)', str(figure_label))
+            if match:
+                num = match.group(1)
+        
         row = None
         if figure_label is not None:
             cur.execute(
@@ -810,23 +825,25 @@ def upsert_figure(
             cur.execute(
                 """
                 UPDATE figures
-                   SET page      = ?,
-                       image_path= ?,
-                       caption   = ?,
-                       kind      = ?,
-                       attrs     = ?,
+                   SET page       = ?,
+                       image_path = ?,
+                       caption    = ?,
+                       kind       = ?,
+                       attrs      = ?,
+                       owner_id   = COALESCE(?, owner_id),
+                       num        = COALESCE(?, num),
                        figure_label = COALESCE(?, figure_label)
                  WHERE id = ?
                 """,
-                (page, image_path, caption, kind, attrs_json, figure_label, fid),
+                (page, image_path, caption, kind, attrs_json, owner_id, num, figure_label, fid),
             )
         else:
             cur.execute(
                 """
-                INSERT INTO figures(doc_id, figure_label, page, image_path, caption, kind, attrs)
-                VALUES(?,?,?,?,?,?,?)
+                INSERT INTO figures(doc_id, owner_id, num, figure_label, page, image_path, caption, kind, attrs)
+                VALUES(?,?,?,?,?,?,?,?,?)
                 """,
-                (doc_id, figure_label, page, image_path, caption, kind, attrs_json),
+                (doc_id, owner_id, num, figure_label, page, image_path, caption, kind, attrs_json),
             )
             fid = int(cur.lastrowid)
 

@@ -9,9 +9,17 @@ import time
 import math
 from decimal import Decimal 
 logger = logging.getLogger(__name__)
+
+# =====================================================
+# НАСТРОЙКИ АДМИНОВ
+# =====================================================
+# Список Telegram ID администраторов (имеют доступ к /help и другим админ-командам)
+ADMIN_IDS = {781477708}  # Добавь сюда ID админов через запятую
+
 from typing import Iterable, AsyncIterable, Optional, List, Tuple
 from .docs_handlers import register_docs_handlers
 from aiogram import Bot, Dispatcher, F, types
+from app.db import upsert_figure
 from aiogram.filters import Command
 from aiogram.exceptions import TelegramBadRequest
 from app.planner import is_big_complex_query, plan_tasks_from_user_query, batch_tasks, TaskType
@@ -754,8 +762,11 @@ def _split_multipart(text: str,
     return parts
 
 
-async def _send(m: types.Message, text: str):
-    """Бережно отправляем длинный текст частями в HTML-режиме (нестримовый фолбэк) + retry."""
+async def _send(m: types.Message, text: str, parse_mode: str = None):
+    """Бережно отправляем длинный текст частями + retry.
+    
+    parse_mode: None (авто HTML), 'HTML', 'Markdown', 'MarkdownV2'
+    """
     chunks = _split_multipart(text or "")
     logger.info(
         "SEND: %d chunk(s) to chat_id=%s (message_id=%s), total_len=%d",
@@ -764,6 +775,9 @@ async def _send(m: types.Message, text: str):
         getattr(m, "message_id", None),
         len(text or ""),
     )
+    
+    # Определяем режим парсинга
+    use_html = parse_mode is None or parse_mode == "HTML"
 
     for i, chunk in enumerate(chunks):
         if i > 0 and MULTIPART_SLEEP_MS > 0:
@@ -772,11 +786,18 @@ async def _send(m: types.Message, text: str):
         sent = False
         for attempt in range(3):
             try:
-                await m.answer(
-                    _to_html(chunk),
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                )
+                if use_html:
+                    await m.answer(
+                        _to_html(chunk),
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                else:
+                    await m.answer(
+                        chunk,
+                        parse_mode=parse_mode,
+                        disable_web_page_preview=True,
+                    )
                 sent = True
                 break
             except Exception as e:
@@ -2439,19 +2460,16 @@ async def _send_media_from_cards(m: types.Message, cards: list[dict]) -> bool:
 
 # ------------------------------ helpers ------------------------------
 
-def _parse_by_ext(path: str) -> list[dict]:
-    """Парсинг документа с извлечением секций"""
-    fname = (os.path.basename(path) or "").lower()
+def _parse_by_ext(file_path: str) -> dict:
+    """Парсит документ и возвращает полную структуру"""
+    ext = os.path.splitext(file_path)[1].lower()
     
-    if fname.endswith(".docx"):
-        result = parse_docx(path)
-        return result.get('sections', [])  # ✅ Только секции!
-    
-    if fname.endswith(".doc"):
-        result = parse_doc(path)
-        return result.get('sections', [])  # ✅ Только секции!
-    
-    raise RuntimeError("Поддерживаю только .doc и .docx.")
+    if ext == '.docx':
+        return parse_docx(file_path)  # Возвращает dict с sections, figures, tables
+    elif ext == '.doc':
+        return parse_doc(file_path)
+    else:
+        return {'sections': [], 'figures': [], 'tables': []}
 
 def _first_chunks_context(owner_id: int, doc_id: int, n: int = 10, max_chars: int = 6000) -> str:
     con = get_conn()
@@ -2863,9 +2881,82 @@ def verbatim_find(owner_id: int, doc_id: int, q_text: str, max_hits: int = 3) ->
 @dp.message(Command("start"))
 async def start(m: types.Message):
     ensure_user(str(m.from_user.id))
-    await _send(m,
-        "Привет! Я репетитор по твоей ВКР. Пришли файл ВКР — я проиндексирую и буду объяснять содержание: главы простым языком, смысл таблиц/рисунков, конспекты к защите. Можешь прикрепить вопрос к файлу или написать его отдельным сообщением."
-    )
+    
+    welcome_text = """👋 Привет! Я **репетитор по ВКР** — помогу разобраться в твоей выпускной работе.
+
+📚 **Что я умею:**
+• Объяснять содержание глав простым языком
+• Анализировать таблицы и рисунки с точными данными
+• Отвечать на вопросы по тексту работы
+• Помогать готовиться к защите
+
+📎 **Как начать:**
+1. Отправь мне файл ВКР (.docx)
+2. Дождись индексации
+3. Задавай вопросы!
+
+💡 **Примеры вопросов:**
+• "Что показано на рисунке 1?"
+• "Объясни данные в таблице 2.1"
+• "О чём говорится в главе 2?"
+• "Какие методы использованы в исследовании?"
+
+⚡ **Команды:**
+/start — это сообщение
+/diag — диагностика документа
+/reindex — переиндексировать документ
+
+🔑 Если у тебя есть промокод — введи /redeem КОД"""
+
+    await _send(m, welcome_text, parse_mode="Markdown")
+
+
+# ------------------------------ /help (только для админов) ------------------------------
+
+@dp.message(Command("help"))
+async def cmd_help(m: types.Message):
+    """Справка по админ-командам (только для администраторов)"""
+    user_id = m.from_user.id
+    
+    if user_id not in ADMIN_IDS:
+        await _send(m, "❌ Команда /help доступна только администраторам.")
+        return
+    
+    help_text = """🔧 **Админ-команды:**
+
+**Диагностика:**
+/diag — информация о текущем документе
+/reindex — переиндексировать документ
+
+**Управление доступом:**
+/redeem КОД — активировать промокод
+/promo — управление промокодами
+
+**Отладка:**
+/debug — режим отладки
+/stats — статистика использования
+
+**Пользователи:**
+Всего зарегистрировано: {users_count}
+Документов в системе: {docs_count}
+
+💡 Для обычных пользователей доступна только команда /start"""
+
+    # Получаем статистику
+    try:
+        con = get_conn()
+        cur = con.cursor()
+        cur.execute("SELECT COUNT(*) as c FROM users")
+        users_count = cur.fetchone()["c"]
+        cur.execute("SELECT COUNT(*) as c FROM documents")
+        docs_count = cur.fetchone()["c"]
+        con.close()
+    except:
+        users_count = "?"
+        docs_count = "?"
+    
+    help_text = help_text.format(users_count=users_count, docs_count=docs_count)
+    await _send(m, help_text, parse_mode="Markdown")
 
 
 # ------------------------------ /diag ------------------------------
@@ -8849,7 +8940,26 @@ async def handle_text_message_unified(m: types.Message):
     Сохраняет всю логику старого обработчика + использует новый пайплайн.
     """
     uid = ensure_user(str(m.from_user.id))
+    user_tg_id = m.from_user.id
     doc_id = ACTIVE_DOC.get(uid)
+
+    # =====================================================
+    # ПРОВЕРКА ДОСТУПА (промокод/подписка)
+    # =====================================================
+    if user_tg_id not in ADMIN_IDS:
+        try:
+            from .promo_access import get_access_status
+            access = get_access_status(user_tg_id)
+            if not access.is_active:
+                await _send(m, 
+                    "🔒 **Доступ ограничен**\n\n"
+                    "Для работы с ботом нужен активный промокод.\n"
+                    "Введите: `/redeem ВАШ_КОД`",
+                    parse_mode="Markdown"
+                )
+                return
+        except Exception as e:
+            logger.warning(f"Ошибка проверки доступа: {e}")
 
     # Восстанавливаем активный документ из БД, если не в памяти
     if not doc_id:
@@ -8957,7 +9067,30 @@ async def _answer_via_unified_pipeline(
 async def handle_document_upload(m: types.Message):
     """Обработчик загрузки новых документов (.doc, .docx)"""
     uid = ensure_user(str(m.from_user.id))
+    user_tg_id = m.from_user.id
     doc = m.document
+
+    # =====================================================
+    # ПРОВЕРКА ДОСТУПА (промокод/подписка)
+    # =====================================================
+    # Админы имеют доступ всегда
+    if user_tg_id not in ADMIN_IDS:
+        try:
+            from .promo_access import get_access_status
+            access = get_access_status(user_tg_id)
+            if not access.is_active:
+                await _send(m, 
+                    "🔒 **Доступ ограничен**\n\n"
+                    "Для работы с документами нужен активный промокод.\n\n"
+                    "Введите команду:\n"
+                    "`/redeem ВАШ_КОД`\n\n"
+                    "Если у вас нет кода — обратитесь к администратору.",
+                    parse_mode="Markdown"
+                )
+                return
+        except Exception as e:
+            logger.warning(f"Ошибка проверки доступа: {e}")
+            # При ошибке проверки — пропускаем (fail-open для отладки)
 
     # Проверка формата
     filename = doc.file_name or ""
@@ -8988,14 +9121,56 @@ async def handle_document_upload(m: types.Message):
             """Функция индексации для оркестратора"""
             
             # Парсим документ
-            sections = _parse_by_ext(file_path)
-            logger.info(f"Parsed {len(sections)} sections from document")
+            parsed_data = _parse_by_ext(file_path)  # Это возвращает dict с 'sections', 'figures', 'tables'
+            sections = parsed_data if isinstance(parsed_data, list) else parsed_data.get('sections', [])
+            figures_from_parse = parsed_data.get('figures', []) if isinstance(parsed_data, dict) else []
+            tables_from_parse = parsed_data.get('tables', []) if isinstance(parsed_data, dict) else []
             
             # Отладка: смотрим первую секцию
             if sections:
                 first = sections[0]
                 logger.info(f"First section keys: {first.keys()}")
                 logger.info(f"First section text length: {len(first.get('text', ''))}")
+            
+            # =====================================================
+            # ДОБАВЛЯЕМ ТАБЛИЦЫ В СЕКЦИИ ДЛЯ ИНДЕКСАЦИИ
+            # ВАЖНО: element_type='text' чтобы indexing.py не разбивал данные!
+            # =====================================================
+            if tables_from_parse:
+                logger.info(f"Добавляем {len(tables_from_parse)} таблиц в индекс...")
+                for tbl in tables_from_parse:
+                    tbl_num = tbl.get('num', '')
+                    tbl_caption = tbl.get('caption', f'Таблица {tbl_num}')
+                    tbl_data = tbl.get('data', [])
+                    
+                    # Форматируем данные таблицы как текст
+                    table_text_lines = [f"[Таблица {tbl_num}] {tbl_caption}"]
+                    
+                    for row_idx, row in enumerate(tbl_data):
+                        if row_idx == 0:
+                            table_text_lines.append("Заголовок: " + " | ".join(str(cell) for cell in row))
+                        else:
+                            table_text_lines.append(" | ".join(str(cell) for cell in row))
+                    
+                    table_text = "\n".join(table_text_lines)
+                    
+                    # ВАЖНО: используем element_type='text' (НЕ 'table'!)
+                    # чтобы indexing.py не разбивал данные на маленькие чанки
+                    sections.append({
+                        'text': table_text,
+                        'level': 0,
+                        'title': tbl_caption,
+                        'element_type': 'text',  # НЕ 'table'! Иначе данные потеряются
+                        'section_path': f'Таблица {tbl_num}',
+                        'attrs': {
+                            'table_num': tbl_num,
+                            'is_table': True,  # Помечаем что это таблица
+                            'rows': tbl.get('rows', len(tbl_data)),
+                            'cols': tbl.get('cols', len(tbl_data[0]) if tbl_data else 0),
+                        }
+                    })
+                
+                logger.info(f"Таблицы добавлены. Всего секций: {len(sections)}")
             
             # Обогащаем секции
             sections = enrich_sections(sections, doc_kind=os.path.splitext(file_path)[1].lower().strip("."))
@@ -9037,7 +9212,7 @@ async def handle_document_upload(m: types.Message):
             invalidate_cache(uid, doc_id)
             update_document_meta(doc_id, layout_profile=_current_embedding_profile())
             
-            return {"sections_count": len(sections), "total_chars": total_chars}
+            return {"sections_count": len(sections), "total_chars": total_chars, "figures": figures_from_parse}
 
         # Оркестратор
         result = await asyncio.to_thread(
@@ -9054,15 +9229,39 @@ async def handle_document_upload(m: types.Message):
         ACTIVE_DOC[uid] = doc_id
         await asyncio.to_thread(set_user_active_doc, uid, doc_id)
 
-        # Индексы
-        if fig_index_document:
-            try:
-                await asyncio.to_thread(fig_index_document, uid, doc_id, path)
-            except: pass
-
         try:
-            await asyncio.to_thread(oox_build_index, path, Cfg.UPLOAD_DIR)
-        except: pass
+            # Получаем figures из результата индексации
+            # figures могут быть в result["figures"] или в result["index_result"]["figures"]
+            index_result = result.get("index_result", {})
+            figures_found = result.get("figures", []) or index_result.get("figures", [])
+            
+            logger.info(f"result keys: {list(result.keys())}")
+            logger.info(f"index_result keys: {list(index_result.keys()) if index_result else 'empty'}")
+            logger.info(f"figures_found count: {len(figures_found)}")
+            
+            if figures_found:
+                logger.info(f"Найдено {len(figures_found)} рисунков. Сохраняем в БД...")
+                for fig in figures_found:
+                    # Формируем attrs с chart_data
+                    fig_attrs = {}
+                    if fig.get("chart_data"):
+                        fig_attrs["chart_data"] = fig["chart_data"]
+                        logger.info(f"Сохраняем chart_data для рисунка {fig.get('num')}")
+                    
+                    await asyncio.to_thread(
+                        upsert_figure,
+                        doc_id=doc_id,
+                        figure_label=fig.get("num"),
+                        page=None,
+                        image_path=fig.get("image_path"),
+                        caption=fig.get("caption"),
+                        kind=fig.get("kind", "image"),  # Используем kind из fig!
+                        attrs=fig_attrs if fig_attrs else None,  # Передаём attrs с chart_data!
+                    )
+            else:
+                logger.warning("figures_found пустой! Рисунки не будут сохранены в БД.")
+        except Exception as e:
+            logger.exception(f"Ошибка сохранения рисунков в БД: {e}")
 
         # Отложенные вопросы
         pending = await asyncio.to_thread(dequeue_all_pending_queries, uid)
