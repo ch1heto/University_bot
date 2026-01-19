@@ -264,56 +264,178 @@ def parse_docx(file_path: str) -> Dict[str, Any]:
             traceback.print_exc()
 
         # ===========================================
-        # 2. ИЗВЛЕЧЕНИЕ ОБЫЧНЫХ ИЗОБРАЖЕНИЙ (если есть)
+        # СНАЧАЛА СОБИРАЕМ ВСЕ ПОДПИСИ РИСУНКОВ ИЗ ПАРАГРАФОВ
+        # с позицией параграфа для умного связывания
         # ===========================================
-        for rel_id, rel in doc.part.rels.items():
-            target_ref = getattr(rel, 'target_ref', '') or ''
-            reltype = getattr(rel, 'reltype', '') or ''
-            
-            # Проверяем, является ли это изображением
-            is_image = (
-                'image' in reltype.lower() or
-                'image' in target_ref.lower() or
-                any(target_ref.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff', '.emf', '.wmf'])
+        figure_captions_found = []
+        seen_caption_nums = set()  # Для удаления дубликатов
+        
+        for para_idx, para in enumerate(doc.paragraphs):
+            text = para.text.strip()
+            # Ищем "Рисунок X.X" или "Рис. X.X" с возможным описанием
+            # Подпись должна НАЧИНАТЬСЯ с "Рис" (не просто упоминание)
+            match = re.match(
+                r'[Рр]ис(?:ун[а-яё]*)?\.?\s*(\d+(?:\.\d+)?)\s*[-–—:.]?\s*(.*)',
+                text
             )
-            
-            if is_image:
-                figure_counter += 1
+            if match:
+                num = match.group(1)
+                title = match.group(2).strip()[:100]
                 
-                try:
-                    image_part = rel.target_part
-                    image_data = image_part.blob
-                    
-                    ext = os.path.splitext(target_ref)[-1] or ".png"
-                    img_hash = hashlib.sha256(image_data).hexdigest()[:8]
-                    safe_name = f"fig_{figure_counter}_{img_hash}{ext}"
-                    img_path = images_dir / safe_name
-                    
-                    with open(img_path, 'wb') as f:
-                        f.write(image_data)
-                    
-                    print(f"DEBUG: Сохранено изображение #{figure_counter}: {img_path}")
-
-                    caption = _find_figure_caption_in_sections(sections, figure_counter)
-                    
-                    fig_num = str(figure_counter)
-                    if caption:
-                        match = re.search(r'[Рр]ис(?:ун[а-яё]*)?\.?\s*(\d+(?:\.\d+)?)', caption)
-                        if match:
-                            fig_num = match.group(1)
-                    
-                    figures.append({
-                        'id': figure_counter,
-                        'num': fig_num,
-                        'caption': caption or f'Рисунок {figure_counter}',
-                        'image_path': str(img_path.resolve()),
-                        'original_name': target_ref,
-                        'kind': 'image',
-                        'chart_data': None,
+                # Пропускаем дубликаты — берём первую подпись с непустым названием
+                if num not in seen_caption_nums:
+                    figure_captions_found.append({
+                        'num': num,
+                        'title': title,
+                        'full_text': text[:200],
+                        'para_idx': para_idx,  # Позиция для связывания
                     })
+                    seen_caption_nums.add(num)
+                elif title:  # Если это дубликат, но с названием — обновляем
+                    for cap in figure_captions_found:
+                        if cap['num'] == num and not cap['title']:
+                            cap['title'] = title
+                            cap['full_text'] = text[:200]
+                            break
+        
+        print(f"DEBUG: Найдено подписей рисунков: {len(figure_captions_found)} (уникальных)")
+        
+        # Создаём словарь подписей по номерам для быстрого поиска
+        captions_by_num = {cap['num']: cap for cap in figure_captions_found}
+        used_captions = set()  # Какие подписи уже использованы
+
+        # ===========================================
+        # 2. ИЗВЛЕЧЕНИЕ ОБЫЧНЫХ ИЗОБРАЖЕНИЙ В ПОРЯДКЕ ДОКУМЕНТА
+        # ===========================================
+        # ВАЖНО: перебираем изображения в порядке их появления в XML,
+        # а не в произвольном порядке из rels (dict)!
+        from docx.oxml.ns import qn
+        
+        raw_images = []
+        seen_rel_ids = set()  # Чтобы не добавлять одно изображение дважды
+        
+        # Перебираем все blip-элементы в порядке документа
+        for elem in doc.element.body.iter():
+            if elem.tag.endswith('}blip'):
+                embed_id = elem.get(qn('r:embed'))
+                if embed_id and embed_id not in seen_rel_ids:
+                    seen_rel_ids.add(embed_id)
                     
-                except Exception as e:
-                    print(f"DEBUG: Ошибка извлечения изображения {figure_counter}: {e}")
+                    try:
+                        rel = doc.part.rels.get(embed_id)
+                        if not rel:
+                            continue
+                            
+                        reltype = getattr(rel, 'reltype', '') or ''
+                        target_ref = getattr(rel, 'target_ref', '') or ''
+                        
+                        is_image = (
+                            'image' in reltype.lower() or
+                            'image' in target_ref.lower() or
+                            any(target_ref.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff', '.emf', '.wmf'])
+                        )
+                        
+                        if is_image:
+                            image_part = rel.target_part
+                            image_data = image_part.blob
+                            
+                            # Фильтруем слишком маленькие изображения (логотипы, иконки)
+                            if len(image_data) < 5000:  # < 5KB — скорее всего иконка
+                                print(f"DEBUG: Пропускаем маленькое изображение {target_ref} ({len(image_data)} байт)")
+                                continue
+                            
+                            raw_images.append({
+                                'rel_id': embed_id,
+                                'target_ref': target_ref,
+                                'image_data': image_data,
+                            })
+                            print(f"DEBUG: Найдено изображение #{len(raw_images)}: {target_ref} ({len(image_data)} байт)")
+                    except Exception as e:
+                        print(f"DEBUG: Ошибка чтения изображения {embed_id}: {e}")
+        
+        print(f"DEBUG: Найдено изображений для обработки: {len(raw_images)}")
+        
+        # Теперь связываем изображения с подписями
+        # Стратегия: если количество изображений == количеству подписей — связываем по порядку
+        # Иначе — пытаемся найти соответствие по номерам из chart_extractor или по порядку с учётом уже использованных
+        
+        # Сначала добавляем диаграммы (они уже имеют правильные номера)
+        chart_nums_used = set()
+        for fig in figures:
+            if fig.get('num'):
+                chart_nums_used.add(fig['num'])
+                used_captions.add(fig['num'])
+        
+        # Определяем какие подписи ещё не использованы
+        available_captions = [cap for cap in figure_captions_found if cap['num'] not in used_captions]
+        
+        print(f"DEBUG: Диаграммы заняли номера: {chart_nums_used}")
+        print(f"DEBUG: Доступных подписей для изображений: {len(available_captions)}")
+        
+        # Связываем изображения с оставшимися подписями
+        for img_idx, img in enumerate(raw_images):
+            figure_counter += 1
+            
+            try:
+                image_data = img['image_data']
+                target_ref = img['target_ref']
+                
+                ext = os.path.splitext(target_ref)[-1] or ".png"
+                img_hash = hashlib.sha256(image_data).hexdigest()[:8]
+                safe_name = f"fig_{figure_counter}_{img_hash}{ext}"
+                img_path = images_dir / safe_name
+                
+                with open(img_path, 'wb') as f:
+                    f.write(image_data)
+                
+                # Определяем номер рисунка
+                if img_idx < len(available_captions):
+                    cap = available_captions[img_idx]
+                    fig_num = cap['num']
+                    caption = f"Рисунок {cap['num']}"
+                    if cap['title']:
+                        caption += f" – {cap['title']}"
+                    used_captions.add(fig_num)
+                    print(f"DEBUG: Изображение #{figure_counter} связано с подписью Рисунок {fig_num}")
+                else:
+                    # Нет больше подписей — используем порядковый номер
+                    fig_num = str(figure_counter)
+                    caption = f'Рисунок {figure_counter}'
+                    print(f"DEBUG: Изображение #{figure_counter} без подписи (лишнее изображение)")
+                
+                print(f"DEBUG: Сохранено изображение #{figure_counter} (num={fig_num}): {img_path}")
+                
+                figures.append({
+                    'id': figure_counter,
+                    'num': fig_num,
+                    'label': fig_num,  # Для совместимости с БД
+                    'caption': caption,
+                    'image_path': str(img_path.resolve()),
+                    'original_name': target_ref,
+                    'kind': 'image',
+                    'chart_data': None,
+                })
+                
+            except Exception as e:
+                print(f"DEBUG: Ошибка извлечения изображения {figure_counter}: {e}")
+        
+        # ===========================================
+        # 3. ПРОВЕРКА НА НЕИЗВЛЕЧЁННЫЕ РИСУНКИ (SmartArt и др.)
+        # ===========================================
+        # Если подписей больше чем извлечённых рисунков — есть SmartArt или другие объекты
+        extracted_nums = {fig['num'] for fig in figures}
+        missing_figures = []
+        
+        for cap in figure_captions_found:
+            if cap['num'] not in extracted_nums:
+                missing_figures.append(cap)
+        
+        if missing_figures:
+            print(f"DEBUG: ⚠️ ВНИМАНИЕ: {len(missing_figures)} рисунков НЕ извлечены (возможно SmartArt/DrawingML):")
+            for mf in missing_figures:
+                print(f"DEBUG:   - Рисунок {mf['num']}: {mf['title'][:50] if mf['title'] else '(без названия)'}...")
+            print("DEBUG: Эти рисунки могут быть SmartArt-диаграммами, которые не извлекаются как изображения.")
+            print("DEBUG: Рекомендация: конвертировать DOCX в PDF для извлечения всех визуальных элементов.")
         
         # Итоговый отчёт
         if not figures:

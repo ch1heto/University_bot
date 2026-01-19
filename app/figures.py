@@ -1451,28 +1451,31 @@ def analyze_figure_with_vision(
         
         # Импорт polza_client
         try:
-            from .polza_client import chat_with_gpt
+            from .polza_client import chat_with_gpt_multimodal
         except:
             log.warning("polza_client не импортирован")
             return ""
         
         # Находим рисунок в БД
-        with db_mod.get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT image_path, caption, num, figure_label
-                FROM figures 
-                WHERE doc_id = ? AND (num = ? OR figure_label LIKE ?)
-                LIMIT 1
-            """, (doc_id, str(figure_num), f'%{figure_num}%'))
-            
-            row = cursor.fetchone()
-            if not row:
-                log.info(f"Рисунок {figure_num} не найден в БД")
-                return ""
-            
-            image_path = row['image_path']
-            caption = row['caption'] or f"Рисунок {figure_num}"
+        conn = db_mod.get_conn()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT image_path, caption, num, figure_label
+            FROM figures 
+            WHERE doc_id = ? AND (num = ? OR figure_label LIKE ?)
+            LIMIT 1
+        """, (doc_id, str(figure_num), f'%{figure_num}%'))
+
+        row = cursor.fetchone()
+
+        if not row:
+            conn.close()  # ДОБАВИТЬ!
+            log.info(f"Рисунок {figure_num} не найден в БД")
+            return ""
+
+        image_path = row['image_path']
+        caption = row['caption'] or f"Рисунок {figure_num}"
+        conn.close()  # ДОБАВИТЬ!
         
         # Проверяем существование файла
         if not image_path or not Path(image_path).exists():
@@ -1481,47 +1484,38 @@ def analyze_figure_with_vision(
         
         log.info(f"Анализируем рисунок: {image_path}")
         
-        # Загружаем и кодируем изображение
-        with open(image_path, 'rb') as f:
-            image_data = f.read()
-        
-        image_base64 = base64.b64encode(image_data).decode('utf-8')
-        
-        # Определяем MIME тип
-        ext = Path(image_path).suffix.lower()
-        mime_types = {
-            '.png': 'image/png',
-            '.jpg': 'image/jpeg',
-            '.jpeg': 'image/jpeg',
-            '.gif': 'image/gif',
-        }
-        mime_type = mime_types.get(ext, 'image/png')
-        
-        # Формируем промпт для Vision API
-        prompt = f"""Опиши подробно, что изображено на этом рисунке.
+        # Формируем промпт для Vision API с проверкой соответствия
+        prompt = f"""Проанализируй это изображение.
 
-ОБЯЗАТЕЛЬНО укажи:
-1. Тип визуализации (гистограмма, круговая диаграмма, линейный график, таблица, фото и т.д.)
+СНАЧАЛА ПРОВЕРЬ СООТВЕТСТВИЕ:
+Подпись рисунка: "{caption}"
+Содержимое изображения соответствует этой подписи? Если НЕТ — укажи это явно в начале ответа.
+
+ОПИШИ ПОДРОБНО:
+1. Тип визуализации (гистограмма, круговая диаграмма, линейный график, блок-схема, таблица, формула, фото и т.д.)
 2. Что показано на осях X и Y (если это график)
-3. КОНКРЕТНЫЕ ЗНАЧЕНИЯ и числа, которые видны на рисунке
+3. КОНКРЕТНЫЕ ЗНАЧЕНИЯ и числа, которые видны на изображении
 4. Легенду (если есть)
-5. Основные выводы, которые можно сделать из графика
+5. Основные выводы, которые можно сделать
 
-Подпись рисунка: {caption}
 Вопрос пользователя: {question}
 
-Отвечай КОНКРЕТНО, указывая точные числа и значения."""
+Отвечай КОНКРЕТНО, указывая точные числа и значения с изображения."""
         
-        # Вызываем Vision API через polza_client
-        response = chat_with_gpt(
-            prompt,
-            max_tokens=800,
-            temperature=0.3,
+        # Вызываем Vision API через chat_with_gpt_multimodal
+        messages = [
+            {"role": "user", "content": prompt}
+        ]
+        
+        response = chat_with_gpt_multimodal(
+            messages=messages,
             images=[{
-                'type': 'base64',
-                'data': image_base64,
-                'mime_type': mime_type,
-            }]
+                'path': image_path,
+                'label': figure_num,
+                'caption': caption,
+            }],
+            max_tokens=8000,
+            temperature=0.3,
         )
         
         log.info(f"Vision API ответ получен, длина: {len(response)}")
@@ -1545,20 +1539,22 @@ def find_figure_by_number(owner_id: int, doc_id: int, figure_num: str) -> Option
         Или None, если не найдено.
     """
     try:
-        with db_mod.get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT id, doc_id, owner_id, num, caption, image_path, 
-                       chart_data, created_at
-                FROM figures 
-                WHERE owner_id = ? AND doc_id = ? AND num = ?
-                LIMIT 1
-            """, (owner_id, doc_id, str(figure_num)))
-            
-            row = cursor.fetchone()
-            if row:
-                return dict(row)
-            return None
+        conn = db_mod.get_conn()  # ← ИСПРАВЛЕНО
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, doc_id, owner_id, num, caption, image_path, 
+                   chart_data, created_at
+            FROM figures 
+            WHERE owner_id = ? AND doc_id = ? AND num = ?
+            LIMIT 1
+        """, (owner_id, doc_id, str(figure_num)))
+        
+        row = cursor.fetchone()
+        conn.close()  # ← ДОБАВЛЕНО
+        
+        if row:
+            return dict(row)
+        return None
     except Exception as e:
         log.error(f"Ошибка поиска рисунка: {e}")
         return None

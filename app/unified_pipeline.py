@@ -34,8 +34,17 @@ try:
         build_context_coverage,
         get_table_context_for_numbers,
         get_figure_context_for_numbers,
+        # НОВОЕ: для мультимодальности
+        build_multimodal_context,
+        get_figure_record_with_image,
     )
-    from .polza_client import chat_with_gpt, chat_with_gpt_stream
+    from .polza_client import (
+        chat_with_gpt, 
+        chat_with_gpt_stream,
+        # НОВОЕ: для мультимодальности
+        chat_with_gpt_multimodal,
+        chat_with_gpt_stream_multimodal,
+    )
     from .db import get_user_active_doc
     from .figures import analyze_figure_with_vision
 except Exception as e:
@@ -54,6 +63,7 @@ class QuestionType:
     CALC = "calc"           # Вычислительный вопрос (работа с числами)
     TABLE = "table"         # Вопрос про таблицу
     FIGURE = "figure"       # Вопрос про рисунок/график
+    MIXED = "mixed"         # Вопрос про таблицу И рисунок (сравнение)
     SECTION = "section"     # Вопрос про конкретный раздел
     SEMANTIC = "semantic"   # Обычный смысловой вопрос
     GOST = "gost"          # Вопрос про оформление/ГОСТ
@@ -73,13 +83,19 @@ def detect_question_type(question: str) -> str:
     if any(kw in q_lower for kw in calc_keywords):
         return QuestionType.CALC
     
-    # 2. ТАБЛИЦЫ
-    if any(w in q_lower for w in ['таблиц', 'табл.', 'table']):
+    # 2. СМЕШАННЫЕ вопросы (таблица + рисунок) — проверяем ПЕРВЫМИ!
+    has_table = any(w in q_lower for w in ['таблиц', 'табл.', 'table'])
+    has_figure = any(kw in q_lower for kw in ['рис', 'график', 'диаграмм', 'figure', 'chart'])
+    
+    if has_table and has_figure:
+        return QuestionType.MIXED
+    
+    # 3. ТАБЛИЦЫ
+    if has_table:
         return QuestionType.TABLE
     
-    # 3. РИСУНКИ/ГРАФИКИ
-    fig_keywords = ['рис', 'график', 'диаграмм', 'схем', 'figure', 'chart']
-    if any(kw in q_lower for kw in fig_keywords):
+    # 4. РИСУНКИ/ГРАФИКИ
+    if has_figure:
         return QuestionType.FIGURE
     
     # 4. РАЗДЕЛЫ
@@ -148,6 +164,118 @@ def extract_numbers_from_question(question: str, entity_type: str = "figure") ->
     print(f"[DEBUG] extract_numbers('{question[:40]}...', '{entity_type}') -> {numbers}")
     
     return list(set(numbers))
+
+
+async def _search_figure_in_text(doc_id: int, figure_num: str) -> str:
+    """
+    Ищет текстовое описание рисунка в документе.
+    Используется когда:
+    1. Vision API не смог проанализировать изображение
+    2. Изображение вообще не найдено (рисунок — это текстовая схема/таблица)
+    3. Vision API показывает не тот рисунок
+    
+    Стратегия: ищем подпись рисунка и возвращаем текст ПОСЛЕ неё,
+    а также ищем раздел с соответствующим номером (например 1.2 → раздел 1.2).
+    """
+    try:
+        from .db import get_conn
+        con = get_conn()
+        cur = con.cursor()
+        
+        result_text = ""
+        
+        # Стратегия 1: Ищем раздел с номером рисунка (1.2 → раздел 1.2)
+        # Это работает для случаев когда рисунок описывает содержимое раздела
+        section_num = figure_num  # например "1.2"
+        
+        cur.execute("""
+            SELECT text FROM chunks 
+            WHERE doc_id = ? AND (
+                section_path LIKE ? OR 
+                text LIKE ?
+            )
+            ORDER BY id ASC
+            LIMIT 20
+        """, (doc_id, f'%{section_num}%', f'%{section_num}%'))
+        
+        section_chunks = cur.fetchall()
+        for chunk in section_chunks:
+            chunk_text = chunk['text']
+            # Фильтруем только содержательные чанки
+            if len(chunk_text) > 50 and 'Рис.' not in chunk_text[:20]:
+                result_text += chunk_text + "\n\n"
+        
+        # Стратегия 2: Ищем подпись рисунка и берём контекст после неё
+        if len(result_text) < 500:  # Если мало нашли
+            search_patterns = [
+                f'%Рис%{figure_num}%',
+                f'%рис%{figure_num}%',
+            ]
+            
+            for pattern in search_patterns:
+                cur.execute("""
+                    SELECT id, text FROM chunks 
+                    WHERE doc_id = ? AND text LIKE ?
+                    ORDER BY id ASC
+                    LIMIT 1
+                """, (doc_id, pattern))
+                
+                row = cur.fetchone()
+                if row:
+                    caption_chunk_id = row['id']
+                    
+                    # Берём следующие 15 чанков (больше контекста!)
+                    cur.execute("""
+                        SELECT text FROM chunks 
+                        WHERE doc_id = ? AND id > ?
+                        ORDER BY id ASC
+                        LIMIT 15
+                    """, (doc_id, caption_chunk_id))
+                    
+                    following_chunks = cur.fetchall()
+                    for chunk in following_chunks:
+                        chunk_text = chunk['text']
+                        if len(chunk_text) > 30 and chunk_text not in result_text:
+                            result_text += chunk_text + "\n\n"
+                    
+                    break
+        
+        # Стратегия 3: Ищем ключевые слова связанные с темой рисунка
+        # Например для "Методы анализа" ищем упоминания методов
+        if 'метод' in figure_num.lower() or len(result_text) < 500:
+            cur.execute("""
+                SELECT text FROM chunks 
+                WHERE doc_id = ? AND (
+                    text LIKE '%метод%анализ%' OR
+                    text LIKE '%ABC%анализ%' OR
+                    text LIKE '%вертикальн%анализ%' OR
+                    text LIKE '%горизонтальн%анализ%' OR
+                    text LIKE '%структурн%анализ%'
+                )
+                ORDER BY id ASC
+                LIMIT 10
+            """, (doc_id,))
+            
+            method_chunks = cur.fetchall()
+            for chunk in method_chunks:
+                chunk_text = chunk['text']
+                if len(chunk_text) > 50 and chunk_text not in result_text:
+                    result_text += chunk_text + "\n\n"
+        
+        con.close()
+        
+        # Ограничиваем размер чтобы не переполнить контекст
+        if len(result_text) > 8000:
+            result_text = result_text[:8000] + "\n\n[... текст сокращён ...]"
+        
+        if result_text:
+            logger.info(f"Найдено текстовое описание рисунка {figure_num}: {len(result_text)} символов")
+        
+        return result_text
+        
+    except Exception as e:
+        logger.warning(f"Ошибка поиска текстового описания рисунка: {e}")
+        return ""
 
 
 # ==================== ПОЛУЧЕНИЕ КОНТЕКСТА ====================
@@ -251,7 +379,95 @@ async def get_context_for_question(
                 owner_id, doc_id, table_nums
             )
     
-    # 3. Для вопросов про рисунки - сначала chart_data, потом Vision API
+    # 3. Для СМЕШАННЫХ вопросов (таблица + рисунок) — собираем оба контекста
+    if question_type == QuestionType.MIXED:
+        table_nums = extract_numbers_from_question(question, "table")
+        fig_nums = extract_numbers_from_question(question, "figure")
+        
+        combined_parts = []
+        
+        # Получаем данные таблицы (копируем логику из TABLE)
+        if table_nums:
+            table_data_text = ""
+            try:
+                from .db import get_conn
+                con = get_conn()
+                cur = con.cursor()
+                
+                for table_num in table_nums:
+                    search_patterns = [
+                        f'%Таблица {table_num}%',
+                        f'%таблица {table_num}%',
+                        f'%Таблица{table_num}%',
+                    ]
+                    
+                    for pattern in search_patterns:
+                        cur.execute("""
+                            SELECT text, element_type, section_path FROM chunks 
+                            WHERE doc_id = ? AND (
+                                element_type = 'table' OR
+                                section_path LIKE ? OR 
+                                text LIKE ?
+                            )
+                            ORDER BY 
+                                CASE WHEN element_type = 'table' THEN 0 ELSE 1 END,
+                                LENGTH(text) DESC
+                            LIMIT 5
+                        """, (doc_id, pattern, pattern))
+                        
+                        rows = cur.fetchall()
+                        print(f"[DEBUG MIXED TABLE] Поиск '{pattern}': найдено {len(rows)} чанков")
+                        
+                        if rows:
+                            for row in rows:
+                                chunk_text = row['text']
+                                print(f"[DEBUG MIXED TABLE]   element_type={row['element_type']}, len={len(chunk_text)}")
+                                if len(chunk_text) > 100:
+                                    table_data_text += chunk_text + "\n\n"
+                            
+                            if table_data_text:
+                                print(f"[DEBUG MIXED TABLE] Итого данных таблицы {table_num}: {len(table_data_text)} символов")
+                                break
+                    
+                    if table_data_text:
+                        break
+                
+                con.close()
+                
+                if table_data_text:
+                    combined_parts.append(f"ДАННЫЕ ТАБЛИЦЫ {table_nums[0]}:\n{table_data_text}")
+            except Exception as e:
+                logger.warning(f"Ошибка загрузки таблицы для MIXED: {e}")
+                print(f"[DEBUG MIXED TABLE] Ошибка: {e}")
+        
+        # Получаем данные рисунка через Vision API
+        if fig_nums:
+            try:
+                vision_result = await asyncio.to_thread(
+                    analyze_figure_with_vision,
+                    owner_id, doc_id, fig_nums[0], question
+                )
+                
+                if vision_result:
+                    combined_parts.append(f"ВИЗУАЛЬНЫЙ АНАЛИЗ РИСУНКА {fig_nums[0]} (Vision API):\n{vision_result}")
+            except Exception as e:
+                logger.warning(f"Vision API failed для MIXED: {e}")
+        
+        # Получаем общий текстовый контекст
+        text_context = await asyncio.to_thread(
+            retrieve, owner_id, doc_id, question, top_k=5
+        )
+        text_context_str = build_context(text_context) if text_context else ""
+        
+        if combined_parts:
+            combined_context = "\n\n---\n\n".join(combined_parts)
+            if text_context_str:
+                combined_context += f"\n\nДОПОЛНИТЕЛЬНЫЙ КОНТЕКСТ:\n{text_context_str}"
+            return combined_context
+        
+        return text_context_str
+    
+    # 4. Для вопросов про рисунки - сначала chart_data, потом Vision API
     if question_type == QuestionType.FIGURE:
         fig_nums = extract_numbers_from_question(question, "figure")
         if fig_nums:
@@ -324,7 +540,31 @@ async def get_context_for_question(
                     owner_id, doc_id, fig_nums[0], question
                 )
                 
+                # Проверяем качество ответа Vision API
+                vision_is_valid = True
                 if vision_result:
+                    vision_lower = vision_result.lower()
+                    # Признаки ПОЛНОГО провала (изображение не загрузилось или пустое)
+                    # Эти фразы должны быть в НАЧАЛЕ ответа, чтобы не ловить их в середине текста
+                    critical_failures = [
+                        'изображение полностью чёрное',
+                        'изображение пустое',
+                        'не удалось загрузить',
+                        'изображение не загружено',
+                        'контент отсутствует',
+                        'изображение не отображается',
+                    ]
+                    # Проверяем только если эти фразы в первых 200 символах (в начале ответа)
+                    vision_start = vision_lower[:200]
+                    if any(sign in vision_start for sign in critical_failures):
+                        logger.warning(f"Vision API: изображение не загрузилось, используем текстовый контекст")
+                        vision_is_valid = False
+                
+                if vision_result and vision_is_valid:
+                    # Дополнительно: ищем текстовое описание рисунка
+                    # (полезно когда Vision видит не тот рисунок или рисунок — текстовая схема)
+                    figure_text_context = await _search_figure_in_text(doc_id, fig_nums[0])
+                    
                     combined_context = f"""
 ОПИСАНИЕ ИЗ ДОКУМЕНТА:
 {text_context}
@@ -332,14 +572,189 @@ async def get_context_for_question(
 ВИЗУАЛЬНЫЙ АНАЛИЗ РИСУНКА (Vision API):
 {vision_result}
 """
+                    # Добавляем текстовое описание если оно существенное
+                    if figure_text_context and len(figure_text_context) > 200:
+                        combined_context += f"""
+
+ТЕКСТОВОЕ ОПИСАНИЕ РИСУНКА {fig_nums[0]} (из документа):
+{figure_text_context}
+
+КРИТИЧЕСКИ ВАЖНО: 
+1. Визуальный анализ показывает ДРУГОЕ изображение (не соответствует подписи рисунка).
+2. Используй ТЕКСТОВОЕ ОПИСАНИЕ как ОСНОВНОЙ и ЕДИНСТВЕННЫЙ источник для ответа!
+3. НЕ описывай визуальные элементы из Vision API — они относятся к другому рисунку.
+4. Отвечай на вопрос ТОЛЬКО на основе текстового описания выше.
+"""
                     return combined_context
+                else:
+                    # Vision не сработал — ищем описание рисунка в тексте
+                    logger.info(f"Vision API не дал результата, ищем описание рисунка {fig_nums[0]} в тексте")
+                    figure_text_context = await _search_figure_in_text(doc_id, fig_nums[0])
+                    if figure_text_context:
+                        combined_context = f"""
+ОПИСАНИЕ ИЗ ДОКУМЕНТА:
+{text_context}
+
+ТЕКСТОВОЕ ОПИСАНИЕ РИСУНКА {fig_nums[0]} (из документа):
+{figure_text_context}
+
+ВАЖНО: Визуальный анализ рисунка недоступен. Отвечай на основе текстового описания из документа.
+"""
+                        return combined_context
+                    
             except Exception as e:
                 logger.warning(f"Vision API failed: {e}, using text context only")
             
             # Последний fallback: только текстовый контекст
             return text_context
+        
+        else:
+            # Номера рисунков не указаны — проверяем, спрашивают ли про ВСЕ рисунки
+            all_figures_keywords = [
+                'все рисунки', 'всех рисунков', 'всем рисункам', 'рисунки в работе', 
+                'какие рисунки', 'сколько рисунков', 'перечисли рисунки', 
+                'список рисунков', 'про рисунки', 'о рисунках',
+                'на рисунках', 'рисунках в', 'значения на рисунках',
+                'данные на рисунках', 'диаграммы в работе', 'все диаграммы',
+                'графики в работе', 'все графики', 'опиши рисунки',
+                'расскажи о диаграммах', 'расскажи про диаграммы',
+            ]
+            
+            q_lower = question.lower()
+            is_all_figures_question = any(kw in q_lower for kw in all_figures_keywords)
+            
+            if is_all_figures_question:
+                logger.info("Вопрос про ВСЕ рисунки — собираем информацию обо всех")
+                
+                try:
+                    from .db import get_figures_for_doc
+                    figures = await asyncio.to_thread(get_figures_for_doc, doc_id)
+                    
+                    if figures:
+                        all_figures_text = f"В документе найдено {len(figures)} рисунков:\n\n"
+                        
+                        for i, fig in enumerate(figures, 1):
+                            fig_label = str(fig.get('label') or fig.get('figure_label') or f'#{i}')
+                            caption = fig.get('caption') or 'без подписи'
+                            kind = fig.get('kind') or 'image'
+                            
+                            all_figures_text += f"### Рисунок {fig_label}: {caption}\n"
+                            all_figures_text += f"Тип: {kind}\n"
+                            
+                            # Добавляем ПОЛНЫЕ данные если есть chart_data
+                            attrs = fig.get('attrs') or {}
+                            if isinstance(attrs, str):
+                                try:
+                                    attrs = json.loads(attrs)
+                                except:
+                                    attrs = {}
+                            
+                            chart_data = attrs.get('chart_data')
+                            if chart_data:
+                                # Извлекаем полные данные диаграммы
+                                categories = chart_data.get('categories', [])
+                                series = chart_data.get('series', [])
+                                chart_type = chart_data.get('chart_type', '')
+                                
+                                if chart_type:
+                                    all_figures_text += f"Тип диаграммы: {chart_type}\n"
+                                
+                                if categories and series:
+                                    all_figures_text += "**Данные:**\n"
+                                    for s in series:
+                                        series_name = s.get('name', 'Значения')
+                                        values = s.get('values', [])
+                                        all_figures_text += f"  {series_name}:\n"
+                                        for j, cat in enumerate(categories):
+                                            if j < len(values):
+                                                val = values[j]
+                                                # Форматируем проценты
+                                                if isinstance(val, (int, float)):
+                                                    all_figures_text += f"    - {cat}: {val}%\n"
+                                                else:
+                                                    all_figures_text += f"    - {cat}: {val}\n"
+                            
+                            all_figures_text += "\n"
+                        
+                        # Добавляем RAG-контекст для дополнительной информации
+                        rag_context = await asyncio.to_thread(
+                            retrieve, owner_id, doc_id, question, top_k=5
+                        )
+                        rag_text = build_context(rag_context) if rag_context else ""
+                        
+                        return f"""ПОЛНЫЕ ДАННЫЕ ВСЕХ РИСУНКОВ В ДОКУМЕНТЕ:
+{all_figures_text}
+
+ДОПОЛНИТЕЛЬНЫЙ КОНТЕКСТ ИЗ ДОКУМЕНТА:
+{rag_text}
+
+ИНСТРУКЦИЯ: Используй ТОЧНЫЕ ЧИСЛОВЫЕ ДАННЫЕ из списка выше для ответа. Опиши значения, тренды, максимумы и минимумы на основе этих данных."""
+                    
+                except Exception as e:
+                    logger.warning(f"Ошибка получения списка рисунков: {e}")
     
-    # 4. Для остальных - обычный RAG поиск
+    # 5. Для вопросов про РАЗДЕЛЫ — расширенный поиск по названиям глав
+    if question_type == QuestionType.SECTION:
+        # Извлекаем номера разделов из вопроса
+        section_patterns = re.findall(r'(\d+\.\d+)', question)
+        
+        if section_patterns:
+            section_context = ""
+            try:
+                from .db import get_conn
+                con = get_conn()
+                cur = con.cursor()
+                
+                for section_num in section_patterns:
+                    # Ищем чанки, относящиеся к этому разделу
+                    search_patterns = [
+                        f'%{section_num}%',
+                        f'%глава {section_num}%',
+                        f'%раздел {section_num}%',
+                        f'%подглава {section_num}%',
+                    ]
+                    
+                    for pattern in search_patterns:
+                        cur.execute("""
+                            SELECT text, section_path FROM chunks 
+                            WHERE doc_id = ? AND (
+                                section_path LIKE ? OR 
+                                text LIKE ?
+                            )
+                            ORDER BY LENGTH(text) DESC
+                            LIMIT 10
+                        """, (doc_id, pattern, pattern))
+                        
+                        rows = cur.fetchall()
+                        if rows:
+                            for row in rows:
+                                chunk_text = row['text']
+                                if len(chunk_text) > 50 and chunk_text not in section_context:
+                                    section_context += chunk_text + "\n\n"
+                            break
+                
+                con.close()
+                
+                if section_context:
+                    print(f"[DEBUG SECTION] Найдено контекста для разделов {section_patterns}: {len(section_context)} символов")
+                    # Дополняем RAG-поиском
+                    rag_context = await asyncio.to_thread(
+                        retrieve, owner_id, doc_id, question, top_k=5
+                    )
+                    rag_text = build_context(rag_context) if rag_context else ""
+                    
+                    return f"""СОДЕРЖИМОЕ ЗАПРОШЕННЫХ РАЗДЕЛОВ:
+{section_context}
+
+ДОПОЛНИТЕЛЬНЫЙ КОНТЕКСТ:
+{rag_text}
+
+ВАЖНО: Анализируй содержимое разделов и отвечай на основе представленных данных!"""
+                    
+            except Exception as e:
+                logger.warning(f"Ошибка поиска разделов: {e}")
+    
+    # 6. Для остальных - обычный RAG поиск
     # Используем retrieve_coverage для лучшего качества
     try:
         # Async retrieve
@@ -507,22 +922,50 @@ class UnifiedPipeline:
             
             return answer
     
-    async def _answer_sync(self, system: str, question: str, context: str) -> str:
-        """Синхронный вызов LLM"""
+    async def _answer_sync(self, system: str, question: str, context) -> str:
+        """Синхронный вызов LLM (поддерживает мультимодальность)"""
         try:
+            # Проверяем, мультимодальный ли контекст
+            images = []
+            text_context = context
+            
+            if isinstance(context, dict) and context.get("type") == "multimodal":
+                # Мультимодальный режим: есть картинки
+                text_context = context.get("text", "")
+                images = context.get("images", [])
+                logger.info(f"Multimodal request with {len(images)} image(s)")
+            elif isinstance(context, str):
+                # Обычный текстовый режим
+                text_context = context
+                logger.info("Text-only request")
+            else:
+                # Странный формат - пытаемся извлечь текст
+                text_context = str(context)
+            
             # Формируем сообщения
             messages = [
                 {"role": "system", "content": system},
-                {"role": "user", "content": f"Контекст из документа:\n{context}\n\nВопрос: {question}"}
+                {"role": "user", "content": f"Контекст из документа:\n{text_context}\n\nВопрос: {question}"}
             ]
             
-            # Вызываем API
-            answer = await asyncio.to_thread(
-                chat_with_gpt,
-                messages=messages,
-                temperature=0.3,  # Низкая температура для точности
-                max_tokens=4000,
-            )
+            # Вызываем API (с картинками или без)
+            if images:
+                # Мультимодальный запрос
+                answer = await asyncio.to_thread(
+                    chat_with_gpt_multimodal,
+                    messages=messages,
+                    images=images,
+                    temperature=0.2,  # Ниже температура для точности
+                    max_tokens=4000,
+                )
+            else:
+                # Обычный текстовый запрос
+                answer = await asyncio.to_thread(
+                    chat_with_gpt,
+                    messages=messages,
+                    temperature=0.3,
+                    max_tokens=4000,
+                )
             
             return answer
         except Exception as e:

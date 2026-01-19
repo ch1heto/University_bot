@@ -2,6 +2,7 @@
 import re
 import json
 import numpy as np
+import os
 from .config import Cfg
 from typing import Optional, List, Dict, Tuple, Any
 from .db import get_conn, get_figures_for_doc
@@ -3126,3 +3127,195 @@ def build_context_coverage(
             break
 
     return "\n\n".join(parts)
+
+def get_figure_record_with_image(
+    doc_id: int,
+    *,
+    figure_label: Optional[str] = None,
+    figure_id: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    НОВАЯ ФУНКЦИЯ: Возвращает данные о рисунке + путь к изображению.
+    
+    Возвращает:
+    {
+        "figure_id": int,
+        "label": "2.3",
+        "caption": "Распределение бюджета",
+        "image_path": "/cache/fig_2_3.png",  ← ПУТЬ К КАРТИНКЕ!
+        "chart_data": {...},  # если есть точные данные из DOCX
+        "page": 15,
+        "section": "2"
+    }
+    
+    ИСПОЛЬЗОВАНИЕ:
+    fig = get_figure_record_with_image(doc_id, figure_label="2.3")
+    if fig and fig["image_path"]:
+        # Отправляем картинку в GPT
+    """
+    if figure_id is None and not figure_label:
+        return None
+
+    figs = get_figures_for_doc(doc_id)
+    row: Optional[Dict[str, Any]] = None
+
+    def _num_norm(x: str) -> str:
+        return (x or "").strip().replace(" ", "").replace(",", ".")
+
+    if figure_id is not None:
+        for f in figs:
+            if int(f.get("figure_id")) == int(figure_id):
+                row = f
+                break
+    else:
+        wanted = _num_norm(str(figure_label))
+        for f in figs:
+            lab = _num_norm(str(f.get("label") or f.get("figure_label") or ""))
+            if lab and lab == wanted:
+                row = f
+                break
+
+    if not row:
+        return None
+
+    # Извлекаем путь к изображению
+    image_path = row.get("image_path") or row.get("abs_path") or row.get("path")
+    
+    # Проверяем существование файла
+    if image_path and not os.path.exists(image_path):
+        logger.warning(f"Image file not found for figure {figure_label}: {image_path}")
+        image_path = None
+
+    # Извлекаем chart_data из attrs (если есть)
+    attrs = row.get("attrs")
+    chart_data = None
+    if isinstance(attrs, str):
+        try:
+            attrs_obj = json.loads(attrs or "{}")
+            chart_data = attrs_obj.get("chart_data")
+        except Exception:
+            pass
+    elif isinstance(attrs, dict):
+        chart_data = attrs.get("chart_data")
+
+    return {
+        "figure_id": int(row.get("figure_id")),
+        "label": row.get("label") or row.get("figure_label"),
+        "caption": (row.get("caption") or "").strip(),
+        "image_path": image_path,  # ← КЛЮЧЕВОЕ: путь к файлу
+        "chart_data": chart_data,  # точные данные из DOCX (если есть)
+        "page": row.get("page"),
+        "section": row.get("section") or row.get("section_path"),
+    }
+
+
+def build_multimodal_context(
+    owner_id: int,
+    doc_id: int,
+    question: str,
+    *,
+    top_k: int = 8,
+    include_figures: bool = True,
+) -> Dict[str, Any]:
+    """
+    НОВАЯ ФУНКЦИЯ: Собирает контекст для мультимодального запроса.
+    
+    Возвращает:
+    {
+        "text": "текстовый контекст из RAG",
+        "images": [
+            {
+                "path": "/cache/fig_2_3.png",
+                "label": "2.3",
+                "caption": "Распределение бюджета",
+                "chart_data": {...}  # опционально
+            }
+        ],
+        "metadata": {...}  # для отладки
+    }
+    
+    ИСПОЛЬЗОВАНИЕ:
+    ctx = build_multimodal_context(uid, doc_id, "Что на Рисунке 2.3?")
+    answer = chat_with_gpt_multimodal(
+        messages=[{"role": "user", "content": ctx["text"]}],
+        images=ctx["images"]
+    )
+    """
+    # 1. Текстовый контекст (RAG как обычно)
+    snippets = retrieve(owner_id, doc_id, question, top_k=top_k) or []
+    text_context = build_context(snippets) if snippets else ""
+
+    result = {
+        "text": text_context,
+        "images": [],
+        "metadata": {
+            "snippets_count": len(snippets),
+            "max_score": max([s.get("score", 0) for s in snippets], default=0.0),
+        }
+    }
+
+    # 2. Если в вопросе упомянуты рисунки — добавляем их картинки
+    if not include_figures:
+        return result
+
+    if not extract_figure_numbers:
+        return result
+
+    fig_nums = extract_figure_numbers(question)
+    if not fig_nums:
+        return result
+
+    # Ограничиваем количество картинок (чтобы не превысить лимит токенов)
+    max_images = int(getattr(Cfg, "MAX_IMAGES_PER_REQUEST", 5))
+    
+    for raw_num in fig_nums[:max_images]:
+        fig_data = get_figure_record_with_image(doc_id, figure_label=raw_num)
+        if not fig_data:
+            continue
+
+        # Проверяем наличие файла
+        if not fig_data.get("image_path"):
+            logger.warning(f"Figure {raw_num} has no accessible image")
+            continue
+
+        result["images"].append({
+            "path": fig_data["image_path"],
+            "label": fig_data["label"],
+            "caption": fig_data["caption"],
+            "chart_data": fig_data.get("chart_data"),  # для текстового дополнения
+        })
+
+    result["metadata"]["images_count"] = len(result["images"])
+    return result
+
+
+def format_chart_data_as_text(chart_data: Any) -> str:
+    """
+    Форматирует chart_data из DOCX в читаемый текст.
+    Используется ТОЛЬКО если картинка недоступна.
+    
+    ИСПОЛЬЗОВАНИЕ:
+    data_text = format_chart_data_as_text(fig["chart_data"])
+    """
+    if not chart_data:
+        return ""
+    
+    if isinstance(chart_data, dict):
+        # Пример: {"categories": ["A", "B"], "series": [{"values": [10, 20]}]}
+        parts = []
+        categories = chart_data.get("categories", [])
+        series_list = chart_data.get("series", [])
+        
+        if categories and series_list:
+            for i, cat in enumerate(categories):
+                values = []
+                for s in series_list:
+                    vals = s.get("values", [])
+                    if i < len(vals):
+                        values.append(str(vals[i]))
+                if values:
+                    parts.append(f"— {cat}: {', '.join(values)}")
+        
+        return "\n".join(parts) if parts else str(chart_data)
+    
+    return str(chart_data)

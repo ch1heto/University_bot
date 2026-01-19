@@ -9063,6 +9063,12 @@ async def _answer_via_unified_pipeline(
 # ОБРАБОТЧИК ЗАГРУЗКИ ДОКУМЕНТОВ
 # ============================================================================
 
+@dp.message(Command("crash"))
+async def cmd_crash(message: types.Message):
+    await message.answer("Падаю...")
+    import sys
+    sys.exit(1)
+
 @dp.message(F.document)
 async def handle_document_upload(m: types.Message):
     """Обработчик загрузки новых документов (.doc, .docx)"""
