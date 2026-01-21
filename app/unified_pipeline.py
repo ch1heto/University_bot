@@ -693,66 +693,228 @@ async def get_context_for_question(
                 except Exception as e:
                     logger.warning(f"Ошибка получения списка рисунков: {e}")
     
-    # 5. Для вопросов про РАЗДЕЛЫ — расширенный поиск по названиям глав
+    # 5. Для вопросов про РАЗДЕЛЫ — расширенный поиск
     if question_type == QuestionType.SECTION:
-        # Извлекаем номера разделов из вопроса
-        section_patterns = re.findall(r'(\d+\.\d+)', question)
+        section_context = ""
         
-        if section_patterns:
-            section_context = ""
-            try:
-                from .db import get_conn
+        # Извлекаем номера из вопроса (поддержка "глава 1", "1.1", "раздел 2")
+        q_lower = question.lower()
+
+        chapter_nums = re.findall(r'глав[а-яё]*\s*(?:№\s*)?(\d+)', q_lower)
+        # любые уровни: 1.1, 1.1.1, 2.3.4.5
+        section_nums = re.findall(r'\b(\d+(?:\.\d+)+)\b', question)
+        # поддержка "раздел 2", "пункт 3.1", "подраздел 1.2.3"
+        named_nums = re.findall(r'(?:раздел|подраздел|пункт|параграф)\s*(?:№\s*)?(\d+(?:\.\d+)*)', q_lower)
+
+        all_nums = sorted(set(chapter_nums + section_nums + named_nums), key=len, reverse=True)
+
+        # Проверяем ключевые слова для введения
+        q_lower = question.lower()
+        asks_intro = any(kw in q_lower for kw in ['введени', 'цель', 'объект', 'предмет', 'задач', 'гипотез', 'актуальн'])
+        asks_structure = any(kw in q_lower for kw in ['структур', 'содержани', 'оглавлен', 'все главы', 'все подглав', 'план'])
+        asks_conclusion = 'заключен' in q_lower or 'вывод' in q_lower
+        
+        try:
+            from .db import get_conn, get_document_ai_meta
+            
+            # Если спрашивают про введение/цель/задачи — используем сохранённые метаданные
+            if asks_intro:
+                meta = get_document_ai_meta(doc_id)
+                print(f"[DEBUG META] doc_id={doc_id}, meta={meta}")  # Дебаг
+                
+                if meta:
+                    intro_parts = []
+                    if meta.get('relevance'):
+                        intro_parts.append(f"АКТУАЛЬНОСТЬ ИССЛЕДОВАНИЯ:\n{meta['relevance']}")
+                    if meta.get('object'):
+                        intro_parts.append(f"ОБЪЕКТ ИССЛЕДОВАНИЯ: {meta['object']}")
+                    if meta.get('subject'):
+                        intro_parts.append(f"ПРЕДМЕТ ИССЛЕДОВАНИЯ: {meta['subject']}")
+                    if meta.get('goal'):
+                        intro_parts.append(f"ЦЕЛЬ ИССЛЕДОВАНИЯ: {meta['goal']}")
+                    if meta.get('tasks') and isinstance(meta['tasks'], list):
+                        tasks_formatted = "\n".join([f"  {i+1}. {t}" for i, t in enumerate(meta['tasks'])])
+                        intro_parts.append(f"ЗАДАЧИ ИССЛЕДОВАНИЯ:\n{tasks_formatted}")
+                    if meta.get('hypothesis'):
+                        intro_parts.append(f"ГИПОТЕЗА: {meta['hypothesis']}")
+                    
+                    if intro_parts:
+                        section_context = "=== ДАННЫЕ ИЗ ВВЕДЕНИЯ ===\n\n" + "\n\n".join(intro_parts) + "\n\n"
+                        print(f"[DEBUG] Добавлен контекст из метаданных: {len(section_context)} символов")
+            
+            # Если спрашивают про структуру — ищем все заголовки
+            if asks_structure or 'подглав' in q_lower:
+                con = get_conn()
+                cur = con.cursor()
+                cur.execute("""
+                    SELECT text, section_path, element_type FROM chunks
+                    WHERE owner_id = ? AND doc_id = ? AND element_type = 'heading'
+                    ORDER BY id ASC
+                    LIMIT 200
+                """, (owner_id, doc_id))
+
+                
+                headings = cur.fetchall()
+                con.close()
+                
+                if headings:
+                    heading_texts = [row['text'] for row in headings]
+                    section_context += "СТРУКТУРА ДОКУМЕНТА (ЗАГОЛОВКИ):\n\n"
+                    section_context += "\n".join(heading_texts) + "\n\n"
+            
+            # Поиск по конкретным номерам глав
+            if all_nums:
                 con = get_conn()
                 cur = con.cursor()
                 
-                for section_num in section_patterns:
-                    # Ищем чанки, относящиеся к этому разделу
-                    search_patterns = [
-                        f'%{section_num}%',
-                        f'%глава {section_num}%',
-                        f'%раздел {section_num}%',
-                        f'%подглава {section_num}%',
-                    ]
+                for num in all_nums:
+                    # Расширенный поиск: по тексту И по section_path
+                    # Используем более гибкие паттерны
                     
-                    for pattern in search_patterns:
+                    # 1) Сначала ищем заголовок главы
+                    patterns = []
+
+                    is_chapter_request = bool(re.search(r'\bглава\b', q_lower))
+
+                    if '.' not in str(num):
+                        if is_chapter_request:
+                            # ЖЁСТКО только глава, чтобы не цеплять списки "1. ..." и пункты
+                            patterns += [
+                                f'ГЛАВА {num}%',
+                                f'Глава {num}%',
+                            ]
+                        else:
+                            # общий случай (раздел/пункт), можно шире
+                            patterns += [
+                                f'ГЛАВА {num}%',
+                                f'Глава {num}%',
+                                f'{num} %',
+                                f'{num}. %',
+                                f'{num}.%',
+                                f'%> {num} %',
+                            ]
+
+
+                    # Ищем И по text, И по section_path
+                    # --- before execute: guard ---
+                    if not patterns:
+                        continue  # или: patterns = [f"%{num}%"] как ultra-fallback
+
+                    text_clause = " OR ".join(["text LIKE ?"] * len(patterns))
+                    path_clause = " OR ".join(["section_path LIKE ?"] * len(patterns))
+
+                    sql = f"""
+                        SELECT text, section_path, element_type
+                        FROM chunks
+                        WHERE owner_id = ? AND doc_id = ? AND element_type = 'heading'
+                        AND ( ({text_clause}) OR ({path_clause}) )
+                        ORDER BY id ASC
+                        LIMIT 10
+                    """
+                    cur.execute(sql, (owner_id, doc_id, *patterns, *patterns))
+
+                    
+                    headings = cur.fetchall()
+                    found_section_paths = []
+                    
+                    for row in headings:
+                        chunk_text = row['text']
+                        sp = row['section_path']
+                        if sp:
+                            found_section_paths.append(sp)
+
+                    
+                    # 2) Теперь ищем ВСЁ содержимое этой главы по section_path
+                    for sp in found_section_paths:
+                        if not sp:
+                            continue
                         cur.execute("""
-                            SELECT text, section_path FROM chunks 
-                            WHERE doc_id = ? AND (
-                                section_path LIKE ? OR 
-                                text LIKE ?
-                            )
-                            ORDER BY LENGTH(text) DESC
-                            LIMIT 10
-                        """, (doc_id, pattern, pattern))
+                            SELECT text, element_type FROM chunks
+                            WHERE owner_id = ? AND doc_id = ? AND section_path LIKE ?
+                            ORDER BY id ASC
+                            LIMIT 500
+                        """, (owner_id, doc_id, f'{sp}%'))
                         
-                        rows = cur.fetchall()
-                        if rows:
-                            for row in rows:
-                                chunk_text = row['text']
-                                if len(chunk_text) > 50 and chunk_text not in section_context:
-                                    section_context += chunk_text + "\n\n"
-                            break
+                        content_rows = cur.fetchall()
+                        for crow in content_rows:
+                            ctext = crow['text']
+                            if ctext not in section_context and len(ctext) > 50:
+                                section_context += ctext + "\n\n"
+                    
+                    # 3) Fallback: поиск подглав (1.1, 1.2, 1.3...)
+                    # Fallback, если заголовок главы не найден, но пользователь просит "глава N":
+                    # ищем любые подзаголовки/фрагменты вида "N." / "N.x" в тексте и section_path без ограничения 1..9
+                    if '.' not in str(num) and not found_section_paths:
+                        fallback_patterns = [
+                            f'{num}.%',      # "1. ..." или "1.1 ..."
+                            f'{num} %',      # "1 Введение"
+                        ]
+                        cur.execute(f"""
+                            SELECT text FROM chunks
+                            WHERE owner_id = ? AND doc_id = ? AND (
+                                {" OR ".join(["section_path LIKE ?"] * len(fallback_patterns))} OR
+                                {" OR ".join(["text LIKE ?"] * len(fallback_patterns))}
+                            )
+                            ORDER BY id ASC
+                            LIMIT 200
+                        """, (owner_id, doc_id, *fallback_patterns, *fallback_patterns))
+
+                        for row in cur.fetchall():
+                            stext = row['text']
+                            if stext not in section_context and len(stext) > 30:
+                                section_context += stext + "\n\n"
                 
                 con.close()
-                
-                if section_context:
-                    print(f"[DEBUG SECTION] Найдено контекста для разделов {section_patterns}: {len(section_context)} символов")
-                    # Дополняем RAG-поиском
-                    rag_context = await asyncio.to_thread(
-                        retrieve, owner_id, doc_id, question, top_k=5
+            
+            # Для заключения
+            if asks_conclusion:
+                con = get_conn()
+                cur = con.cursor()
+                cur.execute("""
+                    SELECT text FROM chunks 
+                    WHERE doc_id = ? AND (
+                        text LIKE '%ЗАКЛЮЧЕНИЕ%' OR 
+                        text LIKE '%Заключение%' OR
+                        section_path LIKE '%заключен%'
                     )
-                    rag_text = build_context(rag_context) if rag_context else ""
-                    
-                    return f"""СОДЕРЖИМОЕ ЗАПРОШЕННЫХ РАЗДЕЛОВ:
+                    ORDER BY id ASC
+                    LIMIT 20
+                """, (doc_id,))
+                
+                rows = cur.fetchall()
+                for row in rows:
+                    if row['text'] not in section_context:
+                        section_context += row['text'] + "\n\n"
+                con.close()
+            
+            if section_context:
+                print(f"[DEBUG SECTION] Собран контекст: {len(section_context)} символов")
+                
+                # Дополняем RAG-поиском
+                rag_context = await asyncio.to_thread(
+                    retrieve, owner_id, doc_id, question, top_k=5
+                )
+                rag_text = build_context(rag_context) if rag_context else ""
+                
+                return f"""ИНФОРМАЦИЯ ПО ЗАПРОСУ:
+
 {section_context}
 
 ДОПОЛНИТЕЛЬНЫЙ КОНТЕКСТ:
 {rag_text}
 
-ВАЖНО: Анализируй содержимое разделов и отвечай на основе представленных данных!"""
-                    
-            except Exception as e:
-                logger.warning(f"Ошибка поиска разделов: {e}")
+ВАЖНО: Отвечай на основе представленных данных. Если информации недостаточно — укажи это."""
+            
+            else:
+                # Fallback: если специфичный поиск не дал результатов
+                print(f"[DEBUG SECTION] Контекст пустой, используем RAG fallback")
+                # Не возвращаем — пусть код идёт дальше в RAG поиск
+                pass
+                
+        except Exception as e:
+            logger.warning(f"Ошибка поиска разделов: {e}")
+            import traceback
+            traceback.print_exc()
     
     # 6. Для остальных - обычный RAG поиск
     # Используем retrieve_coverage для лучшего качества
@@ -775,7 +937,7 @@ async def get_context_for_question(
         retrieve, owner_id, doc_id, question, top_k=10
     )
     return build_context(snippets) if snippets else ""
-
+    
 
 # ==================== ПОСТРОЕНИЕ ПРОМПТА ====================
 
@@ -821,21 +983,34 @@ def build_system_prompt(question_type: str) -> str:
             "- В конце ОБЯЗАТЕЛЬНО напиши краткий вывод.\n"
         )
     
-    elif question_type == QuestionType.GOST:
+    elif question_type == QuestionType.SECTION:
         return base + (
-            "\nТип вопроса: ОФОРМЛЕНИЕ/ГОСТ.\n"
-            "- Проверяй соответствие требованиям ГОСТа.\n"
-            "- Указывай конкретные нарушения, если они есть.\n"
-            "- Давай рекомендации по исправлению.\n"
+            "\nТип вопроса: РАЗДЕЛ/ГЛАВА/СТРУКТУРА.\n"
+            "ПРАВИЛА:\n"
+            "- Отвечай на конкретный запрос пользователя (описать главу, перечислить подглавы, раскрыть содержание раздела).\n"
+            "- Если пользователь просит 'опиши главу N' — дай краткое содержание главы:\n"
+            "  1) тема и назначение главы,\n"
+            "  2) ключевые положения и определения,\n"
+            "  3) что рассматривается по подпунктам,\n"
+            "  4) выводы по главе (если есть в тексте).\n"
+            "- Если пользователь просит 'структуру/оглавление/план' — перечисли заголовки и подзаголовки.\n"
+            "- Не навязывай пункты 'цель/объект/предмет/задачи/методы', если пользователь об этом не спрашивал.\n"
+            "- Если информации в контексте нет — честно скажи: 'В документе не указано'.\n"
+            "- В конце: краткий вывод.\n"
         )
-    
+
+
     else:  # SEMANTIC или SECTION
         return base + (
             "\nТип вопроса: СМЫСЛОВОЙ.\n"
-            "- Давай содержательные, развёрнутые ответы.\n"
-            "- Используй цитаты из документа для подтверждения.\n"
-            "- Структурируй ответ логично (введение, основная часть, вывод).\n"
-            "- В конце ОБЯЗАТЕЛЬНО напиши краткий вывод.\n"
+            "ПРАВИЛА ОТВЕТА:\n"
+            "- Отвечай ТОЛЬКО на основе контекста из документа.\n"
+            "- Приводи прямые цитаты в кавычках «...».\n"
+            "- НЕ используй ссылки [S1], [S2] — они не видны пользователю.\n"
+            "- Если информации нет в контексте — честно скажи: 'В документе не указано'.\n"
+            "- НЕ выдумывай 'предполагаемые формулировки' — только факты из документа.\n"
+            "- Структурируй ответ: пункты с конкретными данными.\n"
+            "- В конце — краткий вывод из 1-2 предложений.\n"
         )
 
 
@@ -1005,7 +1180,6 @@ class UnifiedPipeline:
 
 # Создаём единственный экземпляр для всего приложения
 pipeline = UnifiedPipeline()
-
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 

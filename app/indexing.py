@@ -425,10 +425,16 @@ def _yield_chunks_for_section(
     # якоря
     base_attrs = _attach_anchors(base_attrs, section_path=section_path, page=page, title=title)
 
-    # заголовок
+    # заголовок — индексируем И название, И текст (если есть)
     if et == "heading":
         head_txt = _prefix(section)
         yield head_txt, {"page": page, "section_path": section_path}, "heading", base_attrs
+        # Также индексируем текст секции, если он отличается от заголовка
+        body = (text or "").strip()
+        if body and body != title and len(body) > len(title) + 10:
+            for ch in split_into_chunks(body):
+                if ch.strip():
+                    yield ch, {"page": page, "section_path": section_path}, "text", base_attrs
         return
 
     # источник
@@ -646,19 +652,49 @@ def _extract_intro_meta_from_sections(
         return None
 
     intro_text_parts: List[str] = []
+    in_intro = False
 
     for s in sections:
-        title = (s.get("title") or "").strip().upper()
-        # ищем раздел "ВВЕДЕНИЕ" или близкие варианты
-        if "ВВЕДЕНИЕ" in title:
-            body = (s.get("text") or "").strip()
-            if body:
-                intro_text_parts.append(body)
+        title_u = (s.get("title") or "").strip().upper()
+        text = (s.get("text") or "").strip()
+        sp_u = (s.get("section_path") or "").strip().upper()
 
-    if not intro_text_parts:
-        return None
+        # 1) Старт введения
+        is_intro_start = (
+            "ВВЕДЕНИЕ" in title_u or
+            text.upper().startswith("ВВЕДЕНИЕ") or
+            "INTRODUCTION" in title_u or
+            text.upper().startswith("INTRODUCTION") or
+            ("ВВЕДЕНИЕ" in sp_u) or
+            ("INTRODUCTION" in sp_u)
+        )
 
-    intro_text = "\n".join(intro_text_parts)
+        if is_intro_start:
+            in_intro = True
+            if text:
+                intro_text_parts.append(text)
+            continue
+
+        # 2) Если мы уже внутри введения — продолжаем собирать, пока не начался следующий крупный раздел
+        if in_intro:
+            # стоп-условия: следующий крупный заголовок/глава/нумерованный раздел/заключение
+            looks_like_new_major = (
+                ("ГЛАВА" in title_u) or
+                ("ЗАКЛЮЧЕНИЕ" in title_u) or
+                re.match(r"^\s*\d+(\.\d+)*\b", (s.get("title") or "").strip()) is not None or
+                re.match(r"^\s*ГЛАВА\s+\d+", text.upper()) is not None or
+                re.match(r"^\s*\d+(\.\d+)*\b", text) is not None
+            )
+
+            # если section_path больше не про введение и при этом начался новый крупный раздел — выходим
+            if looks_like_new_major and ("ВВЕДЕНИЕ" not in sp_u) and ("INTRODUCTION" not in sp_u):
+                break
+
+            if text:
+                intro_text_parts.append(text)
+
+
+        intro_text = "\n".join(intro_text_parts)
 
     # очень простой парсер по ключевым фразам
     def _find_after(label: str) -> Optional[str]:
@@ -736,20 +772,6 @@ def _extract_intro_meta_from_sections(
             elif tasks:
                 tasks[-1] += " " + line
 
-
-
-    tasks: List[str] = []
-    if tasks_block:
-        for line in tasks_block.split("\n"):
-            line = line.strip(" \t-•—;:")
-            if not line:
-                continue
-            # простая эвристика: строки, начинающиеся с цифры / маркера, считаем задачами
-            if line[0].isdigit() or line.startswith(("-", "—")):
-                tasks.append(line)
-            elif tasks:
-                # если уже начался список, а строка без цифры — можно присоединить к предыдущей
-                tasks[-1] += " " + line
 
     hypothesis = _find_after("гипотеза исследования")
     if hypothesis is None:

@@ -3082,7 +3082,10 @@ def build_context_coverage(
             continue
 
         # ✅ отсечём обрывки (часто заголовки/мусор)
-        if len(block) < 80:
+        # ✅ отсечём обрывки, но НЕ заголовки (они часто короткие, но важные)
+        element_type = s.get("element_type", "")
+        min_len = 20 if element_type == "heading" else 80
+        if len(block) < min_len:
             continue
 
         k = f"{sid or 0}|{spath}|{hash(block)}"
@@ -3096,17 +3099,16 @@ def build_context_coverage(
         fid = s.get("for_item")
 
         meta_bits: List[str] = []
-        if fid:
-            meta_bits.append(f"item={fid}")
-        if page is not None:
-            meta_bits.append(f"стр.{page}")
         if spath:
             meta_bits.append(spath)
-        if sid:
-            meta_bits.append(f"id={sid}")
+        if page is not None:
+            meta_bits.append(f"стр.{page}")
 
-        meta = " | ".join(meta_bits)
-        prefix = f"[S{idx}" + (f" {meta}" if meta else "") + "] "
+        # Формируем читаемый префикс без [S1], [S2]
+        if meta_bits:
+            prefix = f"--- {' | '.join(meta_bits)} ---\n"
+        else:
+            prefix = ""
 
         if total + len(prefix) + len(block) > max_chars:
             remaining = max_chars - total

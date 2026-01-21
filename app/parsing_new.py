@@ -88,29 +88,131 @@ def parse_docx(file_path: str) -> Dict[str, Any]:
         # ===================================================================
         # ИЗВЛЕЧЕНИЕ СЕКЦИЙ (ПАРАГРАФЫ)
         # ===================================================================
+
+        def _norm_title_key(s: str) -> str:
+            s = re.sub(r"\s+", " ", (s or "").strip().lower())
+            s = re.sub(r"[–—−]", "-", s)
+            s = re.sub(r"[\"'«»]", "", s)
+            s = re.sub(r"[^\wа-яё0-9 -]", "", s)
+            return s
+
+        # 0) PRE-PASS: собираем карту подглав из оглавления (строки вида "2.1 ... ..... 15")
+        toc_map: dict[str, str] = {}  # normalized_title -> "2.1"
+        for p in doc.paragraphs:
+            t = (p.text or "").strip()
+            if not t:
+                continue
+            if _is_toc_line(t):
+                m = re.match(r"^(\d+(?:\.\d+)*)\s+(.+?)\.{3,}\s*\d+\s*$", t)
+                if m:
+                    num = m.group(1).strip()
+                    title_toc = m.group(2).strip()
+                    if num and title_toc:
+                        toc_map[_norm_title_key(title_toc)] = num
+
         sections = []
+        heading_stack: list[str] = []
+        current_section_path = "Документ"
+
         for para in doc.paragraphs:
-            text = para.text.strip()
+            text = (para.text or "").strip()
             if not text:
                 continue
-            
-            # Определяем уровень заголовка
+
+            # 1) ВЫКИДЫВАЕМ ОГЛАВЛЕНИЕ ИЗ КОНТЕНТА (оно иначе даёт дубликаты заголовков)
+            if _is_toc_line(text):
+                continue
+
+            # 2) НЕ ДАЁМ ФОРМУЛАМ/УРАВНЕНИЯМ ПОРТИТЬ СТРУКТУРУ
+            # Даже если Word пометил это как Heading — принудительно считаем обычным текстом.
+            if _looks_like_formula(text):
+                level = 0
+                title = ""
+                # section_path остаётся текущим
+                sections.append({
+                    'text': text,
+                    'level': 0,
+                    'title': "",
+                    'element_type': 'text',
+                    'section_path': current_section_path,
+                })
+                continue
+
             level = 0
             title = ""
-            if para.style.name.startswith('Heading'):
+
+            style_name = para.style.name if para.style else ""
+
+            candidate_level = 0
+            candidate_title = ""
+
+            # 3) Подтягиваем номер из оглавления, если заголовок в теле без номера/стиля
+            # Например в теле: "Организация эмпирического исследования" -> делаем "2.1 Организация..."
+            if not re.match(r'^\d+(?:\.\d+)*\b', text):
+                key = _norm_title_key(text)
+                if key in toc_map:
+                    text = f"{toc_map[key]} {text}"
+
+            # 4) Word Heading N — только кандидат
+            if style_name.startswith('Heading'):
                 try:
-                    level = int(para.style.name.replace('Heading ', ''))
-                    title = text
+                    candidate_level = int(style_name.replace('Heading ', ''))
+                except:
+                    candidate_level = 1
+                candidate_title = text
+
+            # 5) Русские стили "Заголовок N" — тоже кандидат
+            elif HEAD_STYLE_RE.search(style_name):
+                match = HEAD_STYLE_RE.search(style_name)
+                if match:
+                    candidate_level = int(match.group(2))
+                    candidate_title = text
+
+            # 6) Подтверждение заголовка
+            if candidate_level > 0:
+                if _is_heading(text):
+                    level = candidate_level
+                    title = candidate_title
+                else:
+                    level = 0
+                    title = ""
+            else:
+                if _is_heading(text):
+                    level, title = _parse_heading(text)
+                else:
+                    level = 0
+                    title = ""
+
+            # 7) формируем ИЕРАРХИЧЕСКИЙ section_path
+            if level > 0:
+                try:
+                    level = int(level)
                 except:
                     level = 1
-                    title = text
-            
+                if level < 1:
+                    level = 1
+                if level > 9:
+                    level = 9
+
+                heading_stack = heading_stack[: level - 1]
+                heading_stack.append(title or text)
+                current_section_path = " > ".join(heading_stack)
+            else:
+                if not current_section_path:
+                    current_section_path = "Документ"
+
             sections.append({
                 'text': text,
                 'level': level,
-                'title': title,
+                'title': title if title else (text if level > 0 else ""),
+                'element_type': 'heading' if level > 0 else 'text',
+                'section_path': current_section_path,
             })
-        
+
+            if level > 0:
+                print(f"DEBUG HEADING: level={level}, path={current_section_path[:80]}...")
+
+
         print(f"DEBUG: Найдено секций (параграфов): {len(sections)}")
 
         tables = []
@@ -825,6 +927,24 @@ def _extract_metadata(doc_content) -> Dict[str, Any]:
 
 # ==================== УТИЛИТЫ ====================
 
+FORMULA_SIGNS_RE = re.compile(r"[=÷±∑√≤≥<>]")
+EQ_NUMBER_RE = re.compile(r"\(\s*\d+\s*\)\s*$")
+TOC_DOTS_RE = re.compile(r"\.{3,}\s*\d+\s*$")
+
+def _looks_like_formula(text: str) -> bool:
+    if FORMULA_SIGNS_RE.search(text):
+        return True
+    if EQ_NUMBER_RE.search(text) and ("=" in text or "÷" in text):
+        return True
+    # типичный паттерн "К1 = ..." / "K1 = ..."
+    if re.search(r"\b[А-ЯA-Z]\d+\s*=", text):
+        return True
+    return False
+
+def _is_toc_line(text: str) -> bool:
+    # классический лидер точками + номер страницы
+    return bool(TOC_DOTS_RE.search(text))
+
 def _flatten_list_to_text(lst) -> str:
     """
     Преобразует вложенный список в плоский текст.
@@ -840,41 +960,88 @@ def _flatten_list_to_text(lst) -> str:
 def _is_heading(text: str) -> bool:
     """
     Проверяет, является ли текст заголовком.
+    Версия, которая не превращает формулы и обычные абзацы в заголовки.
     """
-    text = text.strip()
-    # Эвристика: заголовки обычно короткие и начинаются с цифры или заглавной буквы
-    if len(text) < 5 or len(text) > 200:
+    text = (text or "").strip()
+    if len(text) < 3 or len(text) > 300:
         return False
-    
-    # Проверяем паттерны заголовков
-    if re.match(r'^\d+\.?\s+[А-ЯЁA-Z]', text):  # "1. Введение" или "1 ВВЕДЕНИЕ"
-        return True
-    
-    if text.isupper() and len(text.split()) <= 10:  # "ГЛАВА 1. ТЕОРЕТИЧЕСКИЕ ОСНОВЫ"
-        return True
-    
-    return False
 
+    # 0) ЖЁСТКО отсекаем формулы/уравнения (ваш кейс: "К1 = ... (1)")
+    # Если есть математические операторы и/или ссылка на формулу "(1)" — это не заголовок.
+    if re.search(r'[=÷×+\-*/<>]', text) and re.search(r'\(\s*\d+\s*\)\s*$', text):
+        return False
+    if re.search(r'[=÷×]', text):
+        return False
+
+    # 1) Нумерованные заголовки: "1.2.3 Название" или "1.2.3. Название"
+    if re.match(r'^\d+(?:\.\d+)*\.?\s+\S', text):
+        # доп. страховка: если это слишком длинная фраза — вероятно абзац/перечень
+        return len(text.split()) <= 25
+
+    # 2) "ГЛАВА 1" / "Глава 1" / "CHAPTER 1"
+    if re.match(r'^(?:ГЛАВА|CHAPTER)\s*\d+\b', text, re.IGNORECASE):
+        return True
+
+    # 3) Полностью заглавные строки — но только если это "текст", а не смесь формульных символов
+    # Разрешаем буквы/пробелы/дефисы/кавычки/точки/запятые, без "=" и т.п.
+    if text.isupper() and len(text.split()) <= 12 and re.fullmatch(r"[A-ZА-ЯЁ0-9\s«»\"'.,:;()\-]+", text):
+        # если заканчивается точкой — скорее абзац
+        if not re.search(r'[.]\s*$', text):
+            return True
+
+    # 4) Жёсткие ключевые слова разделов (ТОЛЬКО startswith)
+    keywords = [
+        'ВВЕДЕНИЕ', 'ЗАКЛЮЧЕНИЕ', 'ВЫВОДЫ', 'ПРИЛОЖЕНИЕ',
+        'СПИСОК ЛИТЕРАТУРЫ', 'СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ',
+        'БИБЛИОГРАФИЧЕСКИЙ СПИСОК', 'СОДЕРЖАНИЕ', 'ОГЛАВЛЕНИЕ',
+        'АННОТАЦИЯ', 'ABSTRACT', 'SUMMARY',
+        'INTRODUCTION', 'CONCLUSION', 'REFERENCES', 'APPENDIX'
+    ]
+    text_upper = text.upper()
+    for kw in keywords:
+        if text_upper.startswith(kw) and len(text.split()) <= 20:
+            return True
+
+    # 5) "1. Название"
+    if re.match(r'^\d+\.\s+[А-ЯЁA-Z]', text):
+        return True
+
+    return False
 
 def _parse_heading(text: str) -> Tuple[int, str]:
     """
     Определяет уровень заголовка и его текст.
+    Улучшенная версия.
     """
     text = text.strip()
     
-    # Паттерн: "1.2.3 Название"
-    match = re.match(r'^(\d+(?:\.\d+)*)\s+(.+)', text)
-    if match:
-        num_parts = match.group(1).split('.')
-        level = len(num_parts)
-        title = match.group(2).strip()
-        return level, title
+    # 1) "ГЛАВА 1. Название" или "Глава 1 Название"
+    m = re.match(r'^(?:ГЛАВА|Глава|CHAPTER|Chapter)\s*(\d+)[\.\:\s]*(.*)$', text, re.IGNORECASE)
+    if m:
+        return 1, text  # Главы всегда уровень 1
     
-    # Паттерн: "ГЛАВА 1. НАЗВАНИЕ"
+    # 2) Нумерованный заголовок: "1.2.3 Название" или "1.2.3. Название"  
+    m = re.match(r'^(\d+(?:\.\d+)*)\.?\s+(.+)$', text)
+    if m:
+        num_parts = m.group(1).split('.')
+        level = len(num_parts)
+        return level, text
+    
+    # 3) Простой номер: "1. Название"
+    m = re.match(r'^(\d+)\.\s+(.+)$', text)
+    if m:
+        return 1, text
+    
+    # 4) Полностью заглавный текст — уровень 1
     if text.isupper():
         return 1, text
     
-    return 0, text
+    # 5) Ключевые слова — уровень 1
+    keywords_l1 = ['ВВЕДЕНИЕ', 'ЗАКЛЮЧЕНИЕ', 'ВЫВОДЫ', 'СОДЕРЖАНИЕ', 'ОГЛАВЛЕНИЕ']
+    if text.upper() in keywords_l1 or any(text.upper().startswith(k) for k in keywords_l1):
+        return 1, text
+    
+    return 1, text  # По умолчанию уровень 1
 
 
 def _find_table_caption(body, section_idx: int, item_idx: int) -> Optional[str]:

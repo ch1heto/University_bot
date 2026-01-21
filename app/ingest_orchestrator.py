@@ -491,15 +491,18 @@ def _build_structured_sections(file_path: str, kind: str) -> List[Dict[str, Any]
     if k == "docx":
         if not parse_docx:
             raise IngestError("parse_docx недоступен (не импортирован parsing.py).")
-        sections = parse_docx(file_path)
+        _parsed = parse_docx(file_path)
+        sections = _parsed.get('sections', []) if isinstance(_parsed, dict) else _parsed
     elif k == "pdf":
         if not parse_pdf:
             raise IngestError("parse_pdf недоступен (не импортирован parsing.py).")
-        sections = parse_pdf(file_path)
+        _parsed = parse_pdf(file_path)
+        sections = _parsed.get('sections', []) if isinstance(_parsed, dict) else _parsed
     elif k == "doc":
         if not parse_doc:
             raise IngestError("parse_doc недоступен (не импортирован parsing.py).")
-        sections = parse_doc(file_path)
+        _parsed = parse_doc(file_path)
+        sections = _parsed.get('sections', []) if isinstance(_parsed, dict) else _parsed
     elif k == "txt":
         # Простейший одно-секционный парсинг
         body = Path(file_path).read_text(encoding="utf-8", errors="ignore")
