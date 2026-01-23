@@ -91,9 +91,20 @@ CREATE TABLE IF NOT EXISTS figure_analysis (
     updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (figure_id) REFERENCES figures(id) ON DELETE CASCADE
 );
+
+
+CREATE TABLE IF NOT EXISTS document_meta (
+    doc_id      INTEGER PRIMARY KEY,
+    relevance   TEXT,
+    object      TEXT,
+    subject     TEXT,
+    goal        TEXT,
+    tasks_json  TEXT,
+    hypothesis  TEXT,
+    updated_at  TEXT
+);
+
 """
-
-
 # ----------------------------- helpers -----------------------------
 
 def _table_info(con: sqlite3.Connection, table: str) -> set[str]:
@@ -1195,26 +1206,48 @@ def get_document_ai_meta(doc_id: int) -> Optional[Dict[str, Any]]:
     con = get_conn()
     try:
         cur = con.cursor()
+
+        # ВАЖНО: если база старая и таблица ещё не создана — создаём "мягко".
+        # Это безопасно: CREATE TABLE IF NOT EXISTS ничего не сломает.
         cur.execute(
             """
-            SELECT
-                relevance,
-                object,
-                subject,
-                goal,
-                tasks_json,
-                hypothesis
-            FROM document_meta
-            WHERE doc_id = ?
-            """,
-            (doc_id,),
+            CREATE TABLE IF NOT EXISTS document_meta (
+                doc_id      INTEGER PRIMARY KEY,
+                relevance   TEXT,
+                object      TEXT,
+                subject     TEXT,
+                goal        TEXT,
+                tasks_json  TEXT,
+                hypothesis  TEXT,
+                updated_at  TEXT
+            )
+            """
         )
+
+        try:
+            cur.execute(
+                """
+                SELECT
+                    relevance,
+                    object,
+                    subject,
+                    goal,
+                    tasks_json,
+                    hypothesis
+                FROM document_meta
+                WHERE doc_id = ?
+                """,
+                (doc_id,),
+            )
+        except Exception:
+            # Последняя линия обороны: если по каким-то причинам SELECT всё равно не работает,
+            # не валим пайплайн — просто говорим "меты нет".
+            return None
+
         row = cur.fetchone()
         if not row:
             return None
 
-        # На sqlite3.Row безопаснее читать по ключам,
-        # чтобы не зависеть от row_factory и порядка колонок.
         tasks_json = row["tasks_json"]
         if isinstance(tasks_json, (bytes, bytearray)):
             try:
