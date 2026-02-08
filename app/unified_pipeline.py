@@ -1380,7 +1380,21 @@ class UnifiedPipeline:
                 return self._answer_stream(system_prompt, question, merged_context)
 
             answer = await self._answer_sync(system_prompt, question, merged_context)
-            if use_cache:
+
+            if not answer or not answer.strip():
+                logger.warning(
+                    "[PIPELINE] LLM returned empty after retries (multi-intent), question='%s'",
+                    question[:80],
+                )
+                answer = (
+                    "Не удалось получить ответ от языковой модели.\n"
+                    "Возможные причины:\n"
+                    "- Временные проблемы с сервисом генерации ответов\n"
+                    "- Слишком большой объём контекста\n\n"
+                    "Попробуйте повторить запрос через несколько секунд."
+                )
+
+            if use_cache and answer:
                 cache_key = self._get_cache_key(doc_id, question)
                 self._update_cache(cache_key, answer)
             return answer
@@ -1409,7 +1423,21 @@ class UnifiedPipeline:
             return self._answer_stream(system_prompt, question, context)
 
         answer = await self._answer_sync(system_prompt, question, context)
-        if use_cache:
+
+        if not answer or not answer.strip():
+            logger.warning(
+                "[PIPELINE] LLM returned empty after retries, returning fallback for question='%s'",
+                question[:80],
+            )
+            answer = (
+                "Не удалось получить ответ от языковой модели.\n"
+                "Возможные причины:\n"
+                "- Временные проблемы с сервисом генерации ответов\n"
+                "- Слишком большой объём контекста\n\n"
+                "Попробуйте повторить запрос через несколько секунд."
+            )
+
+        if use_cache and answer:
             cache_key = self._get_cache_key(doc_id, question)
             self._update_cache(cache_key, answer)
         return answer
@@ -1448,24 +1476,35 @@ class UnifiedPipeline:
                 {"role": "user", "content": f"Контекст из документа:\n{text_context}\n\nВопрос: {question}"}
             ]
 
-            # Вызываем API (с картинками или без)
-            if images:
-                # Мультимодальный запрос
-                answer = await asyncio.to_thread(
-                    chat_with_gpt_multimodal,
-                    messages=messages,
-                    images=images,
-                    temperature=0.2,  # Ниже температура для точности
-                    max_tokens=4000,
+            # Вызываем API (с картинками или без) с ретраем при пустом ответе
+            max_retries = 2
+            answer = ""
+            for attempt in range(1, max_retries + 1):
+                if images:
+                    answer = await asyncio.to_thread(
+                        chat_with_gpt_multimodal,
+                        messages=messages,
+                        images=images,
+                        temperature=0.2,
+                        max_tokens=4000,
+                    )
+                else:
+                    answer = await asyncio.to_thread(
+                        chat_with_gpt,
+                        messages=messages,
+                        temperature=0.3,
+                        max_tokens=4000,
+                    )
+
+                if answer and answer.strip():
+                    break
+
+                logger.warning(
+                    "[PIPELINE] LLM returned empty on attempt %d/%d for question='%s'",
+                    attempt, max_retries, question[:80],
                 )
-            else:
-                # Обычный текстовый запрос
-                answer = await asyncio.to_thread(
-                    chat_with_gpt,
-                    messages=messages,
-                    temperature=0.3,
-                    max_tokens=4000,
-                )
+                if attempt < max_retries:
+                    await asyncio.sleep(1.5)
 
             logger.info(
                 "[PIPELINE] _answer_sync result: answer_len=%d, empty=%s",
