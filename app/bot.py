@@ -57,6 +57,8 @@ from .db import (
     # ↓ новое для FSM/очереди
     enqueue_pending_query, dequeue_all_pending_queries,
     get_processing_state, start_downloading,
+    finish_indexing_error,
+    set_processing_state,
     find_nearest_table_above
 )
 from .parsing_new import parse_docx, parse_doc, save_upload
@@ -130,7 +132,13 @@ from .utils import safe_filename, sha256_bytes, split_for_telegram, infer_doc_ki
 from .lexsearch import best_context
 
 # где у вас создаются объекты бота и диспетчера:
-bot = Bot(Cfg.TG_TOKEN)
+from aiogram.client.session.aiohttp import AiohttpSession
+import aiohttp
+
+# Сессия с увеличенными таймаутами для нестабильных сетей (актуально для РФ)
+_tg_timeout = aiohttp.ClientTimeout(total=60, connect=15, sock_connect=15, sock_read=60)
+_tg_session = AiohttpSession(timeout=_tg_timeout)
+bot = Bot(Cfg.TG_TOKEN, session=_tg_session)
 dp = Dispatcher()
 
 register_docs_handlers(dp)
@@ -3006,6 +3014,63 @@ async def cmd_diag(m: types.Message):
         f"— Версия индексатора: {indexer_ver} (текущая {CURRENT_INDEXER_VERSION})\n"
     )
     await _send(m, txt)
+
+
+# ------------------------------ /health ------------------------------
+
+@dp.message(Command("health"))
+async def cmd_health(m: types.Message):
+    """Диагностика: проверяет связь с Telegram API и Polza.ai (только для админов)."""
+    if m.from_user.id not in ADMIN_IDS:
+        await _send(m, "Эта команда доступна только администраторам.")
+        return
+
+    lines = ["🔍 <b>Проверка здоровья бота</b>\n"]
+
+    # 1) Telegram API — если мы получили сообщение, связь уже есть
+    lines.append("✅ Telegram API: связь есть (сообщение получено)")
+
+    # 2) Polza.ai / LLM API
+    try:
+        from .polza_client import chat_with_gpt as _health_chat
+        test_resp = _health_chat(
+            [{"role": "user", "content": "Ответь одним словом: работаешь?"}],
+            temperature=0.0,
+            max_tokens=10,
+        )
+        if test_resp and len(test_resp.strip()) > 0:
+            lines.append(f"✅ Polza.ai ({Cfg.POLZA_CHAT}): ответ получен — \"{test_resp.strip()[:60]}\"")
+        else:
+            lines.append(f"⚠️ Polza.ai ({Cfg.POLZA_CHAT}): пустой ответ")
+    except Exception as e:
+        lines.append(f"❌ Polza.ai ({Cfg.POLZA_CHAT}): ошибка — {type(e).__name__}: {str(e)[:120]}")
+
+    # 3) Embeddings
+    try:
+        from .polza_client import embeddings as _health_emb
+        vecs = _health_emb(["тест"])
+        if vecs and len(vecs) > 0 and len(vecs[0]) > 0:
+            lines.append(f"✅ Embeddings ({Cfg.POLZA_EMB}): dim={len(vecs[0])}")
+        else:
+            lines.append(f"⚠️ Embeddings ({Cfg.POLZA_EMB}): пустой результат")
+    except Exception as e:
+        lines.append(f"❌ Embeddings ({Cfg.POLZA_EMB}): {type(e).__name__}: {str(e)[:120]}")
+
+    # 4) FSM-состояние текущего пользователя
+    uid = ensure_user(str(m.from_user.id))
+    state = get_processing_state(uid)
+    lines.append(f"\nFSM-состояние: {state}")
+    doc_id = ACTIVE_DOC.get(uid) or get_user_active_doc(uid)
+    lines.append(f"Активный документ: {doc_id or 'нет'}")
+
+    # 5) Конфиг
+    lines.append(f"\nAPI URL: {Cfg.BASE_POLZA}")
+    lines.append(f"Chat model: {Cfg.POLZA_CHAT}")
+    lines.append(f"Vision model: {Cfg.POLZA_VISION_MODEL}")
+    lines.append(f"Emb model: {Cfg.POLZA_EMB}")
+    lines.append(f"API key: {'***' + Cfg.POLZA_KEY[-4:] if Cfg.POLZA_KEY and len(Cfg.POLZA_KEY) > 4 else '(не задан!)'}")
+
+    await _send(m, "\n".join(lines), parse_mode="HTML")
 
 
 # ------------------------------ /reindex ------------------------------
@@ -9302,7 +9367,9 @@ async def handle_document_upload(m: types.Message):
         # Таймаут скачивания — не пугаем пользователя
         logger.warning(f"Таймаут скачивания файла для user {uid}")
         try:
-            await asyncio.to_thread(finish_processing, uid)
+            await asyncio.to_thread(
+                finish_indexing_error, uid, error_message="Таймаут скачивания файла"
+            )
         except Exception:
             pass
         await _send(m, "⏱ Не удалось скачать файл — попробуйте ещё раз или отправьте файл меньшего размера.")
@@ -9316,10 +9383,12 @@ async def handle_document_upload(m: types.Message):
             logger.exception("Ошибка обработки документа: %s", e)
         
         try:
-            await asyncio.to_thread(finish_processing, uid)
+            await asyncio.to_thread(
+                finish_indexing_error, uid, error_message=str(e)
+            )
         except Exception:
             pass
-        
+
         # Специальное сообщение для .doc файлов
         is_doc_file = (
             filename.lower().endswith('.doc') and 
