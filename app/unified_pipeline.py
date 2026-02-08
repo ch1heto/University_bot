@@ -125,57 +125,170 @@ def detect_question_type(question: str) -> str:
     return QuestionType.SEMANTIC
 
 
+# ─── Russian word-number normalization (ordinals + cardinals, 1-20) ───────────
+_ORD_SUFFIXES = r'(?:ый|ая|ое|ого|ой|ому|ую|ым|ом|ые|ых|ыми)'
+_ORD3_SUFFIXES = r'(?:ий|ья|ье|ьего|ьей|ьему|ью|ьим|ьем|ьи|ьих|ьими)'
+
+_WORD_NUMBER_RULES: list[tuple[re.Pattern, str]] = [
+    # ── teens and 20 (longer stems first to avoid substring conflicts) ──
+    (re.compile(r'\bдвадцат' + _ORD_SUFFIXES + r'\b'), '20'),
+    (re.compile(r'\bдвадцат[ьи]\b'), '20'),
+    (re.compile(r'\bдевятнадцат' + _ORD_SUFFIXES + r'\b'), '19'),
+    (re.compile(r'\bдевятнадцат[ьи]\b'), '19'),
+    (re.compile(r'\bвосемнадцат' + _ORD_SUFFIXES + r'\b'), '18'),
+    (re.compile(r'\bвосемнадцат[ьи]\b'), '18'),
+    (re.compile(r'\bсемнадцат' + _ORD_SUFFIXES + r'\b'), '17'),
+    (re.compile(r'\bсемнадцат[ьи]\b'), '17'),
+    (re.compile(r'\bшестнадцат' + _ORD_SUFFIXES + r'\b'), '16'),
+    (re.compile(r'\bшестнадцат[ьи]\b'), '16'),
+    (re.compile(r'\bпятнадцат' + _ORD_SUFFIXES + r'\b'), '15'),
+    (re.compile(r'\bпятнадцат[ьи]\b'), '15'),
+    (re.compile(r'\bчетырнадцат' + _ORD_SUFFIXES + r'\b'), '14'),
+    (re.compile(r'\bчетырнадцат[ьи]\b'), '14'),
+    (re.compile(r'\bтринадцат' + _ORD_SUFFIXES + r'\b'), '13'),
+    (re.compile(r'\bтринадцат[ьи]\b'), '13'),
+    (re.compile(r'\bдвенадцат' + _ORD_SUFFIXES + r'\b'), '12'),
+    (re.compile(r'\bдвенадцат[ьи]\b'), '12'),
+    (re.compile(r'\bодиннадцат' + _ORD_SUFFIXES + r'\b'), '11'),
+    (re.compile(r'\bодиннадцат[ьи]\b'), '11'),
+
+    # ── 1-10 ordinals ──
+    (re.compile(r'\bдесят' + _ORD_SUFFIXES + r'\b'), '10'),
+    (re.compile(r'\bдевят' + _ORD_SUFFIXES + r'\b'), '9'),
+    (re.compile(r'\bвосьм' + _ORD_SUFFIXES + r'\b'), '8'),
+    (re.compile(r'\bседьм' + _ORD_SUFFIXES + r'\b'), '7'),
+    (re.compile(r'\bшест' + _ORD_SUFFIXES + r'\b'), '6'),
+    (re.compile(r'\bпят' + _ORD_SUFFIXES + r'\b'), '5'),
+    (re.compile(r'\bчетв[её]рт' + _ORD_SUFFIXES + r'\b'), '4'),
+    (re.compile(r'\bтрет' + _ORD3_SUFFIXES + r'\b'), '3'),
+    (re.compile(r'\bвтор' + _ORD_SUFFIXES + r'\b'), '2'),
+    (re.compile(r'\bперв' + _ORD_SUFFIXES + r'\b'), '1'),
+
+    # ── 1-10 cardinals ──
+    (re.compile(r'\bдесять\b'), '10'),
+    (re.compile(r'\bдесяти\b'), '10'),
+    (re.compile(r'\bдесятью\b'), '10'),
+    (re.compile(r'\bдевять\b'), '9'),
+    (re.compile(r'\bдевяти\b'), '9'),
+    (re.compile(r'\bдевятью\b'), '9'),
+    (re.compile(r'\bвосемь\b'), '8'),
+    (re.compile(r'\bвосьми\b'), '8'),
+    (re.compile(r'\bвосемью\b'), '8'),
+    (re.compile(r'\bвосьмью\b'), '8'),
+    (re.compile(r'\bсемь\b'), '7'),
+    (re.compile(r'\bсеми\b'), '7'),
+    (re.compile(r'\bсемью\b'), '7'),
+    (re.compile(r'\bшесть\b'), '6'),
+    (re.compile(r'\bшести\b'), '6'),
+    (re.compile(r'\bшестью\b'), '6'),
+    (re.compile(r'\bпять\b'), '5'),
+    (re.compile(r'\bпяти\b'), '5'),
+    (re.compile(r'\bпятью\b'), '5'),
+    (re.compile(r'\bчетыр[её]х\b'), '4'),
+    (re.compile(r'\bчетыр[её]м\b'), '4'),
+    (re.compile(r'\bчетырьмя\b'), '4'),
+    (re.compile(r'\bчетыре\b'), '4'),
+    (re.compile(r'\bтр[её]х\b'), '3'),
+    (re.compile(r'\bтр[её]м\b'), '3'),
+    (re.compile(r'\bтремя\b'), '3'),
+    (re.compile(r'\bтри\b'), '3'),
+    (re.compile(r'\bдвух\b'), '2'),
+    (re.compile(r'\bдвум\b'), '2'),
+    (re.compile(r'\bдвумя\b'), '2'),
+    (re.compile(r'\bдве\b'), '2'),
+    (re.compile(r'\bдва\b'), '2'),
+    (re.compile(r'\bодного\b'), '1'),
+    (re.compile(r'\bодной\b'), '1'),
+    (re.compile(r'\bодному\b'), '1'),
+    (re.compile(r'\bодним\b'), '1'),
+    (re.compile(r'\bодном\b'), '1'),
+    (re.compile(r'\bодну\b'), '1'),
+    (re.compile(r'\bодна\b'), '1'),
+    (re.compile(r'\bодно\b'), '1'),
+    (re.compile(r'\bодин\b'), '1'),
+]
+
+
+def _normalize_word_numbers(text: str) -> str:
+    """Заменяет русские словесные числительные (1-20) на цифры.
+
+    Поддерживает порядковые (первый, второй...) и количественные (один, два...)
+    во всех родах и падежах.
+    Примеры: 'первую главу' → '1 главу', 'рисунок два' → 'рисунок 2'
+    """
+    result = text
+    for pattern, digit in _WORD_NUMBER_RULES:
+        result = pattern.sub(digit, result)
+    return result
+
+
 def extract_numbers_from_question(question: str, entity_type: str = "figure") -> List[str]:
     """
     Извлекает номера (рисунков/таблиц/разделов) из вопроса.
     Поддерживает номера с точкой: 1.1, 2.3, 3.1
-    
+    Поддерживает словесные числительные: первый, второй, два, три и т.д.
+
     entity_type: "figure", "table", "section"
     """
-    q_lower = question.lower()
+    # Нормализуем словесные числительные → цифры
+    q_lower = _normalize_word_numbers(question.lower())
     numbers = []
-    
+
+    _NUM = r'(\d+(?:\.\d+)?)'
+
     if entity_type == "figure":
         # Паттерны для рисунков во ВСЕХ падежах и с номерами типа 1.1
         patterns = [
-            r'рисун[а-яё]*\s*(?:№\s*)?(\d+(?:\.\d+)?)',  # рисунок 1.1, рисунке 2.3
-            r'рис\.?\s*(?:№\s*)?(\d+(?:\.\d+)?)',         # рис. 1.1, рис 2
-            r'график[а-яё]*\s*(?:№\s*)?(\d+(?:\.\d+)?)',  # график 1.1
-            r'диаграмм[а-яё]*\s*(?:№\s*)?(\d+(?:\.\d+)?)',# диаграмма 2.1
-            r'figure\s*(?:№\s*)?(\d+(?:\.\d+)?)',         # figure 1.1
-            r'fig\.?\s*(?:№\s*)?(\d+(?:\.\d+)?)',         # fig. 1.1
+            r'рисун[а-яё]*\s*(?:№\s*)?' + _NUM,          # рисунок 1.1, рисунке 2.3
+            r'рис\.?\s*(?:№\s*)?' + _NUM,                 # рис. 1.1, рис 2
+            r'график[а-яё]*\s*(?:№\s*)?' + _NUM,          # график 1.1
+            r'диаграмм[а-яё]*\s*(?:№\s*)?' + _NUM,        # диаграмма 2.1
+            r'figure\s*(?:№\s*)?' + _NUM,                 # figure 1.1
+            r'fig\.?\s*(?:№\s*)?' + _NUM,                 # fig. 1.1
+            # Обратный порядок: "2 рисунок", "второй рисунок" (после нормализации)
+            _NUM + r'\s+рисун[а-яё]*',
+            _NUM + r'\s+рис\b',
+            _NUM + r'\s+график[а-яё]*',
+            _NUM + r'\s+диаграмм[а-яё]*',
         ]
     elif entity_type == "table":
         # Паттерны для таблиц с номерами типа 2.1
         patterns = [
-            r'таблиц[а-яё]*\s*(?:№\s*)?(\d+(?:\.\d+)?)',  # таблица 2.1, таблице 3
-            r'табл\.?\s*(?:№\s*)?(\d+(?:\.\d+)?)',        # табл. 2.1
-            r'table\s*(?:№\s*)?(\d+(?:\.\d+)?)',          # table 2.1
+            r'таблиц[а-яё]*\s*(?:№\s*)?' + _NUM,         # таблица 2.1, таблице 3
+            r'табл\.?\s*(?:№\s*)?' + _NUM,                # табл. 2.1
+            r'table\s*(?:№\s*)?' + _NUM,                  # table 2.1
+            # Обратный порядок: "2 таблица", "вторая таблица" (после нормализации)
+            _NUM + r'\s+таблиц[а-яё]*',
+            _NUM + r'\s+табл\b',
         ]
     else:  # section
         patterns = [
-            r'глав[а-яё]*\s*(?:№\s*)?(\d+(?:\.\d+)?)',
-            r'раздел[а-яё]*\s*(?:№\s*)?(\d+(?:\.\d+)?)',
-            r'пункт[а-яё]*\s*(?:№\s*)?(\d+(?:\.\d+)?)',
+            r'глав[а-яё]*\s*(?:№\s*)?' + _NUM,
+            r'раздел[а-яё]*\s*(?:№\s*)?' + _NUM,
+            r'пункт[а-яё]*\s*(?:№\s*)?' + _NUM,
+            # Обратный порядок: "1 глава", "первая глава" (после нормализации)
+            _NUM + r'\s+глав[а-яё]*',
+            _NUM + r'\s+раздел[а-яё]*',
+            _NUM + r'\s+пункт[а-яё]*',
         ]
-    
+
     for pattern in patterns:
         matches = re.findall(pattern, q_lower)
         numbers.extend(matches)
-    
+
     # Fallback: ищем номер после предлога
     if not numbers:
         fallback_patterns = {
-            "figure": r'(?:на|про|в|о|об)\s+рис\w*\s+(\d+(?:\.\d+)?)',
-            "table": r'(?:в|из|на|про)\s+табл\w*\s+(\d+(?:\.\d+)?)',
+            "figure": r'(?:на|про|в|о|об)\s+рис\w*\s+' + _NUM,
+            "table": r'(?:в|из|на|про)\s+табл\w*\s+' + _NUM,
         }
         if entity_type in fallback_patterns:
             fallback_match = re.search(fallback_patterns[entity_type], q_lower)
             if fallback_match:
                 numbers.append(fallback_match.group(1))
-    
-    print(f"[DEBUG] extract_numbers('{question[:40]}...', '{entity_type}') -> {numbers}")
-    
+
+    print(f"[DEBUG] extract_numbers('{question[:50]}...', '{entity_type}') -> {numbers}")
+
     return list(set(numbers))
 
 # ==================== SUB-QUESTION QUERY ENGINE (МНОГОСЛОТНЫЕ ВОПРОСЫ) ====================
@@ -316,7 +429,8 @@ def _looks_like_multi_slot(question: str) -> bool:
 
 
 def _build_subquestion_for_slot(question: str, slot: str) -> str:
-    q_lower = (question or "").lower()
+    # Нормализуем словесные числительные → цифры
+    q_lower = _normalize_word_numbers((question or "").lower())
 
     if slot == "chapter":
         # "глава 2"
@@ -324,7 +438,7 @@ def _build_subquestion_for_slot(question: str, slot: str) -> str:
         if m:
             return f"Опиши главу {m.group(1)}: тема, ключевые тезисы, что рассматривается, выводы (если есть)."
 
-        # "во 2-й главе", "2-я глава", "2 глава"
+        # "во 2-й главе", "2-я глава", "2 глава", "первая глава" (→ "1 глава" после нормализации)
         m = re.search(r'\b(\d+(?:\.\d+)*)\s*[--–—]?\s*(?:й|я|е|го|му)?\s*глав[а-яё]*', q_lower)
         if m:
             return f"Опиши главу {m.group(1)}: тема, ключевые тезисы, что рассматривается, выводы (если есть)."
@@ -955,24 +1069,13 @@ async def get_context_for_question(
     # 6) SECTION
     if question_type == QuestionType.SECTION:
         section_context = ""
-        q_lower = (question or "").lower()
+        # Нормализуем словесные числительные → цифры (единая функция)
+        q_lower = _normalize_word_numbers((question or "").lower())
 
-        # 6.1) Извлекаем номера (поддержка "глава 2" и "во 2-й главе")
+        # 6.1) Извлекаем номера (поддержка "глава 2", "во 2-й главе", "первая глава" → "1 глава")
         chapter_nums = []
         chapter_nums += re.findall(r'глав[а-яё]*\s*(?:№\s*)?(\d+)', q_lower)
         chapter_nums += re.findall(r'\b(\d+)\s*[--–—]?\s*(?:й|я|е|го|му)?\s*глав[а-яё]*', q_lower)
-
-        # --- Поддержка словесных номеров (первая → 1, вторая → 2, ...) ---
-        _WORD_TO_NUM = {
-            'перв': '1', 'втор': '2', 'трет': '3', 'четверт': '4', 'четвёрт': '4',
-            'пят': '5', 'шест': '6', 'седьм': '7', 'восьм': '8', 'девят': '9', 'десят': '10',
-        }
-        if not chapter_nums:
-            for stem, num in _WORD_TO_NUM.items():
-                if re.search(r'глав[а-яё]*\s+\S*' + stem, q_lower) or re.search(stem + r'\S*\s+глав', q_lower):
-                    chapter_nums.append(num)
-                    logger.info("[SECTION] Word-number detected: '%s' → %s", stem, num)
-                    break
 
         section_nums = re.findall(r'\b(\d+(?:\.\d+)+)\b', question or "")
         named_nums = re.findall(r'(?:раздел|подраздел|пункт|параграф)\s*(?:№\s*)?(\d+(?:\.\d+)*)', q_lower)
