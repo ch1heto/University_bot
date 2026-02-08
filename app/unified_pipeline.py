@@ -65,6 +65,7 @@ class QuestionType:
     FIGURE = "figure"       # Вопрос про рисунок/график
     MIXED = "mixed"         # Вопрос про таблицу И рисунок (сравнение)
     SECTION = "section"
+    CHAPTER = "chapter"     # Вопрос про конкретную главу/раздел
     SLOTS = "slots"
     SEMANTIC = "semantic"   # Обычный смысловой вопрос
     GOST = "gost"          # Вопрос про оформление/ГОСТ
@@ -75,6 +76,9 @@ def detect_question_type(question: str) -> str:
     Определяет тип вопроса по ключевым словам.
     """
     q_lower = (question or "").lower()
+
+    # Нормализуем словесные числительные для лучшего определения типа
+    q_norm = _normalize_word_numbers(q_lower)
 
     # 1) ВЫЧИСЛИТЕЛЬНЫЕ вопросы
     calc_keywords = [
@@ -95,11 +99,26 @@ def detect_question_type(question: str) -> str:
     if has_figure:
         return QuestionType.FIGURE
 
-    # 3) СЛОТЫ / паспорт / краткий план
+    # 3) CHAPTER — конкретная глава/раздел с номером
+    # Проверяем ПЕРЕД SLOTS, чтобы "опиши главу 1" не уходило в слоты
+    has_chapter_with_num = bool(re.search(
+        r'\b(глав[а-яё]*|раздел[а-яё]*|подраздел[а-яё]*|параграф[а-яё]*|пункт[а-яё]*)\s*(?:№\s*)?\d',
+        q_norm
+    )) or bool(re.search(
+        r'\b\d+\s*[--–—]?\s*(?:й|я|е|го|му)?\s*(глав[а-яё]*|раздел[а-яё]*)',
+        q_norm
+    ))
+    if has_chapter_with_num:
+        # Но если это "цель главы" / "задачи раздела" — это SLOTS
+        slot_triggers_strict = ('цель', 'задач', 'объект', 'предмет', 'метод')
+        if not any(t in q_lower for t in slot_triggers_strict):
+            return QuestionType.CHAPTER
+
+    # 4) СЛОТЫ / паспорт / краткий план
     slot_triggers = ('цель', 'задач', 'объект', 'предмет', 'метод', 'результ', 'вывод', 'заключен')
     slot_hits = sum(1 for k in slot_triggers if k in q_lower)
 
-    # “паспорт/краткий план” — всегда SLOTS
+    # "паспорт/краткий план" — всегда SLOTS
     if any(t in q_lower for t in ('краткий план', 'план вкр', 'паспорт')):
         return QuestionType.SLOTS
 
@@ -109,7 +128,7 @@ def detect_question_type(question: str) -> str:
     if slot_hits >= 1:
         return QuestionType.SLOTS
 
-    # 4) РАЗДЕЛЫ/ГЛАВЫ/СТРУКТУРА (про структуру/главы)
+    # 5) РАЗДЕЛЫ/ГЛАВЫ/СТРУКТУРА (про структуру/главы — без номера)
     section_keywords = [
         'глав', 'раздел', 'параграф', 'пункт', 'введение', 'заключение',
         'структур', 'содержани', 'оглавлен', 'подглав'
@@ -117,7 +136,7 @@ def detect_question_type(question: str) -> str:
     if any(kw in q_lower for kw in section_keywords):
         return QuestionType.SECTION
 
-    # 5) ГОСТ/ОФОРМЛЕНИЕ
+    # 6) ГОСТ/ОФОРМЛЕНИЕ
     gost_keywords = ['гост', 'оформлени', 'шрифт', 'межстроч', 'поля', 'кегл']
     if any(kw in q_lower for kw in gost_keywords):
         return QuestionType.GOST
@@ -343,13 +362,13 @@ _SLOTS = {
     },
     "chapter": {
         "title": "Глава/раздел",
-        "keywords": ["глава", "раздел", "подглава", "подглав", "параграф", "пункт"],
+        "keywords": ["глав", "раздел", "подглав", "параграф", "пункт"],
         "subq": None,
-        "force_type": QuestionType.SECTION,
+        "force_type": QuestionType.CHAPTER,
     },
     "table": {
         "title": "Таблица",
-        "keywords": ["таблица", "табл"],
+        "keywords": ["таблиц", "табл"],
         "subq": None,
         "force_type": QuestionType.TABLE,
     },
@@ -385,9 +404,9 @@ def _extract_slots_in_order(question: str) -> List[str]:
 
 _INTENTS = {
     "slots":   ["цель", "задач", "объект", "предмет", "метод", "результ", "вывод", "заключен", "паспорт", "краткий план", "план вкр"],
-    "chapter": ["глава", "раздел", "подглава", "подглав", "параграф", "пункт", "введение", "заключение", "оглавлен", "содержани", "структур"],
-    "table":   ["таблица", "табл", "table"],
-    "figure":  ["рисунок", "рис.", "рис ", "диаграмм", "график", "figure", "fig.", "chart"],
+    "chapter": ["глав", "раздел", "подглав", "параграф", "пункт", "введени", "оглавлен", "содержани", "структур"],
+    "table":   ["таблиц", "табл", "table"],
+    "figure":  ["рисун", "рис.", "рис ", "диаграмм", "график", "figure", "fig.", "chart"],
     "gost":    ["гост", "оформлени", "шрифт", "межстроч", "поля", "кегл"],
     "calc":    ["сколько", "посчитай", "вычисли", "сумма", "среднее", "процент", "доля", "итого"],
 }
@@ -636,14 +655,16 @@ async def get_context_for_question(
 
     if is_table_question:
         table_nums = extract_numbers_from_question(question, "table")
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(f"[TABLE] is_table_question=True table_nums={table_nums} doc_id={doc_id} owner_id={owner_id}")
+        logger.info(f"[TABLE] is_table_question=True table_nums={table_nums} doc_id={doc_id} owner_id={owner_id}")
 
         if table_nums:
-            text_context = await asyncio.to_thread(
+            # get_table_context_for_numbers возвращает список snippet-dicts
+            rag_snippets = await asyncio.to_thread(
                 get_table_context_for_numbers,
                 owner_id, doc_id, table_nums
             )
+            rag_text = build_context(rag_snippets) if rag_snippets else ""
+            logger.info(f"[TABLE] RAG snippets: {len(rag_snippets) if rag_snippets else 0}, text_len={len(rag_text)}")
 
             table_data_text = ""
             try:
@@ -656,32 +677,35 @@ async def get_context_for_question(
                         f'%Таблица {table_num}%',
                         f'%таблица {table_num}%',
                         f'%Таблица{table_num}%',
+                        f'%Табл. {table_num}%',
+                        f'%табл. {table_num}%',
+                        f'%Table {table_num}%',
                     ]
 
                     for pattern in search_patterns:
+                        # Ищем чанки типа table/table_row ИЛИ содержащие упоминание таблицы
                         cur.execute("""
                             SELECT text, element_type, section_path
                             FROM chunks
                             WHERE owner_id = ? AND doc_id = ?
                               AND (
-                                element_type = 'table' OR
+                                element_type IN ('table', 'table_row') OR
                                 section_path LIKE ? OR
                                 text LIKE ?
                               )
                             ORDER BY
-                                CASE WHEN element_type = 'table' THEN 0 ELSE 1 END,
-                                LENGTH(text) DESC
-                            LIMIT 5
+                                CASE WHEN element_type IN ('table', 'table_row') THEN 0 ELSE 1 END,
+                                id ASC
+                            LIMIT 30
                         """, (owner_id, doc_id, pattern, pattern))
 
                         rows = cur.fetchall()
-                        if logger.isEnabledFor(logging.DEBUG):
-                            logger.debug(f"[TABLE] pattern={pattern} found={len(rows)}")
+                        logger.info(f"[TABLE] pattern={pattern} found={len(rows)}")
 
                         if rows:
                             for row in rows:
                                 chunk_text = row['text']
-                                if chunk_text and len(chunk_text) > 100:
+                                if chunk_text and len(chunk_text) > 30:
                                     table_data_text += chunk_text + "\n\n"
 
                             if table_data_text:
@@ -690,29 +714,54 @@ async def get_context_for_question(
                     if table_data_text:
                         break
 
+                    # Fallback: поиск table_row чанков с attrs содержащими номер
+                    if not table_data_text:
+                        like_attrs1 = f'%"caption_num": "{table_num}"%'
+                        like_attrs2 = f'%"label": "{table_num}"%'
+                        cur.execute("""
+                            SELECT text, section_path
+                            FROM chunks
+                            WHERE owner_id = ? AND doc_id = ?
+                              AND element_type IN ('table', 'table_row')
+                              AND (attrs LIKE ? OR attrs LIKE ?)
+                            ORDER BY id ASC
+                            LIMIT 50
+                        """, (owner_id, doc_id, like_attrs1, like_attrs2))
+
+                        rows = cur.fetchall()
+                        logger.info(f"[TABLE] attrs search found={len(rows)}")
+                        for row in rows:
+                            chunk_text = row['text']
+                            if chunk_text and len(chunk_text) > 20:
+                                table_data_text += chunk_text + "\n\n"
+
                 con.close()
             except Exception as e:
                 logger.warning(f"[TABLE] Ошибка поиска таблицы: {e}")
 
+            # Собираем итоговый контекст
+            combined = ""
             if table_data_text:
-                return f"""ДАННЫЕ ТАБЛИЦЫ:
-{table_data_text}
+                combined += f"ДАННЫЕ ТАБЛИЦЫ:\n{table_data_text}\n\n"
+            if rag_text:
+                combined += f"КОНТЕКСТ ИЗ ДОКУМЕНТА:\n{rag_text}\n\n"
+            if combined:
+                combined += "ВАЖНО: Используй данные из таблицы для точного ответа!"
+                return combined
 
-КОНТЕКСТ ИЗ ДОКУМЕНТА:
-{text_context}
-
-ВАЖНО: Используй данные из таблицы для точного ответа!"""
-
-            return text_context
+            # Если ничего не нашли по номеру — fallback в RAG
+            logger.warning(f"[TABLE] Ничего не найдено для table_nums={table_nums}")
+            return rag_text if rag_text else ""
 
     # 2) CALC без явной таблицы, но номер таблицы указан
     if question_type == QuestionType.CALC:
         table_nums = extract_numbers_from_question(question, "table")
         if table_nums:
-            return await asyncio.to_thread(
+            snippets = await asyncio.to_thread(
                 get_table_context_for_numbers,
                 owner_id, doc_id, table_nums
             )
+            return build_context(snippets) if snippets else ""
 
     # 3) MIXED
     if question_type == QuestionType.MIXED:
@@ -733,6 +782,8 @@ async def get_context_for_question(
                         f'%Таблица {table_num}%',
                         f'%таблица {table_num}%',
                         f'%Таблица{table_num}%',
+                        f'%Табл. {table_num}%',
+                        f'%табл. {table_num}%',
                     ]
 
                     for pattern in search_patterns:
@@ -741,21 +792,21 @@ async def get_context_for_question(
                             FROM chunks
                             WHERE owner_id = ? AND doc_id = ?
                               AND (
-                                element_type = 'table' OR
+                                element_type IN ('table', 'table_row') OR
                                 section_path LIKE ? OR
                                 text LIKE ?
                               )
                             ORDER BY
-                                CASE WHEN element_type = 'table' THEN 0 ELSE 1 END,
-                                LENGTH(text) DESC
-                            LIMIT 5
+                                CASE WHEN element_type IN ('table', 'table_row') THEN 0 ELSE 1 END,
+                                id ASC
+                            LIMIT 30
                         """, (owner_id, doc_id, pattern, pattern))
 
                         rows = cur.fetchall()
                         if rows:
                             for row in rows:
                                 chunk_text = row['text']
-                                if chunk_text and len(chunk_text) > 100:
+                                if chunk_text and len(chunk_text) > 30:
                                     table_data_text += chunk_text + "\n\n"
                             if table_data_text:
                                 break
@@ -1066,7 +1117,175 @@ async def get_context_for_question(
         except Exception as e:
             logger.warning(f"Ошибка поиска SLOTS: {e}")
 
-    # 6) SECTION
+    # 6) CHAPTER — выделенная логика для конкретной главы/раздела
+    if question_type == QuestionType.CHAPTER:
+        q_lower = _normalize_word_numbers((question or "").lower())
+
+        # Извлекаем номера глав/разделов
+        chapter_nums = []
+        chapter_nums += re.findall(r'глав[а-яё]*\s*(?:№\s*)?(\d+(?:\.\d+)*)', q_lower)
+        chapter_nums += re.findall(r'\b(\d+(?:\.\d+)*)\s*[--–—]?\s*(?:й|я|е|го|му)?\s*глав[а-яё]*', q_lower)
+        chapter_nums += re.findall(r'(?:раздел|подраздел|пункт|параграф)[а-яё]*\s*(?:№\s*)?(\d+(?:\.\d+)*)', q_lower)
+        chapter_nums += re.findall(r'\b(\d+(?:\.\d+)+)\b', question or "")  # числа вида 2.1, 2.1.3
+
+        all_nums = sorted(set(chapter_nums), key=len, reverse=True)
+        logger.info("[CHAPTER] question='%s', all_nums=%s", question[:60], all_nums)
+
+        if not all_nums:
+            # Нет номера — fallback в SECTION
+            question_type = QuestionType.SECTION
+        else:
+            chapter_context = ""
+            _CHAPTER_CTX_LIMIT = 14000
+
+            try:
+                from .db import get_conn
+
+                con = get_conn()
+                cur = con.cursor()
+
+                for num in all_nums:
+                    if len(chapter_context) >= _CHAPTER_CTX_LIMIT:
+                        break
+
+                    # Стратегия 1: поиск heading-чанков по номеру главы
+                    heading_patterns = []
+                    if '.' not in str(num):
+                        heading_patterns += [
+                            f'%ГЛАВА {num}%', f'%Глава {num}%', f'%глава {num}%',
+                            f'%ГЛАВА{num}%', f'%Глава{num}%',
+                            f'%{num}.%', f'%{num} %',
+                        ]
+                    else:
+                        heading_patterns += [
+                            f'%{num}%',
+                            f'%{num}.%',
+                        ]
+
+                    found_section_paths = []
+
+                    # Ищем заголовки heading-типа
+                    for pat in heading_patterns:
+                        if found_section_paths:
+                            break
+                        cur.execute("""
+                            SELECT text, section_path
+                            FROM chunks
+                            WHERE owner_id = ? AND doc_id = ? AND element_type = 'heading'
+                              AND (text LIKE ? OR section_path LIKE ?)
+                            ORDER BY id ASC
+                            LIMIT 20
+                        """, (owner_id, doc_id, pat, pat))
+                        for row in cur.fetchall():
+                            sp = row["section_path"]
+                            if sp and sp not in found_section_paths:
+                                found_section_paths.append(sp)
+
+                    # Стратегия 2: если heading не нашлись, ищем по section_path в любых чанках
+                    if not found_section_paths:
+                        section_like_patterns = []
+                        if '.' not in str(num):
+                            section_like_patterns = [
+                                f'Глава {num}%', f'ГЛАВА {num}%', f'глава {num}%',
+                                f'{num} %', f'{num}.%',
+                            ]
+                        else:
+                            section_like_patterns = [f'%{num}%']
+
+                        for pat in section_like_patterns:
+                            if found_section_paths:
+                                break
+                            cur.execute("""
+                                SELECT DISTINCT section_path
+                                FROM chunks
+                                WHERE owner_id = ? AND doc_id = ?
+                                  AND section_path LIKE ?
+                                ORDER BY id ASC
+                                LIMIT 10
+                            """, (owner_id, doc_id, pat))
+                            for row in cur.fetchall():
+                                sp = row["section_path"]
+                                if sp and sp not in found_section_paths:
+                                    found_section_paths.append(sp)
+
+                    logger.info("[CHAPTER] num=%s, found_section_paths=%s", num, found_section_paths[:5])
+
+                    # Собираем контент по найденным section_path
+                    for sp in found_section_paths:
+                        if len(chapter_context) >= _CHAPTER_CTX_LIMIT:
+                            break
+                        cur.execute("""
+                            SELECT text
+                            FROM chunks
+                            WHERE owner_id = ? AND doc_id = ? AND section_path LIKE ?
+                            ORDER BY id ASC
+                            LIMIT 200
+                        """, (owner_id, doc_id, f'{sp}%'))
+
+                        for crow in cur.fetchall():
+                            ctext = crow["text"]
+                            if ctext and len(ctext) > 30 and ctext not in chapter_context:
+                                chapter_context += ctext + "\n\n"
+                                if len(chapter_context) >= _CHAPTER_CTX_LIMIT:
+                                    chapter_context += "\n[... контекст сокращён ...]\n"
+                                    break
+
+                    # Стратегия 3: если вообще ничего не нашли — пробуем text LIKE
+                    if not chapter_context.strip():
+                        text_search_patterns = []
+                        if '.' not in str(num):
+                            text_search_patterns = [
+                                f'%Глава {num}%', f'%ГЛАВА {num}%',
+                                f'%глава {num}%',
+                            ]
+                        else:
+                            text_search_patterns = [f'%{num}%']
+
+                        for pat in text_search_patterns:
+                            if chapter_context.strip():
+                                break
+                            cur.execute("""
+                                SELECT text, section_path
+                                FROM chunks
+                                WHERE owner_id = ? AND doc_id = ?
+                                  AND text LIKE ?
+                                ORDER BY id ASC
+                                LIMIT 30
+                            """, (owner_id, doc_id, pat))
+                            for crow in cur.fetchall():
+                                ctext = crow["text"]
+                                if ctext and len(ctext) > 50 and ctext not in chapter_context:
+                                    chapter_context += ctext + "\n\n"
+                                    if len(chapter_context) >= _CHAPTER_CTX_LIMIT:
+                                        break
+
+                con.close()
+
+            except Exception as e:
+                logger.warning(f"[CHAPTER] Ошибка поиска главы: {e}", exc_info=True)
+
+            if chapter_context.strip():
+                rag_context = await asyncio.to_thread(
+                    retrieve, owner_id, doc_id, question, top_k=5
+                )
+                rag_text = build_context(rag_context) if rag_context else ""
+
+                full_ctx = f"""СОДЕРЖАНИЕ ГЛАВЫ/РАЗДЕЛА:
+
+{chapter_context}
+
+ДОПОЛНИТЕЛЬНЫЙ КОНТЕКСТ:
+{rag_text}
+
+ВАЖНО: Опиши содержание главы/раздела на основе этих данных. Если информации недостаточно — укажи это."""
+                logger.info("[CHAPTER] Final context: %d chars", len(full_ctx))
+                return full_ctx
+
+            logger.warning("[CHAPTER] Ничего не нашли для nums=%s, fallback в SECTION", all_nums)
+            # Если CHAPTER не нашёл данные — попробуем SECTION
+            question_type = QuestionType.SECTION
+
+    # 7) SECTION
     if question_type == QuestionType.SECTION:
         section_context = ""
         # Нормализуем словесные числительные → цифры (единая функция)
@@ -1228,7 +1447,7 @@ async def get_context_for_question(
         except Exception as e:
             logger.warning(f"Ошибка поиска разделов: {e}", exc_info=True)
 
-    # 7) Общий RAG coverage fallback
+    # 8) Общий RAG coverage fallback
     logger.info("[FALLBACK] Using RAG coverage fallback for question='%s', type=%s", question[:60], question_type)
     try:
         result = await asyncio.to_thread(
@@ -1314,6 +1533,20 @@ def build_system_prompt(question_type: str) -> str:
             "- В конце отдельный 'Краткий вывод' (1-2 предложения).\n"
         )
     
+    elif question_type == QuestionType.CHAPTER:
+        return base + (
+            "\nТип вопроса: КОНКРЕТНАЯ ГЛАВА/РАЗДЕЛ.\n"
+            "ПРАВИЛА:\n"
+            "- Дай содержательное описание главы/раздела на основе контекста:\n"
+            "  1) тема и назначение главы/раздела,\n"
+            "  2) ключевые положения, определения, понятия,\n"
+            "  3) что рассматривается по подпунктам (кратко по каждому),\n"
+            "  4) выводы по главе (если есть в тексте).\n"
+            "- Не навязывай пункты 'цель/объект/предмет/задачи/методы', если пользователь об этом не спрашивал.\n"
+            "- Если информации в контексте нет — честно скажи: 'В документе не указано'.\n"
+            "- В конце: краткий вывод.\n"
+        )
+
     elif question_type == QuestionType.SECTION:
         return base + (
             "\nТип вопроса: РАЗДЕЛ/ГЛАВА/СТРУКТУРА.\n"
@@ -1419,7 +1652,8 @@ class UnifiedPipeline:
 
                 if intent == "chapter":
                     subq = _build_subquestion_for_slot(question, "chapter")
-                    sub_context = await get_context_for_question(doc_id, owner_id, subq, QuestionType.SECTION)
+                    # Используем CHAPTER для конкретных глав (не SECTION!)
+                    sub_context = await get_context_for_question(doc_id, owner_id, subq, QuestionType.CHAPTER)
                     slot_blocks.append({
                         "slot": "chapter",
                         "title": "Глава/раздел",
