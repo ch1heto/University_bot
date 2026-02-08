@@ -331,6 +331,17 @@ def chat_with_gpt(
         )
         model = Cfg.vision_model() if (use_vision and Cfg.vision_active()) else Cfg.POLZA_CHAT
 
+        # --- Диагностика: размер запроса ---
+        total_input_chars = sum(
+            len(m.get("content", "")) if isinstance(m.get("content"), str) else
+            sum(len(p.get("text", "")) for p in m.get("content", []) if isinstance(p, dict) and p.get("type") == "text")
+            for m in smsg
+        )
+        logger.info(
+            "[POLZA_REQ] model=%s, msgs=%d, input_chars=%d, max_tokens=%d, temp=%.2f",
+            model, len(smsg), total_input_chars, max_tokens, temperature,
+        )
+
         # Фильтруем extra, чтобы не перетереть критичные ключи
         blocked = {"model", "messages", "temperature", "max_tokens", "stream"}
         pass_extra = {k: v for k, v in (extra or {}).items() if k not in blocked}
@@ -348,14 +359,35 @@ def chat_with_gpt(
         # ---- 1) первый ответ ----
         cmpl = _one_call(smsg)
 
+        # --- Диагностика: ответ API ---
+        usage = getattr(cmpl, "usage", None)
+        usage_str = (
+            f"prompt={usage.prompt_tokens}, completion={usage.completion_tokens}, total={usage.total_tokens}"
+            if usage else "n/a"
+        )
+
         choice = (cmpl.choices or [None])[0]
         if not choice or not getattr(choice, "message", None):
+            logger.warning(
+                "[POLZA_RESP] EMPTY choice! choices=%s, usage=%s",
+                cmpl.choices, usage_str,
+            )
             return ""
 
         text = ((choice.message.content or "") if hasattr(choice.message, "content") else "") or ""
         text = text.strip()
 
         finish_reason = getattr(choice, "finish_reason", None) or ""
+
+        logger.info(
+            "[POLZA_RESP] finish_reason=%s, content_len=%d, usage=%s",
+            finish_reason, len(text), usage_str,
+        )
+        if not text:
+            logger.warning(
+                "[POLZA_RESP] EMPTY content! finish_reason=%s, raw_content=%r, usage=%s",
+                finish_reason, choice.message.content, usage_str,
+            )
 
         # ---- 2) если ответ оборван — дозаказываем "продолжение" ----
         # Иногда API возвращает кусок, но finish_reason не 'stop' → это и есть "обрыв".
