@@ -133,11 +133,11 @@ from .lexsearch import best_context
 
 # где у вас создаются объекты бота и диспетчера:
 from aiogram.client.session.aiohttp import AiohttpSession
-import aiohttp
 
 # Сессия с увеличенными таймаутами для нестабильных сетей (актуально для РФ)
-_tg_timeout = aiohttp.ClientTimeout(total=60, connect=15, sock_connect=15, sock_read=60)
-_tg_session = AiohttpSession(timeout=_tg_timeout)
+# AiohttpSession.timeout должен быть числом (секунды), а не ClientTimeout,
+# иначе dispatcher падает на  bot.session.timeout + polling_timeout
+_tg_session = AiohttpSession(timeout=60)
 bot = Bot(Cfg.TG_TOKEN, session=_tg_session)
 dp = Dispatcher()
 
@@ -6720,7 +6720,7 @@ def _real_table_exists(owner_id: int, doc_id: int, table_num: str) -> bool:
 
     Важно:
     - НЕ используем lower(text) в SQLite для кириллицы: он не гарантированно приводит русские буквы.
-    - Проверку "не префикс" делаем в Python через regex (?!\d).
+    - Проверку "не префикс" делаем в Python через regex (?!\\d).
     - Поддерживаем кейс, когда "таблица N" стоит в конце строки (например "таблица 3").
     """
     if not table_num:
