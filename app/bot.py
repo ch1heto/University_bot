@@ -9083,14 +9083,23 @@ async def _answer_via_unified_pipeline(
     try:
         # Показываем, что печатаем
         await m.bot.send_chat_action(m.chat.id, ChatAction.TYPING)
-        
+
+        logger.info("[BOT] question='%s', uid=%s, doc_id=%s", question[:80], uid, doc_id)
+
         # ✅ ОДИН вызов unified_pipeline для ВСЕХ типов вопросов!
         answer = await answer_question(
             user_id=uid,
             question=question,
             stream=False,  # Пока без стрима (можно включить позже)
         )
-        
+
+        logger.info(
+            "[BOT] answer received: len=%d, empty=%s, first80=%r",
+            len(answer) if answer else 0,
+            not bool(answer),
+            (answer[:80] if answer else ""),
+        )
+
         # Отправляем ответ
         if answer:
             # Разбиваем длинные ответы на части
@@ -9102,12 +9111,13 @@ async def _answer_via_unified_pipeline(
             else:
                 await _send(m, answer)
         else:
+            logger.warning("[BOT] EMPTY answer from pipeline for question='%s'", question[:120])
             # Если пустой ответ (не должно быть, но на всякий случай)
             await _send(
                 m,
                 "Не удалось сформировать ответ. Попробуйте переформулировать вопрос."
             )
-    
+
     except Exception as e:
         logger.error(f"Ошибка в unified_pipeline: {e}", exc_info=True)
         

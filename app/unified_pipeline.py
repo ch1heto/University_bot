@@ -962,10 +962,27 @@ async def get_context_for_question(
         chapter_nums += re.findall(r'глав[а-яё]*\s*(?:№\s*)?(\d+)', q_lower)
         chapter_nums += re.findall(r'\b(\d+)\s*[--–—]?\s*(?:й|я|е|го|му)?\s*глав[а-яё]*', q_lower)
 
+        # --- Поддержка словесных номеров (первая → 1, вторая → 2, ...) ---
+        _WORD_TO_NUM = {
+            'перв': '1', 'втор': '2', 'трет': '3', 'четверт': '4', 'четвёрт': '4',
+            'пят': '5', 'шест': '6', 'седьм': '7', 'восьм': '8', 'девят': '9', 'десят': '10',
+        }
+        if not chapter_nums:
+            for stem, num in _WORD_TO_NUM.items():
+                if re.search(r'глав[а-яё]*\s+\S*' + stem, q_lower) or re.search(stem + r'\S*\s+глав', q_lower):
+                    chapter_nums.append(num)
+                    logger.info("[SECTION] Word-number detected: '%s' → %s", stem, num)
+                    break
+
         section_nums = re.findall(r'\b(\d+(?:\.\d+)+)\b', question or "")
         named_nums = re.findall(r'(?:раздел|подраздел|пункт|параграф)\s*(?:№\s*)?(\d+(?:\.\d+)*)', q_lower)
 
         all_nums = sorted(set(chapter_nums + section_nums + named_nums), key=len, reverse=True)
+
+        logger.info(
+            "[SECTION] question='%s', all_nums=%s, chapter_nums=%s",
+            question[:60], all_nums, chapter_nums,
+        )
 
         asks_structure = any(kw in q_lower for kw in ['структур', 'содержани', 'оглавлен', 'все главы', 'все подглав', 'план'])
         asks_conclusion = 'заключен' in q_lower or 'вывод' in q_lower
@@ -991,6 +1008,9 @@ async def get_context_for_question(
                     if heading_texts:
                         section_context += "СТРУКТУРА ДОКУМЕНТА (ЗАГОЛОВКИ):\n\n" + "\n".join(heading_texts) + "\n\n"
 
+            # Лимит на размер section_context, чтобы не перегружать API
+            _SECTION_CTX_LIMIT = 12000
+
             if all_nums:
                 con = get_conn()
                 cur = con.cursor()
@@ -998,8 +1018,8 @@ async def get_context_for_question(
                 for num in all_nums:
                     patterns = []
 
-                    if re.search(r'\bглава\b', q_lower) and '.' not in str(num):
-                        patterns += [f'ГЛАВА {num}%', f'Глава {num}%']
+                    if re.search(r'\bглав[а-яё]*\b', q_lower) and '.' not in str(num):
+                        patterns += [f'ГЛАВА {num}%', f'Глава {num}%', f'глава {num}%']
                     else:
                         patterns += [
                             f'{num} %',
@@ -1025,22 +1045,34 @@ async def get_context_for_question(
                     hrows = cur.fetchall()
 
                     found_section_paths = [row["section_path"] for row in hrows if row["section_path"]]
+                    logger.info(
+                        "[SECTION] num=%s, heading_rows=%d, section_paths=%s",
+                        num, len(hrows), found_section_paths[:5],
+                    )
 
                     for sp in found_section_paths:
+                        if len(section_context) >= _SECTION_CTX_LIMIT:
+                            logger.info("[SECTION] Context limit reached (%d chars), stopping", len(section_context))
+                            break
+
                         cur.execute("""
                             SELECT text
                             FROM chunks
                             WHERE owner_id = ? AND doc_id = ? AND section_path LIKE ?
                             ORDER BY id ASC
-                            LIMIT 800
+                            LIMIT 200
                         """, (owner_id, doc_id, f'{sp}%'))
 
                         for crow in cur.fetchall():
                             ctext = crow["text"]
                             if ctext and len(ctext) > 50 and ctext not in section_context:
                                 section_context += ctext + "\n\n"
+                                if len(section_context) >= _SECTION_CTX_LIMIT:
+                                    section_context += "\n[... контекст сокращён ...]\n"
+                                    break
 
                 con.close()
+                logger.info("[SECTION] Collected section_context: %d chars", len(section_context))
 
             if asks_conclusion:
                 con = get_conn()
@@ -1066,15 +1098,14 @@ async def get_context_for_question(
                         section_context += t + "\n\n"
 
             if section_context.strip():
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(f"[SECTION] Собран контекст: {len(section_context)} символов")
+                logger.info(f"[SECTION] Собран контекст: {len(section_context)} символов")
 
                 rag_context = await asyncio.to_thread(
                     retrieve, owner_id, doc_id, question, top_k=5
                 )
                 rag_text = build_context(rag_context) if rag_context else ""
 
-                return f"""ИНФОРМАЦИЯ ПО ЗАПРОСУ:
+                full_ctx = f"""ИНФОРМАЦИЯ ПО ЗАПРОСУ:
 
 {section_context}
 
@@ -1082,14 +1113,16 @@ async def get_context_for_question(
 {rag_text}
 
 ВАЖНО: Отвечай на основе представленных данных. Если информации недостаточно — укажи это."""
+                logger.info("[SECTION] Final context for LLM: %d chars", len(full_ctx))
+                return full_ctx
 
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("[SECTION] Специфичный поиск не дал результата, fallback в RAG coverage")
+            logger.warning("[SECTION] Специфичный поиск не дал результата (all_nums=%s), fallback в RAG coverage", all_nums)
 
         except Exception as e:
-            logger.warning(f"Ошибка поиска разделов: {e}")
+            logger.warning(f"Ошибка поиска разделов: {e}", exc_info=True)
 
     # 7) Общий RAG coverage fallback
+    logger.info("[FALLBACK] Using RAG coverage fallback for question='%s', type=%s", question[:60], question_type)
     try:
         result = await asyncio.to_thread(
             retrieve_coverage,
@@ -1098,14 +1131,18 @@ async def get_context_for_question(
             backfill_k=5,
         )
         if result and result.get('snippets'):
-            return build_context_coverage(result['snippets'])
+            ctx = build_context_coverage(result['snippets'])
+            logger.info("[FALLBACK] retrieve_coverage returned %d chars", len(ctx) if ctx else 0)
+            return ctx
     except Exception as e:
         logger.warning(f"retrieve_coverage failed: {e}, fallback to basic retrieve")
 
     snippets = await asyncio.to_thread(
         retrieve, owner_id, doc_id, question, top_k=10
     )
-    return build_context(snippets) if snippets else ""
+    ctx = build_context(snippets) if snippets else ""
+    logger.info("[FALLBACK] basic retrieve returned %d chars, snippets=%d", len(ctx) if ctx else 0, len(snippets) if snippets else 0)
+    return ctx
 
 # ==================== ПОСТРОЕНИЕ ПРОМПТА ====================
 
@@ -1350,9 +1387,12 @@ class UnifiedPipeline:
 
         # 3) Обычный режим (single-intent)
         question_type = detect_question_type(question)
-        logger.info(f"Question type: {question_type}")
+        logger.info(f"[PIPELINE] Single-intent: question='{question[:60]}', type={question_type}")
 
         context = await get_context_for_question(doc_id, owner_id, question, question_type)
+
+        ctx_len = len(context) if context else 0
+        logger.info(f"[PIPELINE] Context retrieved: {ctx_len} chars for type={question_type}")
 
         if not context or len(context) < 100:
             return (
@@ -1383,7 +1423,7 @@ class UnifiedPipeline:
             # Проверяем, мультимодальный ли контекст
             images = []
             text_context = context
-            
+
             if isinstance(context, dict) and context.get("type") == "multimodal":
                 # Мультимодальный режим: есть картинки
                 text_context = context.get("text", "")
@@ -1392,17 +1432,22 @@ class UnifiedPipeline:
             elif isinstance(context, str):
                 # Обычный текстовый режим
                 text_context = context
-                logger.info("Text-only request")
             else:
                 # Странный формат - пытаемся извлечь текст
                 text_context = str(context)
-            
+
+            ctx_len = len(text_context) if isinstance(text_context, str) else 0
+            logger.info(
+                "[PIPELINE] _answer_sync: question='%s', context_len=%d, images=%d",
+                question[:80], ctx_len, len(images),
+            )
+
             # Формируем сообщения
             messages = [
                 {"role": "system", "content": system},
                 {"role": "user", "content": f"Контекст из документа:\n{text_context}\n\nВопрос: {question}"}
             ]
-            
+
             # Вызываем API (с картинками или без)
             if images:
                 # Мультимодальный запрос
@@ -1421,10 +1466,14 @@ class UnifiedPipeline:
                     temperature=0.3,
                     max_tokens=4000,
                 )
-            
+
+            logger.info(
+                "[PIPELINE] _answer_sync result: answer_len=%d, empty=%s",
+                len(answer) if answer else 0, not bool(answer),
+            )
             return answer
         except Exception as e:
-            logger.error(f"LLM call failed: {e}")
+            logger.error(f"LLM call failed: {e}", exc_info=True)
             return f"Ошибка при обращении к модели: {e}"
     
     async def _answer_stream(self, system: str, question: str, context: str):
