@@ -1122,7 +1122,11 @@ async def get_context_for_question(
                     patterns = []
 
                     if re.search(r'\bглав[а-яё]*\b', q_lower) and '.' not in str(num):
-                        patterns += [f'ГЛАВА {num}%', f'Глава {num}%', f'глава {num}%']
+                        patterns += [
+                            f'%ГЛАВА {num}.%', f'%ГЛАВА {num} %',
+                            f'%Глава {num}.%', f'%Глава {num} %',
+                            f'%глава {num}.%', f'%глава {num} %',
+                        ]
                     else:
                         patterns += [
                             f'{num} %',
